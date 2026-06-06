@@ -1,0 +1,75 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --navy: #0D1B2A;
+  --deep-teal: #0A5C74;
+  --royal: #1A3E8A;
+  --gold: #C89B3C;
+  --emerald: #2ECC71;
+  --electric: #0095FF;
+  --offwhite: #F5F7FA;
+}
+
+/* Custom CSS tokens and upgrades for ultra-premium look */
+html, body {
+  background: var(--offwhite);
+  font-family: 'Inter', 'SF Pro', 'IBM Plex Sans', Arial, sans-serif;
+  min-height: 100vh;
+  color: var(--navy);
+}
+
+.bg-navy { background-color: var(--navy); }
+.text-navy { color: var(--navy); }
+.bg-electric { background-color: var(--electric); }
+.text-electric { color: var(--electric); }
+.bg-gold { background-color: var(--gold); }
+.text-gold { color: var(--gold); }
+.bg-emerald { background-color: var(--emerald); }
+.text-emerald { color: var(--emerald); }
+.border-navy { border-color: var(--navy); }
+.border-gold { border-color: var(--gold); }
+.border-electric { border-color: var(--electric); }
+.border-emerald { border-color: var(--emerald); }
+.bg-offwhite { background-color: var(--offwhite); }
+.font-sans { font-family: 'Inter', 'SF Pro', 'IBM Plex Sans', sans-serif; }
+
+/* Tweak base page */
+h1, h2, h3, h4, h5 {
+  font-weight: 700 !important;
+  letter-spacing: -0.01em;
+}
+.shadow-xl { box-shadow: 0 6px 24px 0 rgba(13,27,42,.06),0 1.5px 5px rgba(13,27,42,0.03); }
+.shadow-2xl { box-shadow: 0 16px 54px 0 rgba(13,27,42,.19),0 1.5px 7px rgba(13,27,42,0.02); }
+
+input, select, textarea, button {
+  font-family: inherit;
+  font-size: 1rem;
+  border-radius: .75rem;
+}
+button {
+  font-weight: 700;
+  transition: box-shadow 0.23s cubic-bezier(.19,1,.22,1);
+}
+::-webkit-scrollbar {
+  width: 8px;
+  background: #e8ecf3;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--navy);
+  border-radius: 20px;
+}
+
+/* Responsive fix for dashboard grid */
+@media (max-width: 980px) {
+  .grid-cols-5 {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+}
+@media (max-width: 600px) {
+  .grid-cols-3,
+  .grid-cols-5 {
+    grid-template-columns: repeat(1, minmax(0, 1fr)) !important;
+  }
+}

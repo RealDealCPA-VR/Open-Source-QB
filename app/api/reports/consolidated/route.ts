@@ -1,0 +1,62 @@
+/**
+ * GET /api/reports/consolidated
+ *
+ * Returns a multi-entity consolidated financial report spanning ALL companies in
+ * the database. The caller's own company is used to establish the DB connection;
+ * the companyId is otherwise irrelevant for this endpoint.
+ *
+ * Query params:
+ *   type   "pl" — Consolidated Profit & Loss (default)
+ *          "bs" — Consolidated Balance Sheet
+ *   from   ISO date string — P&L range start (pl only, optional)
+ *   to     ISO date string — P&L range end   (pl only, optional)
+ *   asOf   ISO date string — Balance Sheet as-of date (bs only, optional)
+ */
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerContext } from '@/lib/context';
+import { ServiceError } from '@/lib/services/_base';
+import { consolidatedPL, consolidatedBalanceSheet } from '@/lib/services/consolidation';
+
+export async function GET(req: NextRequest) {
+  try {
+    const ctx = await getServerContext();
+    const sp = req.nextUrl.searchParams;
+
+    const type = (sp.get('type') ?? 'pl').toLowerCase();
+
+    if (type === 'bs') {
+      const asOf = sp.get('asOf') ? new Date(sp.get('asOf')!) : undefined;
+      const result = await consolidatedBalanceSheet(ctx, asOf);
+      return NextResponse.json(result);
+    }
+
+    // Default: P&L
+    const from = sp.get('from') ? new Date(sp.get('from')!) : undefined;
+    const to = sp.get('to') ? new Date(sp.get('to')!) : undefined;
+    const result = await consolidatedPL(ctx, from || to ? { from, to } : undefined);
+    return NextResponse.json(result);
+  } catch (err) {
+    return mapError(err);
+  }
+}
+
+function mapError(err: unknown): NextResponse {
+  if (err instanceof ServiceError) {
+    const status =
+      err.code === 'NOT_FOUND'
+        ? 404
+        : err.code === 'VALIDATION' || err.code === 'UNBALANCED'
+          ? 400
+          : err.code === 'FORBIDDEN'
+            ? 403
+            : err.code === 'CONFLICT'
+              ? 409
+              : 500;
+    return NextResponse.json(
+      { error: err.message, code: err.code, details: err.details },
+      { status },
+    );
+  }
+  console.error('[reports/consolidated] Unexpected error:', err);
+  return NextResponse.json({ error: 'Internal server error.' }, { status: 500 });
+}

@@ -1,0 +1,1 @@
+ALTER TABLE "employees" ADD COLUMN "portal_password_hash" text;

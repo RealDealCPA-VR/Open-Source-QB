@@ -1,0 +1,133 @@
+{
+  "name": "bookkeeper-ai",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Open-source desktop accounting — a QuickBooks competitor with AI-powered error correction.",
+  "author": "BookKeeper AI",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:push": "drizzle-kit push",
+    "db:studio": "drizzle-kit studio",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "node scripts/e2e.mjs",
+    "typecheck": "tsc --noEmit",
+    "electron:dev": "electron .",
+    "desktop": "concurrently -k -s first -n NEXT,APP -c blue,green \"next dev\" \"wait-on tcp:127.0.0.1:3000 && electron .\"",
+    "desktop:pack": "npm run build && electron-builder --dir",
+    "desktop:dist": "npm run build && electron-builder"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.101.0",
+    "@electric-sql/pglite": "^0.5.1",
+    "@neondatabase/serverless": "^0.10.4",
+    "adm-zip": "^0.5.17",
+    "bcryptjs": "^3.0.3",
+    "clsx": "^2.1.1",
+    "date-fns": "^4.1.0",
+    "decimal.js": "^10.6.0",
+    "drizzle-orm": "^0.36.4",
+    "electron-updater": "^6.8.9",
+    "fast-xml-parser": "^4.5.0",
+    "lucide-react": "^0.468.0",
+    "next": "^15.1.3",
+    "next-auth": "^5.0.0-beta.25",
+    "nodemailer": "^8.0.10",
+    "papaparse": "^5.5.3",
+    "pdf-lib": "^1.17.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tailwind-merge": "^2.6.0",
+    "tailwindcss-animate": "^1.0.7",
+    "xml2js": "^0.6.2",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
+    "@types/node": "^22.10.2",
+    "@types/nodemailer": "^8.0.0",
+    "@types/papaparse": "^5.5.2",
+    "@types/react": "^19.0.2",
+    "@types/react-dom": "^19.0.2",
+    "@types/xml2js": "^0.4.14",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.2.1",
+    "drizzle-kit": "^0.30.1",
+    "electron": "^41.7.1",
+    "electron-builder": "^26.15.0",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "tsx": "^4.22.4",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.8",
+    "wait-on": "^9.0.10"
+  },
+  "build": {
+    "appId": "com.bookkeeperai.desktop",
+    "productName": "BookKeeper AI",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "electron/**/*",
+      "drizzle/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": ".next/standalone",
+        "to": "app",
+        "filter": [
+          "**/*",
+          "!node_modules"
+        ]
+      },
+      {
+        "from": ".next/standalone/node_modules",
+        "to": "app/node_modules",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": ".next/static",
+        "to": "app/.next/static"
+      },
+      {
+        "from": "public",
+        "to": "app/public"
+      },
+      {
+        "from": "drizzle",
+        "to": "app/drizzle"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "build/icon.png"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.finance",
+      "icon": "build/icon.png"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Office",
+      "icon": "build/icon.png"
+    }
+  }
+}

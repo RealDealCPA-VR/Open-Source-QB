@@ -1,0 +1,49 @@
+/**
+ * GET  /api/classes  — list active classes for the current company.
+ * POST /api/classes  — create a new class.
+ *
+ * POST body: { name: string; parentId?: string }
+ */
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerContext } from '@/lib/context';
+import { listClasses, createClass } from '@/lib/services/dimensions';
+import { ServiceError } from '@/lib/services/_base';
+
+function errorResponse(err: unknown) {
+  if (err instanceof ServiceError) {
+    const status =
+      err.code === 'NOT_FOUND' ? 404
+      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
+      : err.code === 'FORBIDDEN' ? 403
+      : err.code === 'CONFLICT' ? 409
+      : err.code === 'PERIOD_CLOSED' ? 400
+      : 500;
+    return NextResponse.json({ error: err.message, code: err.code }, { status });
+  }
+  console.error('[classes] unexpected error:', err);
+  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+}
+
+export async function GET() {
+  try {
+    const ctx = await getServerContext();
+    const list = await listClasses(ctx);
+    return NextResponse.json(list);
+  } catch (err) {
+    return errorResponse(err);
+  }
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const ctx = await getServerContext();
+    const body = await req.json();
+    const cls = await createClass(ctx, {
+      name: body.name,
+      parentId: body.parentId ?? null,
+    });
+    return NextResponse.json(cls, { status: 201 });
+  } catch (err) {
+    return errorResponse(err);
+  }
+}

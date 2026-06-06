@@ -1,0 +1,43 @@
+/**
+ * GET /api/reports/ar-aging
+ *
+ * Query params:
+ *   asOf  ISO date string (optional) — defaults to today.
+ *
+ * Returns an AgingReport with one row per customer that has outstanding invoices.
+ */
+import { type NextRequest, NextResponse } from 'next/server';
+import { getServerContext } from '@/lib/context';
+import { arAging } from '@/lib/services/reportsExtra';
+import { ServiceError } from '@/lib/services/_base';
+
+export async function GET(req: NextRequest) {
+  try {
+    const ctx = await getServerContext();
+
+    // Optional ?asOf= query parameter.
+    const asOfParam = req.nextUrl.searchParams.get('asOf');
+    let asOf: Date | undefined;
+    if (asOfParam) {
+      asOf = new Date(asOfParam);
+      if (isNaN(asOf.getTime())) {
+        return NextResponse.json({ error: 'Invalid asOf date.' }, { status: 400 });
+      }
+    }
+
+    const report = await arAging(ctx, asOf);
+    return NextResponse.json(report);
+  } catch (err) {
+    if (err instanceof ServiceError) {
+      const status =
+        err.code === 'NOT_FOUND' ? 404
+        : err.code === 'FORBIDDEN' ? 403
+        : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
+        : err.code === 'CONFLICT' ? 409
+        : 500;
+      return NextResponse.json({ error: err.message, code: err.code }, { status });
+    }
+    console.error('[ar-aging] Unexpected error', err);
+    return NextResponse.json({ error: 'Internal server error.' }, { status: 500 });
+  }
+}

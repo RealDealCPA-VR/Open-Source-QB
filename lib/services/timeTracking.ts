@@ -1,0 +1,306 @@
+/**
+ * Time Tracking service — internal billable time → invoice (QB-parity feature).
+ *
+ * Time entries are stored in `timeEntries`. When entries are billable and have
+ * a customerId they can be gathered and billed through `billTimeToInvoice`, which
+ * calls `createInvoice` from the invoices service (the only GL writer for A/R).
+ *
+ * Rules:
+ *  - No direct GL posting; GL happens only through createInvoice.
+ *  - All queries are scoped to ctx.companyId.
+ *  - Rate fallback: entry.rate → service item salesPrice → 0.
+ */
+import { and, eq, isNull } from 'drizzle-orm';
+import { Money, toAmountString } from '@/lib/money';
+import { timeEntries, customers, items } from '@/lib/db/schema';
+import {
+  type ServiceContext,
+  ServiceError,
+  notFound,
+  validation,
+  writeAudit,
+} from './_base';
+import { createInvoice } from './invoices';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface TimeEntryInput {
+  employeeId?: string | null;
+  customerId?: string | null;
+  jobId?: string | null;
+  serviceItemId?: string | null;
+  date: Date;
+  hours: string | number;
+  billable?: boolean;
+  rate?: string | number | null;
+  description?: string | null;
+}
+
+export interface TimeEntryUpdate {
+  employeeId?: string | null;
+  customerId?: string | null;
+  jobId?: string | null;
+  serviceItemId?: string | null;
+  date?: Date;
+  hours?: string | number;
+  billable?: boolean;
+  rate?: string | number | null;
+  description?: string | null;
+}
+
+export interface ListTimeEntriesFilter {
+  customerId?: string;
+  billable?: boolean;
+  invoiced?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// listTimeEntries
+// ---------------------------------------------------------------------------
+
+export async function listTimeEntries(ctx: ServiceContext, filter: ListTimeEntriesFilter = {}) {
+  const rows = await ctx.db
+    .select()
+    .from(timeEntries)
+    .where(eq(timeEntries.companyId, ctx.companyId))
+    .orderBy(timeEntries.date);
+
+  return rows.filter((r) => {
+    if (filter.customerId !== undefined && r.customerId !== filter.customerId) return false;
+    if (filter.billable !== undefined && r.billable !== filter.billable) return false;
+    if (filter.invoiced !== undefined) {
+      const isInvoiced = r.invoicedInvoiceId !== null;
+      if (isInvoiced !== filter.invoiced) return false;
+    }
+    return true;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// createTimeEntry
+// ---------------------------------------------------------------------------
+
+export async function createTimeEntry(ctx: ServiceContext, input: TimeEntryInput) {
+  const hours = Money.of(input.hours);
+  if (hours.lessThanOrEqualTo(0)) throw validation('Hours must be greater than zero.');
+
+  // Verify customer belongs to company if supplied.
+  if (input.customerId) {
+    const [cust] = await ctx.db
+      .select({ id: customers.id })
+      .from(customers)
+      .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, input.customerId)));
+    if (!cust) throw notFound('Customer');
+  }
+
+  const rate = input.rate != null ? toAmountString(input.rate) : null;
+
+  const [entry] = await ctx.db
+    .insert(timeEntries)
+    .values({
+      companyId: ctx.companyId,
+      employeeId: input.employeeId ?? null,
+      customerId: input.customerId ?? null,
+      jobId: input.jobId ?? null,
+      serviceItemId: input.serviceItemId ?? null,
+      date: input.date,
+      hours: toAmountString(hours),
+      billable: input.billable ?? true,
+      rate,
+      description: input.description ?? null,
+    })
+    .returning();
+
+  await writeAudit(ctx, {
+    action: 'create',
+    entityType: 'time_entry',
+    entityId: entry.id,
+    newValues: { hours: entry.hours, customerId: entry.customerId, billable: entry.billable },
+  });
+
+  return entry;
+}
+
+// ---------------------------------------------------------------------------
+// updateTimeEntry
+// ---------------------------------------------------------------------------
+
+export async function updateTimeEntry(
+  ctx: ServiceContext,
+  id: string,
+  update: TimeEntryUpdate,
+) {
+  const [existing] = await ctx.db
+    .select()
+    .from(timeEntries)
+    .where(and(eq(timeEntries.companyId, ctx.companyId), eq(timeEntries.id, id)));
+  if (!existing) throw notFound('Time entry');
+
+  if (existing.invoicedInvoiceId) {
+    throw new ServiceError('CONFLICT', 'Cannot edit a time entry that has already been invoiced.');
+  }
+
+  if (update.hours !== undefined) {
+    const h = Money.of(update.hours);
+    if (h.lessThanOrEqualTo(0)) throw validation('Hours must be greater than zero.');
+  }
+
+  if (update.customerId !== undefined && update.customerId !== null) {
+    const [cust] = await ctx.db
+      .select({ id: customers.id })
+      .from(customers)
+      .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, update.customerId)));
+    if (!cust) throw notFound('Customer');
+  }
+
+  const patch: Partial<typeof timeEntries.$inferInsert> = {};
+  if (update.employeeId !== undefined) patch.employeeId = update.employeeId;
+  if (update.customerId !== undefined) patch.customerId = update.customerId;
+  if (update.jobId !== undefined) patch.jobId = update.jobId;
+  if (update.serviceItemId !== undefined) patch.serviceItemId = update.serviceItemId;
+  if (update.date !== undefined) patch.date = update.date;
+  if (update.hours !== undefined) patch.hours = toAmountString(update.hours);
+  if (update.billable !== undefined) patch.billable = update.billable;
+  if (update.rate !== undefined) patch.rate = update.rate != null ? toAmountString(update.rate) : null;
+  if (update.description !== undefined) patch.description = update.description;
+
+  const [updated] = await ctx.db
+    .update(timeEntries)
+    .set(patch)
+    .where(and(eq(timeEntries.companyId, ctx.companyId), eq(timeEntries.id, id)))
+    .returning();
+
+  await writeAudit(ctx, {
+    action: 'update',
+    entityType: 'time_entry',
+    entityId: id,
+    oldValues: existing,
+    newValues: patch,
+  });
+
+  return updated;
+}
+
+// ---------------------------------------------------------------------------
+// deleteTimeEntry
+// ---------------------------------------------------------------------------
+
+export async function deleteTimeEntry(ctx: ServiceContext, id: string) {
+  const [existing] = await ctx.db
+    .select()
+    .from(timeEntries)
+    .where(and(eq(timeEntries.companyId, ctx.companyId), eq(timeEntries.id, id)));
+  if (!existing) throw notFound('Time entry');
+
+  if (existing.invoicedInvoiceId) {
+    throw new ServiceError('CONFLICT', 'Cannot delete a time entry that has already been invoiced.');
+  }
+
+  await ctx.db
+    .delete(timeEntries)
+    .where(and(eq(timeEntries.companyId, ctx.companyId), eq(timeEntries.id, id)));
+
+  await writeAudit(ctx, {
+    action: 'delete',
+    entityType: 'time_entry',
+    entityId: id,
+    oldValues: existing,
+  });
+
+  return { deleted: true };
+}
+
+// ---------------------------------------------------------------------------
+// billTimeToInvoice
+// ---------------------------------------------------------------------------
+
+/**
+ * Gather all unbilled (invoicedInvoiceId IS NULL) billable time entries for a
+ * customer, create an invoice via createInvoice (which posts the GL entry), then
+ * stamp invoicedInvoiceId on each entry.
+ *
+ * Rate resolution order per entry:
+ *   1. entry.rate (if set)
+ *   2. service item salesPrice (if serviceItemId set)
+ *   3. 0
+ */
+export async function billTimeToInvoice(
+  ctx: ServiceContext,
+  { customerId }: { customerId: string },
+) {
+  // Verify customer.
+  const [cust] = await ctx.db
+    .select({ id: customers.id })
+    .from(customers)
+    .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, customerId)));
+  if (!cust) throw notFound('Customer');
+
+  // Fetch unbilled billable entries for this customer.
+  const entries = await ctx.db
+    .select()
+    .from(timeEntries)
+    .where(
+      and(
+        eq(timeEntries.companyId, ctx.companyId),
+        eq(timeEntries.customerId, customerId),
+        eq(timeEntries.billable, true),
+        isNull(timeEntries.invoicedInvoiceId),
+      ),
+    )
+    .orderBy(timeEntries.date);
+
+  if (entries.length === 0) {
+    throw new ServiceError('VALIDATION', 'No unbilled billable time entries for this customer.');
+  }
+
+  // Resolve service item prices for any entries that reference one.
+  const itemIds = [...new Set(entries.map((e) => e.serviceItemId).filter(Boolean) as string[])];
+  const itemPriceMap = new Map<string, string | null>();
+  if (itemIds.length > 0) {
+    const itemRows = await ctx.db
+      .select({ id: items.id, salesPrice: items.salesPrice })
+      .from(items)
+      .where(and(eq(items.companyId, ctx.companyId)));
+    for (const r of itemRows) {
+      if (itemIds.includes(r.id)) itemPriceMap.set(r.id, r.salesPrice);
+    }
+  }
+
+  // Build invoice lines: one line per time entry.
+  const lines = entries.map((e) => {
+    let resolvedRate: string | number = '0';
+    if (e.rate != null && Money.gt(e.rate, 0)) {
+      resolvedRate = e.rate;
+    } else if (e.serviceItemId) {
+      const itemPrice = itemPriceMap.get(e.serviceItemId);
+      if (itemPrice != null) resolvedRate = itemPrice;
+    }
+
+    return {
+      itemId: e.serviceItemId ?? null,
+      description: e.description ?? `Time entry — ${e.date.toISOString().slice(0, 10)}`,
+      quantity: e.hours,
+      rate: resolvedRate,
+      taxable: false as const,
+    };
+  });
+
+  // Create the invoice (posts GL internally).
+  const invoice = await createInvoice(ctx, {
+    customerId,
+    date: new Date(),
+    lines,
+  });
+
+  // Stamp invoicedInvoiceId on all billed entries.
+  for (const e of entries) {
+    await ctx.db
+      .update(timeEntries)
+      .set({ invoicedInvoiceId: invoice.id })
+      .where(and(eq(timeEntries.companyId, ctx.companyId), eq(timeEntries.id, e.id)));
+  }
+
+  return invoice;
+}

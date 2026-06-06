@@ -1,0 +1,74 @@
+/**
+ * POST /api/assemblies/build
+ *
+ * Body: { assemblyItemId: string; quantity: string | number; action: 'build' | 'unbuild' }
+ *
+ * Builds or unbuilds the specified quantity of an assembly item.
+ * No GL entry is posted — both sides of the transaction are account 1300 (net $0).
+ * Quantities and averageCost are updated on the item records directly.
+ */
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerContext } from '@/lib/context';
+import { buildAssembly, unbuildAssembly } from '@/lib/services/assemblies';
+import { ServiceError } from '@/lib/services/_base';
+
+// ── Error helper ──────────────────────────────────────────────────────────────
+
+function serviceErrorToResponse(err: ServiceError): NextResponse {
+  const statusMap: Record<string, number> = {
+    NOT_FOUND: 404,
+    VALIDATION: 400,
+    UNBALANCED: 400,
+    FORBIDDEN: 403,
+    CONFLICT: 409,
+    PERIOD_CLOSED: 409,
+  };
+  const status = statusMap[err.code] ?? 500;
+  return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
+}
+
+// ── POST /api/assemblies/build ────────────────────────────────────────────────
+
+export async function POST(req: NextRequest): Promise<NextResponse> {
+  try {
+    const ctx = await getServerContext();
+    const body = await req.json() as {
+      assemblyItemId?: string;
+      quantity?: string | number;
+      action?: string;
+    };
+
+    const { assemblyItemId, quantity, action } = body;
+
+    if (!assemblyItemId) {
+      return NextResponse.json(
+        { error: 'assemblyItemId is required', code: 'VALIDATION' },
+        { status: 400 },
+      );
+    }
+    if (quantity == null) {
+      return NextResponse.json(
+        { error: 'quantity is required', code: 'VALIDATION' },
+        { status: 400 },
+      );
+    }
+    if (action !== 'build' && action !== 'unbuild') {
+      return NextResponse.json(
+        { error: 'action must be "build" or "unbuild"', code: 'VALIDATION' },
+        { status: 400 },
+      );
+    }
+
+    if (action === 'build') {
+      const result = await buildAssembly(ctx, { assemblyItemId, quantity });
+      return NextResponse.json(result, { status: 201 });
+    } else {
+      const result = await unbuildAssembly(ctx, { assemblyItemId, quantity });
+      return NextResponse.json(result, { status: 201 });
+    }
+  } catch (err) {
+    if (err instanceof ServiceError) return serviceErrorToResponse(err);
+    console.error('[POST /api/assemblies/build]', err);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}

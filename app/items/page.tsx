@@ -1,0 +1,410 @@
+'use client';
+
+import { useEffect, useState } from 'react';
+import {
+  Package,
+  Plus,
+  Pencil,
+  PowerOff,
+} from 'lucide-react';
+import {
+  Button,
+  Card,
+  Input,
+  Select,
+  Label,
+  Badge,
+  Table,
+  Th,
+  Td,
+  Tr,
+  Modal,
+  PageHeader,
+  toast,
+  Toaster,
+} from '@/components/ui';
+import { api, ApiError } from '@/lib/client';
+import { formatCurrency } from '@/lib/money';
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+type ItemType = 'service' | 'inventory' | 'non_inventory' | 'bundle';
+
+interface Item {
+  id: string;
+  name: string;
+  sku: string | null;
+  type: ItemType;
+  description: string | null;
+  salesPrice: string | null;
+  purchaseCost: string | null;
+  taxable: boolean;
+  isActive: boolean;
+  incomeAccountId: string | null;
+  expenseAccountId: string | null;
+  assetAccountId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface FormState {
+  name: string;
+  type: ItemType;
+  description: string;
+  salesPrice: string;
+  purchaseCost: string;
+  sku: string;
+}
+
+const EMPTY_FORM: FormState = {
+  name: '',
+  type: 'service',
+  description: '',
+  salesPrice: '',
+  purchaseCost: '',
+  sku: '',
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+const TYPE_LABELS: Record<ItemType, string> = {
+  service: 'Service',
+  inventory: 'Inventory',
+  non_inventory: 'Non-Inventory',
+  bundle: 'Bundle',
+};
+
+const TYPE_TONES: Record<ItemType, 'info' | 'success' | 'warning' | 'neutral'> = {
+  service: 'info',
+  inventory: 'success',
+  non_inventory: 'warning',
+  bundle: 'neutral',
+};
+
+// ── Page ──────────────────────────────────────────────────────────────────────
+
+export default function ItemsPage() {
+  const [items, setItems] = useState<Item[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  // Modal state
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editingItem, setEditingItem] = useState<Item | null>(null);
+  const [form, setForm] = useState<FormState>(EMPTY_FORM);
+  const [saving, setSaving] = useState(false);
+
+  // Deactivate confirmation
+  const [confirmItem, setConfirmItem] = useState<Item | null>(null);
+  const [deactivating, setDeactivating] = useState(false);
+
+  // ── Data fetching ──────────────────────────────────────────────────────────
+
+  async function fetchItems() {
+    setLoading(true);
+    try {
+      const data = await api.get<{ items: Item[] }>('/api/items');
+      setItems(data.items);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to load items.', 'danger');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    fetchItems();
+  }, []);
+
+  // ── Modal helpers ──────────────────────────────────────────────────────────
+
+  function openCreate() {
+    setEditingItem(null);
+    setForm(EMPTY_FORM);
+    setModalOpen(true);
+  }
+
+  function openEdit(item: Item) {
+    setEditingItem(item);
+    setForm({
+      name: item.name,
+      type: item.type,
+      description: item.description ?? '',
+      salesPrice: item.salesPrice ?? '',
+      purchaseCost: item.purchaseCost ?? '',
+      sku: item.sku ?? '',
+    });
+    setModalOpen(true);
+  }
+
+  function closeModal() {
+    setModalOpen(false);
+    setEditingItem(null);
+    setForm(EMPTY_FORM);
+  }
+
+  function setField<K extends keyof FormState>(key: K, value: FormState[K]) {
+    setForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  // ── Submit (create / edit) ─────────────────────────────────────────────────
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!form.name.trim()) {
+      toast('Item name is required.', 'danger');
+      return;
+    }
+
+    const payload = {
+      name: form.name.trim(),
+      type: form.type,
+      description: form.description.trim() || null,
+      salesPrice: form.salesPrice.trim() || null,
+      purchaseCost: form.purchaseCost.trim() || null,
+      sku: form.sku.trim() || null,
+    };
+
+    setSaving(true);
+    try {
+      if (editingItem) {
+        await api.patch(`/api/items/${editingItem.id}`, payload);
+        toast('Item updated.', 'success');
+      } else {
+        await api.post('/api/items', payload);
+        toast('Item created.', 'success');
+      }
+      closeModal();
+      await fetchItems();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Save failed.', 'danger');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // ── Deactivate ─────────────────────────────────────────────────────────────
+
+  async function handleDeactivate() {
+    if (!confirmItem) return;
+    setDeactivating(true);
+    try {
+      await api.del(`/api/items/${confirmItem.id}`);
+      toast(`"${confirmItem.name}" deactivated.`, 'success');
+      setConfirmItem(null);
+      await fetchItems();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Deactivation failed.', 'danger');
+    } finally {
+      setDeactivating(false);
+    }
+  }
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+
+  return (
+    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+      <Toaster />
+
+      <PageHeader
+        title="Products & Services"
+        icon={Package}
+        action={
+          <Button onClick={openCreate}>
+            <Plus className="h-4 w-4" /> Add Item
+          </Button>
+        }
+      />
+
+      <Card>
+        {loading ? (
+          <div className="py-16 text-center text-navy/40 text-sm">Loading items…</div>
+        ) : items.length === 0 ? (
+          <div className="py-16 text-center">
+            <Package className="mx-auto h-10 w-10 text-navy/20 mb-3" />
+            <p className="text-navy/40 text-sm">No items yet. Add your first product or service.</p>
+          </div>
+        ) : (
+          <Table>
+            <thead>
+              <tr>
+                <Th>Name</Th>
+                <Th>SKU</Th>
+                <Th>Type</Th>
+                <Th>Description</Th>
+                <Th className="text-right">Sales Price</Th>
+                <Th className="text-right">Purchase Cost</Th>
+                <Th className="text-center">Taxable</Th>
+                <Th className="text-center">Actions</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((item) => (
+                <Tr key={item.id}>
+                  <Td className="font-semibold text-navy">{item.name}</Td>
+                  <Td className="text-navy/50 text-sm">{item.sku ?? '—'}</Td>
+                  <Td>
+                    <Badge tone={TYPE_TONES[item.type]}>
+                      {TYPE_LABELS[item.type]}
+                    </Badge>
+                  </Td>
+                  <Td className="text-navy/60 text-sm max-w-[200px] truncate">
+                    {item.description ?? '—'}
+                  </Td>
+                  <Td className="text-right tabular-nums">
+                    {item.salesPrice ? formatCurrency(item.salesPrice) : '—'}
+                  </Td>
+                  <Td className="text-right tabular-nums">
+                    {item.purchaseCost ? formatCurrency(item.purchaseCost) : '—'}
+                  </Td>
+                  <Td className="text-center">
+                    {item.taxable ? (
+                      <Badge tone="success">Yes</Badge>
+                    ) : (
+                      <Badge tone="neutral">No</Badge>
+                    )}
+                  </Td>
+                  <Td className="text-center">
+                    <div className="inline-flex gap-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title="Edit item"
+                        onClick={() => openEdit(item)}
+                      >
+                        <Pencil className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title="Deactivate item"
+                        onClick={() => setConfirmItem(item)}
+                        className="text-red-400 hover:text-red-600 hover:bg-red-50"
+                      >
+                        <PowerOff className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  </Td>
+                </Tr>
+              ))}
+            </tbody>
+          </Table>
+        )}
+      </Card>
+
+      {/* Create / Edit Modal */}
+      <Modal
+        open={modalOpen}
+        onClose={closeModal}
+        title={editingItem ? 'Edit Item' : 'Add Item'}
+        footer={
+          <>
+            <Button variant="secondary" onClick={closeModal} disabled={saving}>
+              Cancel
+            </Button>
+            <Button onClick={handleSubmit} disabled={saving}>
+              {saving ? 'Saving…' : editingItem ? 'Save Changes' : 'Create Item'}
+            </Button>
+          </>
+        }
+      >
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <Label htmlFor="item-name">Name *</Label>
+            <Input
+              id="item-name"
+              value={form.name}
+              onChange={(e) => setField('name', e.target.value)}
+              placeholder="e.g. Consulting Hour"
+              required
+              autoFocus
+            />
+          </div>
+
+          <div>
+            <Label htmlFor="item-type">Type</Label>
+            <Select
+              id="item-type"
+              value={form.type}
+              onChange={(e) => setField('type', e.target.value as ItemType)}
+            >
+              <option value="service">Service</option>
+              <option value="inventory">Inventory</option>
+              <option value="non_inventory">Non-Inventory</option>
+              <option value="bundle">Bundle</option>
+            </Select>
+          </div>
+
+          <div>
+            <Label htmlFor="item-sku">SKU / Product Code</Label>
+            <Input
+              id="item-sku"
+              value={form.sku}
+              onChange={(e) => setField('sku', e.target.value)}
+              placeholder="Optional"
+            />
+          </div>
+
+          <div>
+            <Label htmlFor="item-description">Description</Label>
+            <Input
+              id="item-description"
+              value={form.description}
+              onChange={(e) => setField('description', e.target.value)}
+              placeholder="Optional short description"
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <Label htmlFor="item-sales-price">Sales Price</Label>
+              <Input
+                id="item-sales-price"
+                type="number"
+                min="0"
+                step="0.01"
+                value={form.salesPrice}
+                onChange={(e) => setField('salesPrice', e.target.value)}
+                placeholder="0.00"
+              />
+            </div>
+            <div>
+              <Label htmlFor="item-purchase-cost">Purchase Cost</Label>
+              <Input
+                id="item-purchase-cost"
+                type="number"
+                min="0"
+                step="0.01"
+                value={form.purchaseCost}
+                onChange={(e) => setField('purchaseCost', e.target.value)}
+                placeholder="0.00"
+              />
+            </div>
+          </div>
+        </form>
+      </Modal>
+
+      {/* Deactivate Confirmation Modal */}
+      <Modal
+        open={!!confirmItem}
+        onClose={() => setConfirmItem(null)}
+        title="Deactivate Item"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setConfirmItem(null)} disabled={deactivating}>
+              Cancel
+            </Button>
+            <Button variant="danger" onClick={handleDeactivate} disabled={deactivating}>
+              {deactivating ? 'Deactivating…' : 'Deactivate'}
+            </Button>
+          </>
+        }
+      >
+        <p className="text-navy/70 text-sm">
+          Are you sure you want to deactivate{' '}
+          <span className="font-semibold text-navy">{confirmItem?.name}</span>? It will be hidden
+          from active lists but preserved on historical documents. You can reactivate it later.
+        </p>
+      </Modal>
+    </main>
+  );
+}

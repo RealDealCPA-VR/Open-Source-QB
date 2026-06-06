@@ -1,0 +1,55 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# local env files
+.env*.local
+.env
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# local company data (embedded PGlite databases) — never commit financial data
+.bookkeeper-data/
+
+# desktop build output
+/dist
+/dist-electron
+/release
+
+# corrupt repo backup (safe to delete once the new repo is confirmed)
+/.git_corrupt_backup
+
+# code-signing certificates / keys — never commit
+*.pfx
+*.p12
+build/code-sign.pfx
+
+# NOTE: /drizzle (generated SQL migrations) IS tracked on purpose — it is the DB source of
+# truth and is bundled into the desktop build.

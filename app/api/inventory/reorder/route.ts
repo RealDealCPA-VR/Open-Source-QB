@@ -1,0 +1,35 @@
+/**
+ * GET /api/inventory/reorder
+ *
+ * Returns all inventory items where quantityOnHand <= reorderPoint,
+ * along with a suggested reorder quantity for each.
+ */
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerContext } from '@/lib/context';
+import { reorderReport } from '@/lib/services/inventoryOps';
+import { ServiceError } from '@/lib/services/_base';
+
+function serviceErrorToResponse(err: ServiceError): NextResponse {
+  const statusMap: Record<string, number> = {
+    NOT_FOUND: 404,
+    VALIDATION: 400,
+    UNBALANCED: 400,
+    FORBIDDEN: 403,
+    CONFLICT: 409,
+    PERIOD_CLOSED: 409,
+  };
+  const status = statusMap[err.code] ?? 500;
+  return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
+}
+
+export async function GET(_req: NextRequest): Promise<NextResponse> {
+  try {
+    const ctx = await getServerContext();
+    const result = await reorderReport(ctx);
+    return NextResponse.json(result);
+  } catch (err) {
+    if (err instanceof ServiceError) return serviceErrorToResponse(err);
+    console.error('[GET /api/inventory/reorder]', err);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}

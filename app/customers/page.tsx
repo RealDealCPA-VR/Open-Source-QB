@@ -1,0 +1,493 @@
+'use client';
+
+import { useEffect, useState } from 'react';
+import { Users, Pencil, UserX, Plus } from 'lucide-react';
+import {
+  Button,
+  Card,
+  Input,
+  Select,
+  Label,
+  Badge,
+  Table,
+  Th,
+  Td,
+  Tr,
+  Modal,
+  PageHeader,
+  toast,
+  Toaster,
+} from '@/components/ui';
+import { api, ApiError } from '@/lib/client';
+import { formatCurrency } from '@/lib/money';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface Customer {
+  id: string;
+  displayName: string;
+  companyName: string | null;
+  email: string | null;
+  phone: string | null;
+  balance: string;
+  isActive: boolean;
+  terms: string | null;
+  notes: string | null;
+}
+
+interface CustomerFormState {
+  displayName: string;
+  companyName: string;
+  email: string;
+  phone: string;
+  terms: string;
+  notes: string;
+}
+
+const EMPTY_FORM: CustomerFormState = {
+  displayName: '',
+  companyName: '',
+  email: '',
+  phone: '',
+  terms: 'net_30',
+  notes: '',
+};
+
+const TERMS_OPTIONS = [
+  { value: 'net_15', label: 'Net 15' },
+  { value: 'net_30', label: 'Net 30' },
+  { value: 'net_60', label: 'Net 60' },
+  { value: 'net_90', label: 'Net 90' },
+  { value: 'due_on_receipt', label: 'Due on Receipt' },
+];
+
+// ---------------------------------------------------------------------------
+// Customer form (shared by add + edit modal)
+// ---------------------------------------------------------------------------
+
+function CustomerForm({
+  form,
+  onChange,
+}: {
+  form: CustomerFormState;
+  onChange: (field: keyof CustomerFormState, value: string) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-4">
+      <div>
+        <Label htmlFor="displayName">Display Name *</Label>
+        <Input
+          id="displayName"
+          placeholder="e.g. Acme Corp"
+          value={form.displayName}
+          onChange={(e) => onChange('displayName', e.target.value)}
+          required
+        />
+      </div>
+      <div>
+        <Label htmlFor="companyName">Company Name</Label>
+        <Input
+          id="companyName"
+          placeholder="e.g. Acme Corporation Ltd."
+          value={form.companyName}
+          onChange={(e) => onChange('companyName', e.target.value)}
+        />
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <Label htmlFor="email">Email</Label>
+          <Input
+            id="email"
+            type="email"
+            placeholder="billing@example.com"
+            value={form.email}
+            onChange={(e) => onChange('email', e.target.value)}
+          />
+        </div>
+        <div>
+          <Label htmlFor="phone">Phone</Label>
+          <Input
+            id="phone"
+            type="tel"
+            placeholder="(555) 123-4567"
+            value={form.phone}
+            onChange={(e) => onChange('phone', e.target.value)}
+          />
+        </div>
+      </div>
+      <div>
+        <Label htmlFor="terms">Payment Terms</Label>
+        <Select
+          id="terms"
+          value={form.terms}
+          onChange={(e) => onChange('terms', e.target.value)}
+        >
+          {TERMS_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
+            </option>
+          ))}
+        </Select>
+      </div>
+      <div>
+        <Label htmlFor="notes">Notes</Label>
+        <textarea
+          id="notes"
+          rows={3}
+          placeholder="Internal notes about this customer..."
+          value={form.notes}
+          onChange={(e) => onChange('notes', e.target.value)}
+          className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy outline-none focus:border-electric focus:ring-2 focus:ring-electric/30 placeholder:text-navy/30 resize-none"
+        />
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Page
+// ---------------------------------------------------------------------------
+
+export default function CustomersPage() {
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [includeInactive, setIncludeInactive] = useState(false);
+
+  // Add modal
+  const [addOpen, setAddOpen] = useState(false);
+  const [addForm, setAddForm] = useState<CustomerFormState>(EMPTY_FORM);
+  const [addSaving, setAddSaving] = useState(false);
+
+  // Edit modal
+  const [editOpen, setEditOpen] = useState(false);
+  const [editTarget, setEditTarget] = useState<Customer | null>(null);
+  const [editForm, setEditForm] = useState<CustomerFormState>(EMPTY_FORM);
+  const [editSaving, setEditSaving] = useState(false);
+
+  // Deactivate confirm modal
+  const [deactivateTarget, setDeactivateTarget] = useState<Customer | null>(null);
+  const [deactivating, setDeactivating] = useState(false);
+
+  // ---------------------------------------------------------------------------
+  // Data fetching
+  // ---------------------------------------------------------------------------
+
+  async function fetchCustomers() {
+    setLoading(true);
+    try {
+      const url = includeInactive
+        ? '/api/customers?includeInactive=true'
+        : '/api/customers';
+      const data = await api.get<Customer[]>(url);
+      setCustomers(data);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to load customers', 'danger');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    fetchCustomers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [includeInactive]);
+
+  // ---------------------------------------------------------------------------
+  // Add customer
+  // ---------------------------------------------------------------------------
+
+  function openAddModal() {
+    setAddForm(EMPTY_FORM);
+    setAddOpen(true);
+  }
+
+  function updateAddForm(field: keyof CustomerFormState, value: string) {
+    setAddForm((prev) => ({ ...prev, [field]: value }));
+  }
+
+  async function handleAdd() {
+    if (!addForm.displayName.trim()) {
+      toast('Display name is required', 'danger');
+      return;
+    }
+    setAddSaving(true);
+    try {
+      await api.post('/api/customers', {
+        displayName: addForm.displayName.trim(),
+        companyName: addForm.companyName.trim() || undefined,
+        email: addForm.email.trim() || undefined,
+        phone: addForm.phone.trim() || undefined,
+        terms: addForm.terms || undefined,
+        notes: addForm.notes.trim() || undefined,
+      });
+      toast('Customer created', 'success');
+      setAddOpen(false);
+      await fetchCustomers();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to create customer', 'danger');
+    } finally {
+      setAddSaving(false);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Edit customer
+  // ---------------------------------------------------------------------------
+
+  function openEditModal(customer: Customer) {
+    setEditTarget(customer);
+    setEditForm({
+      displayName: customer.displayName,
+      companyName: customer.companyName ?? '',
+      email: customer.email ?? '',
+      phone: customer.phone ?? '',
+      terms: customer.terms ?? 'net_30',
+      notes: customer.notes ?? '',
+    });
+    setEditOpen(true);
+  }
+
+  function updateEditForm(field: keyof CustomerFormState, value: string) {
+    setEditForm((prev) => ({ ...prev, [field]: value }));
+  }
+
+  async function handleEdit() {
+    if (!editTarget) return;
+    if (!editForm.displayName.trim()) {
+      toast('Display name is required', 'danger');
+      return;
+    }
+    setEditSaving(true);
+    try {
+      await api.patch(`/api/customers/${editTarget.id}`, {
+        displayName: editForm.displayName.trim(),
+        companyName: editForm.companyName.trim() || null,
+        email: editForm.email.trim() || null,
+        phone: editForm.phone.trim() || null,
+        terms: editForm.terms || null,
+        notes: editForm.notes.trim() || null,
+      });
+      toast('Customer updated', 'success');
+      setEditOpen(false);
+      setEditTarget(null);
+      await fetchCustomers();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to update customer', 'danger');
+    } finally {
+      setEditSaving(false);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Deactivate customer
+  // ---------------------------------------------------------------------------
+
+  async function handleDeactivate() {
+    if (!deactivateTarget) return;
+    setDeactivating(true);
+    try {
+      await api.del(`/api/customers/${deactivateTarget.id}`);
+      toast(`${deactivateTarget.displayName} deactivated`, 'success');
+      setDeactivateTarget(null);
+      await fetchCustomers();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to deactivate customer', 'danger');
+    } finally {
+      setDeactivating(false);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
+
+  const termsLabel = (val: string | null) =>
+    TERMS_OPTIONS.find((o) => o.value === val)?.label ?? val ?? '-';
+
+  return (
+    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
+      <PageHeader
+        title="Customers"
+        icon={Users}
+        action={
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-2 text-sm text-navy/60 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={includeInactive}
+                onChange={(e) => setIncludeInactive(e.target.checked)}
+                className="rounded border-slate-300 text-electric focus:ring-electric/40"
+              />
+              Show inactive
+            </label>
+            <Button onClick={openAddModal}>
+              <Plus className="h-4 w-4" />
+              Add Customer
+            </Button>
+          </div>
+        }
+      />
+
+      <Card>
+        {loading ? (
+          <div className="p-12 text-center text-navy/40 text-sm">Loading customers...</div>
+        ) : customers.length === 0 ? (
+          <div className="p-12 text-center">
+            <Users className="mx-auto h-10 w-10 text-navy/20 mb-3" />
+            <p className="text-navy/50 text-sm">
+              {includeInactive
+                ? 'No customers found.'
+                : 'No active customers yet. Click "Add Customer" to get started.'}
+            </p>
+          </div>
+        ) : (
+          <Table>
+            <thead>
+              <tr>
+                <Th>Name</Th>
+                <Th>Company</Th>
+                <Th>Email</Th>
+                <Th>Phone</Th>
+                <Th>Terms</Th>
+                <Th className="text-right">Balance</Th>
+                <Th>Status</Th>
+                <Th className="text-right">Actions</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {customers.map((c) => (
+                <Tr key={c.id}>
+                  <Td className="font-semibold text-navy">{c.displayName}</Td>
+                  <Td className="text-navy/70">{c.companyName ?? '-'}</Td>
+                  <Td className="text-navy/70">
+                    {c.email ? (
+                      <a
+                        href={`mailto:${c.email}`}
+                        className="text-electric hover:underline"
+                      >
+                        {c.email}
+                      </a>
+                    ) : (
+                      '-'
+                    )}
+                  </Td>
+                  <Td className="text-navy/70">{c.phone ?? '-'}</Td>
+                  <Td className="text-navy/70">{termsLabel(c.terms)}</Td>
+                  <Td className="text-right font-mono font-semibold text-navy">
+                    {formatCurrency(c.balance)}
+                  </Td>
+                  <Td>
+                    {c.isActive ? (
+                      <Badge tone="success">Active</Badge>
+                    ) : (
+                      <Badge tone="neutral">Inactive</Badge>
+                    )}
+                  </Td>
+                  <Td className="text-right">
+                    <div className="flex items-center justify-end gap-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => openEditModal(c)}
+                        title="Edit customer"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                        Edit
+                      </Button>
+                      {c.isActive && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setDeactivateTarget(c)}
+                          title="Deactivate customer"
+                          className="text-red-500 hover:bg-red-50"
+                        >
+                          <UserX className="h-3.5 w-3.5" />
+                          Deactivate
+                        </Button>
+                      )}
+                    </div>
+                  </Td>
+                </Tr>
+              ))}
+            </tbody>
+          </Table>
+        )}
+      </Card>
+
+      {/* ---- Add customer modal ---- */}
+      <Modal
+        open={addOpen}
+        onClose={() => setAddOpen(false)}
+        title="Add Customer"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addSaving}>
+              Cancel
+            </Button>
+            <Button onClick={handleAdd} disabled={addSaving}>
+              {addSaving ? 'Saving...' : 'Create Customer'}
+            </Button>
+          </>
+        }
+      >
+        <CustomerForm form={addForm} onChange={updateAddForm} />
+      </Modal>
+
+      {/* ---- Edit customer modal ---- */}
+      <Modal
+        open={editOpen}
+        onClose={() => { setEditOpen(false); setEditTarget(null); }}
+        title={`Edit: ${editTarget?.displayName ?? ''}`}
+        footer={
+          <>
+            <Button
+              variant="secondary"
+              onClick={() => { setEditOpen(false); setEditTarget(null); }}
+              disabled={editSaving}
+            >
+              Cancel
+            </Button>
+            <Button onClick={handleEdit} disabled={editSaving}>
+              {editSaving ? 'Saving...' : 'Save Changes'}
+            </Button>
+          </>
+        }
+      >
+        <CustomerForm form={editForm} onChange={updateEditForm} />
+      </Modal>
+
+      {/* ---- Deactivate confirm modal ---- */}
+      <Modal
+        open={!!deactivateTarget}
+        onClose={() => setDeactivateTarget(null)}
+        title="Deactivate Customer"
+        footer={
+          <>
+            <Button
+              variant="secondary"
+              onClick={() => setDeactivateTarget(null)}
+              disabled={deactivating}
+            >
+              Cancel
+            </Button>
+            <Button variant="danger" onClick={handleDeactivate} disabled={deactivating}>
+              {deactivating ? 'Deactivating...' : 'Yes, Deactivate'}
+            </Button>
+          </>
+        }
+      >
+        <p className="text-navy/70 text-sm">
+          Are you sure you want to deactivate{' '}
+          <strong className="text-navy">{deactivateTarget?.displayName}</strong>? They will no
+          longer appear in active customer lists, but all historical invoices and payments will be
+          preserved.
+        </p>
+      </Modal>
+
+      <Toaster />
+    </main>
+  );
+}

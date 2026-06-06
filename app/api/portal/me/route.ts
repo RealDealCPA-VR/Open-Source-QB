@@ -1,0 +1,23 @@
+/** GET /api/portal/me — the signed-in employee's profile + their paychecks. */
+import { NextResponse } from 'next/server';
+import { desc, eq } from 'drizzle-orm';
+import { getDb } from '@/lib/db';
+import { employees, paychecks } from '@/lib/db/schema';
+import { getPortalEmployeeId } from '@/lib/auth';
+
+export async function GET() {
+  const employeeId = await getPortalEmployeeId();
+  if (!employeeId) return NextResponse.json({ error: 'Not authenticated', code: 'FORBIDDEN' }, { status: 401 });
+  const db = await getDb();
+  const [emp] = await db.select().from(employees).where(eq(employees.id, employeeId));
+  if (!emp) return NextResponse.json({ error: 'Not found', code: 'NOT_FOUND' }, { status: 404 });
+  const checks = await db
+    .select()
+    .from(paychecks)
+    .where(eq(paychecks.employeeId, employeeId))
+    .orderBy(desc(paychecks.payDate));
+  return NextResponse.json({
+    employee: { id: emp.id, name: `${emp.firstName} ${emp.lastName}`, email: emp.email, payType: emp.payType },
+    paychecks: checks,
+  });
+}

@@ -1,0 +1,2 @@
+ALTER TABLE "journal_entry_lines" ADD COLUMN "class_id" uuid;--> statement-breakpoint
+ALTER TABLE "journal_entry_lines" ADD CONSTRAINT "journal_entry_lines_class_id_classes_id_fk" FOREIGN KEY ("class_id") REFERENCES "public"."classes"("id") ON DELETE no action ON UPDATE no action;

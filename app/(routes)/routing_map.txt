@@ -1,0 +1,9 @@
+# Routing map for QuickBooks-alternative executive-grade app
+
+/dashboard/page.tsx        -> Executive overview dashboard
+/banking/page.tsx          -> Bank accounts & transactions view
+/transactions/page.tsx     -> All financial transactions (search, filter, table)
+/accounts/page.tsx         -> Chart of Accounts (details, edit, hierarchy)
+/invoices/page.tsx         -> Invoice dashboard
+/reports/page.tsx          -> Financial reports selector (P&L, Balance Sheet, etc.)
+/settings/page.tsx         -> Executive-level product/configuration settings

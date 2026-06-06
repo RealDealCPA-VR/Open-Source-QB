@@ -1,0 +1,81 @@
+/**
+ * GET   /api/jobs/[id]  — fetch a single job, optionally with profitability.
+ * PATCH /api/jobs/[id]  — update mutable fields.
+ * DELETE /api/jobs/[id] — soft-deactivate (isActive = false).
+ *
+ * Query params for GET:
+ *   ?profitability=true  — include jobProfitability breakdown in the response.
+ */
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerContext } from '@/lib/context';
+import { getJob, updateJob, deactivateJob, jobProfitability } from '@/lib/services/jobs';
+import { ServiceError } from '@/lib/services/_base';
+
+function errorResponse(err: unknown) {
+  if (err instanceof ServiceError) {
+    const status =
+      err.code === 'NOT_FOUND' ? 404
+      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
+      : err.code === 'FORBIDDEN' ? 403
+      : err.code === 'CONFLICT' ? 409
+      : 500;
+    return NextResponse.json({ error: err.message, code: err.code }, { status });
+  }
+  console.error('[api/jobs/[id]] unexpected error:', err);
+  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+}
+
+interface RouteParams {
+  params: Promise<{ id: string }>;
+}
+
+export async function GET(req: NextRequest, { params }: RouteParams) {
+  try {
+    const { id } = await params;
+    const ctx = await getServerContext();
+    const { searchParams } = req.nextUrl;
+
+    const job = await getJob(ctx, id);
+
+    if (searchParams.get('profitability') === 'true') {
+      const profitability = await jobProfitability(ctx, id);
+      return NextResponse.json({ ...job, profitability });
+    }
+
+    return NextResponse.json(job);
+  } catch (err) {
+    return errorResponse(err);
+  }
+}
+
+export async function PATCH(req: NextRequest, { params }: RouteParams) {
+  try {
+    const { id } = await params;
+    const ctx = await getServerContext();
+    const body = await req.json();
+
+    const patch: Record<string, unknown> = {};
+    if (body.name !== undefined) patch.name = body.name;
+    if (body.customerId !== undefined) patch.customerId = body.customerId;
+    if (body.budget !== undefined) patch.budget = body.budget;
+    if (body.startDate !== undefined) patch.startDate = body.startDate ? new Date(body.startDate) : null;
+    if (body.endDate !== undefined) patch.endDate = body.endDate ? new Date(body.endDate) : null;
+    if (body.status !== undefined) patch.status = body.status;
+
+    const job = await updateJob(ctx, id, patch);
+    return NextResponse.json(job);
+  } catch (err) {
+    return errorResponse(err);
+  }
+}
+
+export async function DELETE(_req: NextRequest, { params }: RouteParams) {
+  try {
+    const { id } = await params;
+    const ctx = await getServerContext();
+    const job = await deactivateJob(ctx, id);
+    return NextResponse.json(job);
+  } catch (err) {
+    return errorResponse(err);
+  }
+}

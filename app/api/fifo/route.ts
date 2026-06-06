@@ -1,0 +1,128 @@
+/**
+ * GET  /api/fifo  — FIFO inventory valuation (all items, per-layer breakdown)
+ * POST /api/fifo  — receive or consume stock using FIFO cost layers
+ *
+ * POST body shapes:
+ *   { action: 'receive', itemId, quantity, unitCost, date, memo? }
+ *   { action: 'consume', itemId, quantity, date, memo? }
+ */
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerContext } from '@/lib/context';
+import { receiveStock, consumeStock, fifoValuation } from '@/lib/services/fifo';
+import { ServiceError } from '@/lib/services/_base';
+
+// ── Error helper ──────────────────────────────────────────────────────────────
+
+function serviceErrorToResponse(err: ServiceError): NextResponse {
+  const statusMap: Record<string, number> = {
+    NOT_FOUND: 404,
+    VALIDATION: 400,
+    UNBALANCED: 400,
+    FORBIDDEN: 403,
+    CONFLICT: 409,
+    PERIOD_CLOSED: 409,
+  };
+  const status = statusMap[err.code] ?? 500;
+  return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
+}
+
+// ── GET /api/fifo ─────────────────────────────────────────────────────────────
+
+export async function GET(_req: NextRequest): Promise<NextResponse> {
+  try {
+    const ctx = await getServerContext();
+    const valuation = await fifoValuation(ctx);
+    return NextResponse.json(valuation);
+  } catch (err) {
+    if (err instanceof ServiceError) return serviceErrorToResponse(err);
+    console.error('[GET /api/fifo]', err);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}
+
+// ── POST /api/fifo ────────────────────────────────────────────────────────────
+
+export async function POST(req: NextRequest): Promise<NextResponse> {
+  try {
+    const ctx = await getServerContext();
+    const body = await req.json() as Record<string, unknown>;
+    const { action } = body;
+
+    if (!action) {
+      return NextResponse.json(
+        { error: 'action is required: "receive" or "consume"', code: 'VALIDATION' },
+        { status: 400 },
+      );
+    }
+
+    if (action === 'receive') {
+      const { itemId, quantity, unitCost, date, memo } = body as {
+        itemId?: string;
+        quantity?: string | number;
+        unitCost?: string | number;
+        date?: string;
+        memo?: string | null;
+      };
+
+      if (!itemId) {
+        return NextResponse.json({ error: 'itemId is required', code: 'VALIDATION' }, { status: 400 });
+      }
+      if (quantity == null) {
+        return NextResponse.json({ error: 'quantity is required', code: 'VALIDATION' }, { status: 400 });
+      }
+      if (unitCost == null) {
+        return NextResponse.json({ error: 'unitCost is required', code: 'VALIDATION' }, { status: 400 });
+      }
+      if (!date) {
+        return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
+      }
+
+      const result = await receiveStock(ctx, {
+        itemId,
+        quantity,
+        unitCost,
+        date: new Date(date),
+        memo: memo ?? null,
+      });
+
+      return NextResponse.json(result, { status: 201 });
+    }
+
+    if (action === 'consume') {
+      const { itemId, quantity, date, memo } = body as {
+        itemId?: string;
+        quantity?: string | number;
+        date?: string;
+        memo?: string | null;
+      };
+
+      if (!itemId) {
+        return NextResponse.json({ error: 'itemId is required', code: 'VALIDATION' }, { status: 400 });
+      }
+      if (quantity == null) {
+        return NextResponse.json({ error: 'quantity is required', code: 'VALIDATION' }, { status: 400 });
+      }
+      if (!date) {
+        return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
+      }
+
+      const result = await consumeStock(ctx, {
+        itemId,
+        quantity,
+        date: new Date(date),
+        memo: memo ?? null,
+      });
+
+      return NextResponse.json(result, { status: 201 });
+    }
+
+    return NextResponse.json(
+      { error: `Unknown action "${action}". Use "receive" or "consume".`, code: 'VALIDATION' },
+      { status: 400 },
+    );
+  } catch (err) {
+    if (err instanceof ServiceError) return serviceErrorToResponse(err);
+    console.error('[POST /api/fifo]', err);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}

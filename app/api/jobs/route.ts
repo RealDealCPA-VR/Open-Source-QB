@@ -1,0 +1,61 @@
+/**
+ * GET  /api/jobs  — list jobs for the active company.
+ * POST /api/jobs  — create a new job/project.
+ *
+ * Query params for GET:
+ *   ?includeInactive=true  — include deactivated jobs.
+ *   ?summary=true          — return jobsSummary (revenue/cost/profit per active job).
+ */
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerContext } from '@/lib/context';
+import { listJobs, createJob, jobsSummary } from '@/lib/services/jobs';
+import { ServiceError } from '@/lib/services/_base';
+
+function errorResponse(err: unknown) {
+  if (err instanceof ServiceError) {
+    const status =
+      err.code === 'NOT_FOUND' ? 404
+      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
+      : err.code === 'FORBIDDEN' ? 403
+      : err.code === 'CONFLICT' ? 409
+      : 500;
+    return NextResponse.json({ error: err.message, code: err.code }, { status });
+  }
+  console.error('[api/jobs] unexpected error:', err);
+  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+}
+
+export async function GET(req: NextRequest) {
+  try {
+    const ctx = await getServerContext();
+    const { searchParams } = req.nextUrl;
+
+    if (searchParams.get('summary') === 'true') {
+      const summary = await jobsSummary(ctx);
+      return NextResponse.json(summary);
+    }
+
+    const includeInactive = searchParams.get('includeInactive') === 'true';
+    const list = await listJobs(ctx, { includeInactive });
+    return NextResponse.json(list);
+  } catch (err) {
+    return errorResponse(err);
+  }
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const ctx = await getServerContext();
+    const body = await req.json();
+    const job = await createJob(ctx, {
+      name: body.name,
+      customerId: body.customerId ?? null,
+      budget: body.budget ?? null,
+      startDate: body.startDate ? new Date(body.startDate) : null,
+      endDate: body.endDate ? new Date(body.endDate) : null,
+    });
+    return NextResponse.json(job, { status: 201 });
+  } catch (err) {
+    return errorResponse(err);
+  }
+}
