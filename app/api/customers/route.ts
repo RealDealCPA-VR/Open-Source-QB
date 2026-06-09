@@ -14,6 +14,8 @@ import {
   customerBalanceSummary,
 } from '@/lib/services/customers';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createCustomerSchema } from '@/lib/validation/customers';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -50,8 +52,12 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-    const customer = await createCustomer(ctx, body);
+    const body = await req.json().catch(() => ({}));
+    const parsed = createCustomerSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
+    const customer = await createCustomer(ctx, parsed.data);
     return NextResponse.json(customer, { status: 201 });
   } catch (err) {
     return errorResponse(err);

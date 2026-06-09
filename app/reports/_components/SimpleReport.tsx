@@ -1,14 +1,17 @@
 'use client';
 
 /**
- * Generic flat-table report page: optional date-range or as-of controls, CSV
- * export, loading/error states, totals footer. Each concrete report page just
- * supplies columns + an endpoint builder. Underscore folder — not a route.
+ * Generic flat-table report page: optional date-range or as-of controls, the
+ * shared export toolbar (CSV / Excel / PDF / Print / Email + column show/hide
+ * + custom header), loading/error states, totals footer. Each concrete report
+ * page just supplies columns + an endpoint builder. Underscore folder — not a
+ * route.
  */
 import { useCallback, useEffect, useState } from 'react';
 import { Button, Card, EmptyState, PageHeader, Spinner, Table, Th, Td, Tr, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { AsOfControl, RangeControls, downloadCsv, todayStr, yearStartStr, type CsvCell } from './shared';
+import ReportToolbar, { type ExportTable } from './ReportToolbar';
+import { AsOfControl, RangeControls, todayStr, yearStartStr, type CsvCell } from './shared';
 
 export interface SimpleColumn<R> {
   header: string;
@@ -59,6 +62,8 @@ export default function SimpleReport<T, R>({
   const [data, setData] = useState<T | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  /** Hidden column headers (column show/hide picker in the toolbar). */
+  const [hidden, setHidden] = useState<Set<string>>(new Set());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -83,32 +88,51 @@ export default function SimpleReport<T, R>({
 
   const rows = data ? getRows(data) : [];
 
-  const exportCsv = () => {
-    if (!data) return;
-    const csvRows: CsvCell[][] = rows.map((r) => columns.map((c) => c.csv(r)));
-    for (const f of footerRows?.(data) ?? []) csvRows.push(f.cells);
-    downloadCsv(
-      csvName,
-      `${title}${subtitle && data ? ` — ${subtitle(data)}` : ''}`,
-      columns.map((c) => c.header),
-      csvRows,
-    );
-  };
+  // Visible-column projection (indices into the full column list).
+  const visibleIdx = columns
+    .map((c, i) => (hidden.has(c.header) ? -1 : i))
+    .filter((i) => i >= 0);
+  const visibleColumns = visibleIdx.map((i) => columns[i]);
+
+  const isNumeric = (c: SimpleColumn<R>) =>
+    c.numeric || (c.className?.includes('text-right') ?? false);
+
+  const table: ExportTable | null = data
+    ? {
+        filename: csvName.replace(/\.csv$/i, ''),
+        title,
+        subtitle: subtitle?.(data),
+        columns: visibleColumns.map((c) => ({ header: c.header, numeric: isNumeric(c) })),
+        rows: rows.map((r) => visibleIdx.map((i) => columns[i].csv(r))),
+        totals: footerRows?.(data).map((f) => visibleIdx.map((i) => f.cells[i])),
+      }
+    : null;
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader
-        title={title}
-        icon={icon}
-        action={
-          <Button variant="secondary" size="sm" disabled={!data || loading} onClick={exportCsv}>
-            Download CSV
-          </Button>
+      <PageHeader title={title} icon={icon} />
+
+      <ReportToolbar
+        table={table}
+        disabled={loading}
+        columnPicker={columns.map((c) => ({
+          key: c.header,
+          label: c.header,
+          visible: !hidden.has(c.header),
+        }))}
+        onToggleColumn={(key) =>
+          setHidden((prev) => {
+            const next = new Set(prev);
+            if (next.has(key)) next.delete(key);
+            // Never allow hiding the last visible column.
+            else if (next.size < columns.length - 1) next.add(key);
+            return next;
+          })
         }
       />
 
       {controls !== 'none' && (
-        <Card className="p-4 mb-4">
+        <Card className="p-4 mb-4 print-hidden">
           {controls === 'range' ? (
             <RangeControls from={from} to={to} onFrom={setFrom} onTo={setTo} onRun={load} />
           ) : (
@@ -142,7 +166,7 @@ export default function SimpleReport<T, R>({
           <Table>
             <thead>
               <tr>
-                {columns.map((c) => (
+                {visibleColumns.map((c) => (
                   <Th key={c.header} numeric={c.numeric} className={c.className}>
                     {c.header}
                   </Th>
@@ -152,14 +176,14 @@ export default function SimpleReport<T, R>({
             <tbody>
               {rows.length === 0 ? (
                 <tr>
-                  <td colSpan={columns.length}>
+                  <td colSpan={visibleColumns.length}>
                     <EmptyState icon={icon} title={emptyText} />
                   </td>
                 </tr>
               ) : (
                 rows.map((row, i) => (
                   <Tr key={i}>
-                    {columns.map((c) => (
+                    {visibleColumns.map((c) => (
                       <Td key={c.header} numeric={c.numeric} className={c.className}>
                         {c.cell(row)}
                       </Td>
@@ -179,12 +203,12 @@ export default function SimpleReport<T, R>({
                         : 'border-t border-navy/10 font-semibold text-navy/80'
                     }
                   >
-                    {f.cells.map((cell, j) => (
+                    {visibleIdx.map((colIdx) => (
                       <td
-                        key={j}
-                        className={`py-3 px-4 ${columns[j]?.numeric || columns[j]?.className?.includes('text-right') ? 'text-right tabular-nums' : ''}`}
+                        key={colIdx}
+                        className={`py-3 px-4 ${isNumeric(columns[colIdx]) ? 'text-right tabular-nums' : ''}`}
                       >
-                        {cell}
+                        {f.cells[colIdx]}
                       </td>
                     ))}
                   </tr>

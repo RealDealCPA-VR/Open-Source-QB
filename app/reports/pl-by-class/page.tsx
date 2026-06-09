@@ -16,6 +16,7 @@ import {
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency, Money, toAmountString } from '@/lib/money';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -123,6 +124,44 @@ export default function PLByClassPage() {
     );
   }
 
+  const exportTable: ExportTable | null =
+    report && classes.length > 0
+      ? {
+          filename: 'pl-by-class',
+          title: 'Profit & Loss by Class',
+          subtitle: `${from} to ${to}`,
+          landscape: classes.length > 4,
+          columns: [
+            { header: 'Code' },
+            { header: 'Account' },
+            ...classes.map((c) => ({ header: c.className, numeric: true })),
+          ],
+          rows: [
+            ['', 'INCOME', ...classes.map(() => null)],
+            ...incomeRows.map(
+              (r) =>
+                [r.code, r.name, ...classes.map((c) => r.byClass[c.classId] ?? '0.00')] as (
+                  | string
+                  | null
+                )[],
+            ),
+            ['', 'Total Income', ...classes.map((c) => incomeTotals[c.classId] ?? '0.00')],
+            ['', 'EXPENSES', ...classes.map(() => null)],
+            ...expenseRows.map(
+              (r) =>
+                [r.code, r.name, ...classes.map((c) => r.byClass[c.classId] ?? '0.00')] as (
+                  | string
+                  | null
+                )[],
+            ),
+            ['', 'Total Expenses', ...classes.map((c) => expenseTotals[c.classId] ?? '0.00')],
+          ],
+          totals: [
+            ['', 'Net Income', ...classes.map((c) => report.netByClass[c.classId] ?? '0.00')],
+          ],
+        }
+      : null;
+
   function netCell(classId: string) {
     const raw = report?.netByClass[classId] ?? '0.00';
     const n = parseFloat(raw);
@@ -151,8 +190,10 @@ export default function PLByClassPage() {
         }
       />
 
+      <ReportToolbar table={exportTable} disabled={loading} />
+
       {/* Date range filters */}
-      <Card className="p-5 mb-6">
+      <Card className="p-5 mb-6 print-hidden">
         <div className="flex flex-wrap items-end gap-4">
           <div>
             <Label htmlFor="plc-from">From</Label>

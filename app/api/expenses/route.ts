@@ -27,6 +27,8 @@ import {
   type ExpenseMethod,
 } from '@/lib/services/expenses';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createExpenseSchema } from '@/lib/validation/expenses';
 
 function errorStatus(code: string): number {
   switch (code) {
@@ -84,36 +86,13 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    if (!body.date || typeof body.date !== 'string') {
-      return NextResponse.json({ error: 'date (ISO string) is required.' }, { status: 400 });
-    }
-    if (!body.method || !['check', 'cash', 'credit_card'].includes(body.method)) {
-      return NextResponse.json(
-        { error: "method must be 'check', 'cash', or 'credit_card'." },
-        { status: 400 },
-      );
-    }
-    if (!body.paymentAccountId || typeof body.paymentAccountId !== 'string') {
-      return NextResponse.json({ error: 'paymentAccountId is required.' }, { status: 400 });
-    }
-    if (!Array.isArray(body.lines) || body.lines.length === 0) {
-      return NextResponse.json({ error: 'lines must be a non-empty array.' }, { status: 400 });
+    const body = await req.json().catch(() => ({}));
+    const parsed = createExpenseSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const expense = await createExpense(ctx, {
-      vendorId: body.vendorId ?? null,
-      payeeName: body.payeeName ?? null,
-      date: new Date(body.date),
-      method: body.method,
-      reference: body.reference ?? null,
-      paymentAccountId: body.paymentAccountId,
-      memo: body.memo ?? null,
-      toPrint: Boolean(body.toPrint),
-      isRefund: Boolean(body.isRefund),
-      lines: body.lines,
-    });
+    const expense = await createExpense(ctx, parsed.data);
 
     return NextResponse.json({ expense }, { status: 201 });
   } catch (err) {

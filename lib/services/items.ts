@@ -12,12 +12,14 @@
  * the item record and validates the linked account references.
  */
 import { and, asc, eq, ilike, ne } from 'drizzle-orm';
-import { accounts, items } from '@/lib/db/schema';
+import { accounts, assemblyComponents, items } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-export type ItemType = 'service' | 'inventory' | 'non_inventory' | 'bundle';
+export type ItemType =
+  | 'service' | 'inventory' | 'non_inventory' | 'bundle'
+  | 'other_charge' | 'discount' | 'subtotal' | 'payment' | 'sales_tax';
 
 export interface CreateItemInput {
   name: string;
@@ -35,6 +37,8 @@ export interface CreateItemInput {
   /** Inventory asset account (required for type=inventory). */
   assetAccountId?: string | null;
   taxable?: boolean;
+  /** Unit of measure shown on line grids / printed docs (e.g. "hr", "box", "ea"). */
+  unitOfMeasure?: string | null;
 }
 
 export interface UpdateItemInput {
@@ -48,7 +52,23 @@ export interface UpdateItemInput {
   expenseAccountId?: string | null;
   assetAccountId?: string | null;
   taxable?: boolean;
+  unitOfMeasure?: string | null;
   isActive?: boolean;
+}
+
+/** A bundle (group item) component, joined with the component item's details. */
+export interface BundleComponent {
+  componentItemId: string;
+  /** BOM quantity per ONE bundle. */
+  quantity: string;
+  name: string;
+  sku: string | null;
+  type: ItemType;
+  description: string | null;
+  salesPrice: string | null;
+  taxable: boolean;
+  unitOfMeasure: string | null;
+  incomeAccountId: string | null;
 }
 
 export interface ListItemsOpts {
@@ -112,6 +132,37 @@ async function resolveAccountLinks(
   }
 }
 
+/**
+ * Type-specific rules for the QB-parity item types.
+ *  - subtotal: pure UI helper (computed from preceding lines) — must not carry
+ *    prices or account links, they would never be used and only confuse.
+ *  - payment: reduces the invoice balance (Dr Undeposited Funds / Cr A/R) —
+ *    income/expense/asset accounts do not apply.
+ *  - discount / sales_tax / other_charge: allowed to carry a salesPrice (the
+ *    default amount/rate) and an income/discount account.
+ */
+function validateTypeRules(
+  type: ItemType,
+  input: Pick<
+    CreateItemInput,
+    'salesPrice' | 'purchaseCost' | 'incomeAccountId' | 'expenseAccountId' | 'assetAccountId'
+  >,
+): void {
+  if (type === 'subtotal') {
+    if (input.salesPrice != null || input.purchaseCost != null) {
+      throw validation('Subtotal items cannot have a sales price or purchase cost — the amount is computed from the preceding lines.');
+    }
+    if (input.incomeAccountId || input.expenseAccountId || input.assetAccountId) {
+      throw validation('Subtotal items are non-posting and cannot link to accounts.');
+    }
+  }
+  if (type === 'payment') {
+    if (input.incomeAccountId || input.expenseAccountId || input.assetAccountId) {
+      throw validation('Payment items post Dr Undeposited Funds / Cr Accounts Receivable automatically and cannot link to accounts.');
+    }
+  }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /** Return all items for the company, with optional filtering. */
@@ -163,7 +214,8 @@ export async function createItem(ctx: ServiceContext, input: CreateItemInput) {
     .where(and(eq(items.companyId, ctx.companyId), eq(items.name, name)));
   if (dup) throw validation(`An item named "${name}" already exists.`);
 
-  // ── Validate account links ───────────────────────────────────────────────
+  // ── Validate type rules + account links ──────────────────────────────────
+  validateTypeRules((input.type ?? 'service') as ItemType, input);
   await resolveAccountLinks(ctx, input);
 
   // ── Insert ───────────────────────────────────────────────────────────────
@@ -181,6 +233,7 @@ export async function createItem(ctx: ServiceContext, input: CreateItemInput) {
       expenseAccountId: input.expenseAccountId ?? null,
       assetAccountId: input.assetAccountId ?? null,
       taxable: input.taxable ?? true,
+      unitOfMeasure: input.unitOfMeasure?.trim() || null,
     })
     .returning();
 
@@ -220,6 +273,19 @@ export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateI
       if (dup) throw validation(`An item named "${newName}" already exists.`);
     }
   }
+
+  // ── Type rules (validated against the EFFECTIVE post-patch values) ──────
+  const effectiveType = (patch.type ?? before.type) as ItemType;
+  validateTypeRules(effectiveType, {
+    salesPrice: patch.salesPrice !== undefined ? patch.salesPrice : before.salesPrice,
+    purchaseCost: patch.purchaseCost !== undefined ? patch.purchaseCost : before.purchaseCost,
+    incomeAccountId:
+      patch.incomeAccountId !== undefined ? patch.incomeAccountId : before.incomeAccountId,
+    expenseAccountId:
+      patch.expenseAccountId !== undefined ? patch.expenseAccountId : before.expenseAccountId,
+    assetAccountId:
+      patch.assetAccountId !== undefined ? patch.assetAccountId : before.assetAccountId,
+  });
 
   // ── Account link validation (only for fields being patched) ─────────────
   await resolveAccountLinks(ctx, {
@@ -266,6 +332,10 @@ export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateI
       assetAccountId:
         patch.assetAccountId !== undefined ? patch.assetAccountId : before.assetAccountId,
       taxable: patch.taxable !== undefined ? patch.taxable : before.taxable,
+      unitOfMeasure:
+        patch.unitOfMeasure !== undefined
+          ? (patch.unitOfMeasure?.trim() || null)
+          : before.unitOfMeasure,
       isActive: patch.isActive !== undefined ? patch.isActive : before.isActive,
       updatedAt: new Date(),
     })
@@ -289,4 +359,46 @@ export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateI
  */
 export async function deactivateItem(ctx: ServiceContext, id: string) {
   return updateItem(ctx, id, { isActive: false });
+}
+
+/**
+ * Return the components of a bundle (group) item, joined with each component
+ * item's sales details so callers (the invoice form) can expand the bundle
+ * into individual lines. Reuses the assemblyComponents BOM rows — the
+ * assemblies service manages those rows; bundles simply read them.
+ *
+ * Returns [] when the bundle has no BOM yet (the caller keeps a plain line).
+ */
+export async function getBundleComponents(
+  ctx: ServiceContext,
+  bundleItemId: string,
+): Promise<BundleComponent[]> {
+  // Validate the bundle item belongs to this company (any type is tolerated so
+  // assemblies can reuse this too, but the primary caller passes type=bundle).
+  await getItem(ctx, bundleItemId);
+
+  const rows = await ctx.db
+    .select({
+      componentItemId: assemblyComponents.componentItemId,
+      quantity: assemblyComponents.quantity,
+      name: items.name,
+      sku: items.sku,
+      type: items.type,
+      description: items.description,
+      salesPrice: items.salesPrice,
+      taxable: items.taxable,
+      unitOfMeasure: items.unitOfMeasure,
+      incomeAccountId: items.incomeAccountId,
+    })
+    .from(assemblyComponents)
+    .innerJoin(items, eq(items.id, assemblyComponents.componentItemId))
+    .where(
+      and(
+        eq(assemblyComponents.companyId, ctx.companyId),
+        eq(assemblyComponents.assemblyItemId, bundleItemId),
+      ),
+    )
+    .orderBy(asc(items.name));
+
+  return rows as BundleComponent[];
 }

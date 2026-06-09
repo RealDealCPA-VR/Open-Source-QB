@@ -6,6 +6,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listAssets, createAsset } from '@/lib/services/fixedAssets';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createAssetSchema } from '@/lib/validation/fixedAssets';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -35,42 +37,13 @@ export async function GET(_req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    const {
-      name,
-      cost,
-      salvageValue,
-      usefulLifeMonths,
-      placedInService,
-      depreciationExpenseAccountId,
-      accumulatedDepreciationAccountId,
-      assetAccountId,
-    } = body;
-
-    if (!name) {
-      return NextResponse.json({ error: 'Missing required field: name' }, { status: 400 });
-    }
-    if (cost == null) {
-      return NextResponse.json({ error: 'Missing required field: cost' }, { status: 400 });
-    }
-    if (!usefulLifeMonths) {
-      return NextResponse.json({ error: 'Missing required field: usefulLifeMonths' }, { status: 400 });
-    }
-    if (!placedInService) {
-      return NextResponse.json({ error: 'Missing required field: placedInService' }, { status: 400 });
+    const body = await req.json().catch(() => ({}));
+    const parsed = createAssetSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const asset = await createAsset(ctx, {
-      name,
-      cost,
-      salvageValue: salvageValue ?? null,
-      usefulLifeMonths: Number(usefulLifeMonths),
-      placedInService: new Date(placedInService),
-      depreciationExpenseAccountId: depreciationExpenseAccountId ?? null,
-      accumulatedDepreciationAccountId: accumulatedDepreciationAccountId ?? null,
-      assetAccountId: assetAccountId ?? null,
-    });
+    const asset = await createAsset(ctx, parsed.data);
 
     return NextResponse.json(asset, { status: 201 });
   } catch (err) {

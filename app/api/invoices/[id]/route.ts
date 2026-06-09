@@ -8,6 +8,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getInvoice, updateInvoice, voidInvoice } from '@/lib/services/invoices';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { updateInvoiceSchema } from '@/lib/validation/invoices';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -44,49 +46,13 @@ export async function PUT(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    if (!body.customerId) {
-      return NextResponse.json({ error: 'customerId is required', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (!body.date) {
-      return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (!Array.isArray(body.lines) || body.lines.length === 0) {
-      return NextResponse.json({ error: 'lines must be a non-empty array', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (body.discountType != null && body.discountType !== 'amount' && body.discountType !== 'percent') {
-      return NextResponse.json(
-        { error: "discountType must be 'amount' or 'percent'", code: 'VALIDATION' },
-        { status: 400 },
-      );
+    const body = await req.json().catch(() => ({}));
+    const parsed = updateInvoiceSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const updated = await updateInvoice(ctx, id, {
-      customerId: body.customerId,
-      date: new Date(body.date),
-      dueDate: body.dueDate ? new Date(body.dueDate) : null,
-      taxRateId: body.taxRateId ?? null,
-      classId: body.classId ?? null,
-      jobId: body.jobId ?? null,
-      discount: body.discount ?? null,
-      discountType: body.discountType ?? null,
-      currency: body.currency ?? null,
-      exchangeRate: body.exchangeRate ?? null,
-      retainagePercent: body.retainagePercent ?? null,
-      memo: body.memo ?? null,
-      lines: body.lines.map((l: Record<string, unknown>) => ({
-        itemId: (l.itemId as string | undefined) ?? null,
-        accountId: (l.accountId as string | undefined) ?? null,
-        description: (l.description as string | undefined) ?? null,
-        quantity: l.quantity as string | number,
-        rate: l.rate as string | number,
-        taxable: l.taxable !== undefined ? Boolean(l.taxable) : true,
-        taxRateId: (l.taxRateId as string | undefined) ?? null,
-        classId: (l.classId as string | undefined) ?? null,
-        jobId: (l.jobId as string | undefined) ?? null,
-      })),
-    });
+    const updated = await updateInvoice(ctx, id, parsed.data);
 
     return NextResponse.json(updated);
   } catch (err) {

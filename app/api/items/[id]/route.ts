@@ -8,6 +8,8 @@ import { getServerContext } from '@/lib/context';
 import { getItem, updateItem, deactivateItem } from '@/lib/services/items';
 import { setReorderPoint } from '@/lib/services/inventory';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { updateItemSchema } from '@/lib/validation/items';
 
 // ── Error helper ──────────────────────────────────────────────────────────────
 
@@ -51,29 +53,21 @@ export async function PATCH(req: NextRequest, { params }: RouteParams): Promise<
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    // Only forward keys that were actually present in the request body so that
-    // updateItem can distinguish "not provided" from "explicitly set to null".
-    const patch: Parameters<typeof updateItem>[2] = {};
-    if ('name' in body)              patch.name = body.name;
-    if ('sku' in body)               patch.sku = body.sku ?? null;
-    if ('type' in body)              patch.type = body.type;
-    if ('description' in body)       patch.description = body.description ?? null;
-    if ('salesPrice' in body)        patch.salesPrice = body.salesPrice ?? null;
-    if ('purchaseCost' in body)      patch.purchaseCost = body.purchaseCost ?? null;
-    if ('incomeAccountId' in body)   patch.incomeAccountId = body.incomeAccountId ?? null;
-    if ('expenseAccountId' in body)  patch.expenseAccountId = body.expenseAccountId ?? null;
-    if ('assetAccountId' in body)    patch.assetAccountId = body.assetAccountId ?? null;
-    if ('taxable' in body)           patch.taxable = body.taxable;
-    if ('isActive' in body)          patch.isActive = body.isActive;
+    const body = await req.json().catch(() => ({}));
+    // zod's strip mode keeps absent keys absent, so updateItem can distinguish
+    // "not provided" from "explicitly set to null".
+    const parsed = updateItemSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
+    const { reorderPoint, ...patch } = parsed.data;
 
     let item = await updateItem(ctx, id, patch);
 
     // Reorder point is managed by the inventory service (it drives the
     // reorder report and low-stock alerts). null / '' clears it.
-    if ('reorderPoint' in body) {
-      item = await setReorderPoint(ctx, id, body.reorderPoint ?? null);
+    if ('reorderPoint' in parsed.data) {
+      item = await setReorderPoint(ctx, id, reorderPoint ?? null);
     }
 
     return NextResponse.json({ item });

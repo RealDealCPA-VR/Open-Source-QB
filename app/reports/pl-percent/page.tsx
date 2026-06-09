@@ -10,7 +10,8 @@ import { Percent } from 'lucide-react';
 import { Button, Card, PageHeader, Table, Th, Td, Tr, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
-import { RangeControls, downloadCsv, fmtDate, todayStr, yearStartStr, type CsvCell } from '../_components/shared';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
+import { RangeControls, fmtDate, todayStr, yearStartStr, type CsvCell } from '../_components/shared';
 
 interface PercentRow {
   accountId: string;
@@ -109,36 +110,34 @@ export default function PlPercentPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const exportCsv = () => {
-    if (!data) return;
-    const rows: CsvCell[][] = [
-      ...data.income.map((r): CsvCell[] => ['Income', r.name, r.amount, r.pctOfIncome ?? '']),
-      ['Total Income', '', data.totalIncome, data.totalIncomePct ?? ''],
-      ...data.expenses.map((r): CsvCell[] => ['Expenses', r.name, r.amount, r.pctOfIncome ?? '']),
-      ['Total Expenses', '', data.totalExpenses, data.totalExpensesPct ?? ''],
-      ['Net Income', '', data.netIncome, data.netIncomePct ?? ''],
-    ];
-    downloadCsv(
-      'pl-percent-of-income.csv',
-      `P&L % of Income — ${fmtDate(data.from)} to ${fmtDate(data.to)}`,
-      ['Section', 'Account', 'Amount', '% of Income'],
-      rows,
-    );
-  };
+  const table: ExportTable | null = data
+    ? {
+        filename: 'pl-percent-of-income',
+        title: 'P&L - % of Income',
+        subtitle: `${fmtDate(data.from)} to ${fmtDate(data.to)}`,
+        columns: [
+          { header: 'Section' },
+          { header: 'Account' },
+          { header: 'Amount', numeric: true },
+          { header: '% of Income', numeric: true },
+        ],
+        rows: [
+          ...data.income.map((r): CsvCell[] => ['Income', r.name, r.amount, r.pctOfIncome ?? '']),
+          ['Total Income', '', data.totalIncome, data.totalIncomePct ?? ''],
+          ...data.expenses.map((r): CsvCell[] => ['Expenses', r.name, r.amount, r.pctOfIncome ?? '']),
+          ['Total Expenses', '', data.totalExpenses, data.totalExpensesPct ?? ''],
+        ],
+        totals: [['Net Income', '', data.netIncome, data.netIncomePct ?? '']],
+      }
+    : null;
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader
-        title="P&L — % of Income"
-        icon={Percent}
-        action={
-          <Button variant="secondary" size="sm" disabled={!data || loading} onClick={exportCsv}>
-            Download CSV
-          </Button>
-        }
-      />
+      <PageHeader title="P&L — % of Income" icon={Percent} />
 
-      <Card className="p-4 mb-4">
+      <ReportToolbar table={table} disabled={loading} />
+
+      <Card className="p-4 mb-4 print-hidden">
         <RangeControls from={from} to={to} onFrom={setFrom} onTo={setTo} onRun={load} />
       </Card>
 

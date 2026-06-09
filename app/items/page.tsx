@@ -32,7 +32,9 @@ import { useFocusParam } from '@/lib/useFocusParam';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type ItemType = 'service' | 'inventory' | 'non_inventory' | 'bundle';
+type ItemType =
+  | 'service' | 'inventory' | 'non_inventory' | 'bundle'
+  | 'other_charge' | 'discount' | 'subtotal' | 'payment' | 'sales_tax';
 
 interface Item {
   id: string;
@@ -45,11 +47,21 @@ interface Item {
   reorderPoint: string | null;
   taxable: boolean;
   isActive: boolean;
+  unitOfMeasure: string | null;
+  quantityOnHand: string | null;
+  averageCost: string | null;
   incomeAccountId: string | null;
   expenseAccountId: string | null;
   assetAccountId: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+interface Account {
+  id: string;
+  code: string;
+  name: string;
+  type: string;
 }
 
 interface FormState {
@@ -60,6 +72,11 @@ interface FormState {
   purchaseCost: string;
   reorderPoint: string;
   sku: string;
+  unitOfMeasure: string;
+  taxable: boolean;
+  incomeAccountId: string;
+  expenseAccountId: string;
+  assetAccountId: string;
 }
 
 const EMPTY_FORM: FormState = {
@@ -70,6 +87,11 @@ const EMPTY_FORM: FormState = {
   purchaseCost: '',
   reorderPoint: '',
   sku: '',
+  unitOfMeasure: '',
+  taxable: true,
+  incomeAccountId: '',
+  expenseAccountId: '',
+  assetAccountId: '',
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -79,19 +101,34 @@ const TYPE_LABELS: Record<ItemType, string> = {
   inventory: 'Inventory',
   non_inventory: 'Non-Inventory',
   bundle: 'Bundle',
+  other_charge: 'Other Charge',
+  discount: 'Discount',
+  subtotal: 'Subtotal',
+  payment: 'Payment',
+  sales_tax: 'Sales Tax',
 };
 
-const TYPE_TONES: Record<ItemType, 'info' | 'success' | 'warning' | 'neutral'> = {
+const TYPE_TONES: Record<ItemType, 'info' | 'success' | 'warning' | 'neutral' | 'danger'> = {
   service: 'info',
   inventory: 'success',
   non_inventory: 'warning',
   bundle: 'neutral',
+  other_charge: 'info',
+  discount: 'danger',
+  subtotal: 'neutral',
+  payment: 'success',
+  sales_tax: 'warning',
 };
+
+/** Special line-helper types never carry prices/accounts the same way. */
+const NON_POSTING_TYPES: ItemType[] = ['subtotal'];
+const NO_ACCOUNT_TYPES: ItemType[] = ['subtotal', 'payment'];
 
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 function ItemsPageContent() {
   const [items, setItems] = useState<Item[]>([]);
+  const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
 
   // Modal state
@@ -109,8 +146,12 @@ function ItemsPageContent() {
   async function fetchItems() {
     setLoading(true);
     try {
-      const data = await api.get<{ items: Item[] }>('/api/items');
+      const [data, acctList] = await Promise.all([
+        api.get<{ items: Item[] }>('/api/items'),
+        api.get<Account[]>('/api/accounts'),
+      ]);
       setItems(data.items);
+      setAccounts(acctList);
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to load items.', 'danger');
     } finally {
@@ -121,6 +162,10 @@ function ItemsPageContent() {
   useEffect(() => {
     fetchItems();
   }, []);
+
+  const incomeAccounts = accounts.filter((a) => a.type === 'revenue');
+  const expenseAccounts = accounts.filter((a) => a.type === 'expense');
+  const assetAccounts = accounts.filter((a) => a.type === 'asset');
 
   // ── Modal helpers ──────────────────────────────────────────────────────────
 
@@ -140,6 +185,11 @@ function ItemsPageContent() {
       purchaseCost: item.purchaseCost ?? '',
       reorderPoint: item.reorderPoint ?? '',
       sku: item.sku ?? '',
+      unitOfMeasure: item.unitOfMeasure ?? '',
+      taxable: item.taxable,
+      incomeAccountId: item.incomeAccountId ?? '',
+      expenseAccountId: item.expenseAccountId ?? '',
+      assetAccountId: item.assetAccountId ?? '',
     });
     setModalOpen(true);
   }
@@ -166,14 +216,22 @@ function ItemsPageContent() {
       return;
     }
 
+    const nonPosting = NON_POSTING_TYPES.includes(form.type);
+    const noAccounts = NO_ACCOUNT_TYPES.includes(form.type);
     const payload = {
       name: form.name.trim(),
       type: form.type,
       description: form.description.trim() || null,
-      salesPrice: form.salesPrice.trim() || null,
-      purchaseCost: form.purchaseCost.trim() || null,
+      salesPrice: nonPosting ? null : form.salesPrice.trim() || null,
+      purchaseCost: nonPosting ? null : form.purchaseCost.trim() || null,
       reorderPoint: form.type === 'inventory' ? form.reorderPoint.trim() || null : null,
       sku: form.sku.trim() || null,
+      unitOfMeasure: form.unitOfMeasure.trim() || null,
+      taxable: form.taxable,
+      incomeAccountId: noAccounts ? null : form.incomeAccountId || null,
+      expenseAccountId: noAccounts ? null : form.expenseAccountId || null,
+      assetAccountId:
+        form.type === 'inventory' ? form.assetAccountId || null : null,
     };
 
     setSaving(true);
@@ -212,6 +270,9 @@ function ItemsPageContent() {
   }
 
   // ── Render ─────────────────────────────────────────────────────────────────
+
+  const showAccountPickers = !NO_ACCOUNT_TYPES.includes(form.type);
+  const showPrices = !NON_POSTING_TYPES.includes(form.type);
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
@@ -257,9 +318,11 @@ function ItemsPageContent() {
                 <Th>Name</Th>
                 <Th>SKU</Th>
                 <Th>Type</Th>
-                <Th>Description</Th>
+                <Th>Unit</Th>
                 <Th numeric>Sales Price</Th>
                 <Th numeric>Purchase Cost</Th>
+                <Th numeric>On Hand</Th>
+                <Th numeric>Avg Cost</Th>
                 <Th className="text-center">Taxable</Th>
                 <Th className="text-center">Actions</Th>
               </tr>
@@ -267,21 +330,29 @@ function ItemsPageContent() {
             <tbody>
               {items.map((item) => (
                 <Tr key={item.id}>
-                  <Td className="font-semibold text-navy">{item.name}</Td>
+                  <Td className="font-semibold text-navy">
+                    <span title={item.description ?? undefined}>{item.name}</span>
+                  </Td>
                   <Td className="text-navy/50 text-sm">{item.sku ?? '—'}</Td>
                   <Td>
-                    <Badge tone={TYPE_TONES[item.type]}>
-                      {TYPE_LABELS[item.type]}
+                    <Badge tone={TYPE_TONES[item.type] ?? 'neutral'}>
+                      {TYPE_LABELS[item.type] ?? item.type}
                     </Badge>
                   </Td>
-                  <Td className="text-navy/60 text-sm max-w-[200px] truncate">
-                    {item.description ?? '—'}
-                  </Td>
+                  <Td className="text-navy/60 text-sm">{item.unitOfMeasure ?? '—'}</Td>
                   <Td numeric>
                     {item.salesPrice ? formatCurrency(item.salesPrice) : '—'}
                   </Td>
                   <Td numeric>
                     {item.purchaseCost ? formatCurrency(item.purchaseCost) : '—'}
+                  </Td>
+                  <Td numeric className="text-navy/70">
+                    {item.type === 'inventory' ? Number(item.quantityOnHand ?? 0) : '—'}
+                  </Td>
+                  <Td numeric className="text-navy/70">
+                    {item.type === 'inventory' && item.averageCost
+                      ? formatCurrency(Number(item.averageCost).toFixed(2))
+                      : '—'}
                   </Td>
                   <Td className="text-center">
                     {item.taxable ? (
@@ -347,19 +418,56 @@ function ItemsPageContent() {
             />
           </div>
 
-          <div>
-            <Label htmlFor="item-type">Type</Label>
-            <Select
-              id="item-type"
-              value={form.type}
-              onChange={(e) => setField('type', e.target.value as ItemType)}
-            >
-              <option value="service">Service</option>
-              <option value="inventory">Inventory</option>
-              <option value="non_inventory">Non-Inventory</option>
-              <option value="bundle">Bundle</option>
-            </Select>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <Label htmlFor="item-type">Type</Label>
+              <Select
+                id="item-type"
+                value={form.type}
+                onChange={(e) => setField('type', e.target.value as ItemType)}
+              >
+                <option value="service">Service</option>
+                <option value="inventory">Inventory</option>
+                <option value="non_inventory">Non-Inventory</option>
+                <option value="bundle">Bundle (group)</option>
+                <option value="other_charge">Other Charge</option>
+                <option value="discount">Discount</option>
+                <option value="subtotal">Subtotal</option>
+                <option value="payment">Payment</option>
+                <option value="sales_tax">Sales Tax</option>
+              </Select>
+            </div>
+            <div>
+              <Label htmlFor="item-uom">Unit of Measure</Label>
+              <Input
+                id="item-uom"
+                value={form.unitOfMeasure}
+                onChange={(e) => setField('unitOfMeasure', e.target.value)}
+                placeholder="e.g. hr, ea, box"
+                maxLength={50}
+              />
+            </div>
           </div>
+
+          {form.type === 'subtotal' && (
+            <p className="text-xs text-navy/50 rounded-lg bg-navy/5 px-3 py-2">
+              Subtotal items are non-posting: on a sales form the row shows the
+              running total of the lines above it. No price or account applies.
+            </p>
+          )}
+          {form.type === 'discount' && (
+            <p className="text-xs text-navy/50 rounded-lg bg-navy/5 px-3 py-2">
+              Discount items subtract from the invoice. On the form you can enter a
+              flat amount or a percentage of the preceding lines. Posts a debit to
+              the discount (income) account selected below.
+            </p>
+          )}
+          {form.type === 'payment' && (
+            <p className="text-xs text-navy/50 rounded-lg bg-navy/5 px-3 py-2">
+              Payment items record money already received on the invoice itself:
+              Dr Undeposited Funds / Cr Accounts Receivable. No account links apply.
+            </p>
+          )}
 
           <div>
             <Label htmlFor="item-sku">SKU / Product Code</Label>
@@ -381,47 +489,131 @@ function ItemsPageContent() {
             />
           </div>
 
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <Label htmlFor="item-sales-price">Sales Price</Label>
-              <Input
-                id="item-sales-price"
-                type="number"
-                min="0"
-                step="0.01"
-                value={form.salesPrice}
-                onChange={(e) => setField('salesPrice', e.target.value)}
-                placeholder="0.00"
-              />
-            </div>
-            <div>
-              <Label htmlFor="item-purchase-cost">Purchase Cost</Label>
-              <Input
-                id="item-purchase-cost"
-                type="number"
-                min="0"
-                step="0.01"
-                value={form.purchaseCost}
-                onChange={(e) => setField('purchaseCost', e.target.value)}
-                placeholder="0.00"
-              />
-            </div>
-          </div>
-
-          {form.type === 'inventory' && (
-            <div>
-              <Label htmlFor="item-reorder-point">Reorder Point</Label>
-              <Input
-                id="item-reorder-point"
-                type="number"
-                min="0"
-                step="0.0001"
-                value={form.reorderPoint}
-                onChange={(e) => setField('reorderPoint', e.target.value)}
-                placeholder="e.g. 10 — alerts when stock falls to or below this"
-              />
+          {showPrices && (
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label htmlFor="item-sales-price">
+                  {form.type === 'discount' ? 'Default Discount Amount' : 'Sales Price'}
+                </Label>
+                <Input
+                  id="item-sales-price"
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={form.salesPrice}
+                  onChange={(e) => setField('salesPrice', e.target.value)}
+                  placeholder="0.00"
+                />
+              </div>
+              <div>
+                <Label htmlFor="item-purchase-cost">Purchase Cost</Label>
+                <Input
+                  id="item-purchase-cost"
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={form.purchaseCost}
+                  onChange={(e) => setField('purchaseCost', e.target.value)}
+                  placeholder="0.00"
+                />
+              </div>
             </div>
           )}
+
+          {showAccountPickers && (
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label htmlFor="item-income-acct">
+                  {form.type === 'discount' ? 'Discount Account' : 'Income Account'}
+                </Label>
+                <Select
+                  id="item-income-acct"
+                  value={form.incomeAccountId}
+                  onChange={(e) => setField('incomeAccountId', e.target.value)}
+                >
+                  <option value="">Default (4000 Sales Income)</option>
+                  {incomeAccounts.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.code} — {a.name}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+              <div>
+                <Label htmlFor="item-expense-acct">Expense / COGS Account</Label>
+                <Select
+                  id="item-expense-acct"
+                  value={form.expenseAccountId}
+                  onChange={(e) => setField('expenseAccountId', e.target.value)}
+                >
+                  <option value="">None</option>
+                  {expenseAccounts.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.code} — {a.name}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+            </div>
+          )}
+
+          {form.type === 'inventory' && (
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label htmlFor="item-asset-acct">Inventory Asset Account</Label>
+                <Select
+                  id="item-asset-acct"
+                  value={form.assetAccountId}
+                  onChange={(e) => setField('assetAccountId', e.target.value)}
+                >
+                  <option value="">Default (1300 Inventory Asset)</option>
+                  {assetAccounts.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.code} — {a.name}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+              <div>
+                <Label htmlFor="item-reorder-point">Reorder Point</Label>
+                <Input
+                  id="item-reorder-point"
+                  type="number"
+                  min="0"
+                  step="0.0001"
+                  value={form.reorderPoint}
+                  onChange={(e) => setField('reorderPoint', e.target.value)}
+                  placeholder="e.g. 10"
+                />
+              </div>
+            </div>
+          )}
+
+          {editingItem && editingItem.type === 'inventory' && (
+            <div className="grid grid-cols-2 gap-4 rounded-lg bg-navy/5 px-3 py-2">
+              <div className="text-xs text-navy/60">
+                <span className="block font-semibold text-navy/70">Quantity on Hand</span>
+                {Number(editingItem.quantityOnHand ?? 0)} (read-only — changes via
+                bills, invoices &amp; adjustments)
+              </div>
+              <div className="text-xs text-navy/60">
+                <span className="block font-semibold text-navy/70">Average Cost</span>
+                {editingItem.averageCost
+                  ? formatCurrency(Number(editingItem.averageCost).toFixed(2))
+                  : '—'}
+              </div>
+            </div>
+          )}
+
+          <label className="flex items-center gap-2 text-sm text-navy/70 select-none">
+            <input
+              type="checkbox"
+              checked={form.taxable}
+              onChange={(e) => setField('taxable', e.target.checked)}
+              className="accent-electric"
+            />
+            Taxable by default on sales forms
+          </label>
         </form>
       </Modal>
 

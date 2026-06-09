@@ -5,7 +5,7 @@
  * Users pick a year; each account gets a column per month + a row total.
  */
 import { useState, useCallback, useEffect } from 'react';
-import { BarChart2, Download } from 'lucide-react';
+import { BarChart2 } from 'lucide-react';
 import {
   Button,
   Card,
@@ -20,6 +20,7 @@ import {
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -55,42 +56,36 @@ const MONTH_LABELS = [
 ];
 
 // ---------------------------------------------------------------------------
-// CSV download
+// Export table (shared ReportToolbar: CSV / Excel / PDF / Print)
 // ---------------------------------------------------------------------------
 
-function buildCsv(report: MonthlyReport): string {
-  const header = ['Account', ...MONTH_LABELS, 'Total'].join(',');
+function buildTable(report: MonthlyReport): ExportTable {
   const row = (name: string, months: string[], total: string) =>
     [
-      `"${name}"`,
+      name,
       ...months.map((m) => parseFloat(m).toFixed(2)),
       parseFloat(total).toFixed(2),
-    ].join(',');
-
-  const lines: string[] = [
-    header,
-    '== INCOME ==',
-    ...report.income.map((r) => row(r.name, r.months, r.total)),
-    row('Total Income', report.monthlyTotalIncome, report.totalIncome),
-    '',
-    '== EXPENSES ==',
-    ...report.expenses.map((r) => row(r.name, r.months, r.total)),
-    row('Total Expenses', report.monthlyTotalExpenses, report.totalExpenses),
-    '',
-    row('Net Income', report.monthlyNetIncome, report.netIncome),
-  ];
-  return lines.join('\n');
-}
-
-function downloadCsv(report: MonthlyReport) {
-  const csv = buildCsv(report);
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `pl-monthly-${report.year}.csv`;
-  a.click();
-  URL.revokeObjectURL(url);
+    ] as (string | null)[];
+  return {
+    filename: `pl-monthly-${report.year}`,
+    title: 'Monthly Profit & Loss',
+    subtitle: `Calendar year ${report.year}`,
+    landscape: true,
+    columns: [
+      { header: 'Account' },
+      ...MONTH_LABELS.map((m) => ({ header: m, numeric: true })),
+      { header: 'Total', numeric: true },
+    ],
+    rows: [
+      ['INCOME', ...Array(13).fill(null)],
+      ...report.income.map((r) => row(r.name, r.months, r.total)),
+      row('Total Income', report.monthlyTotalIncome, report.totalIncome),
+      ['EXPENSES', ...Array(13).fill(null)],
+      ...report.expenses.map((r) => row(r.name, r.months, r.total)),
+      row('Total Expenses', report.monthlyTotalExpenses, report.totalExpenses),
+    ],
+    totals: [row('Net Income', report.monthlyNetIncome, report.netIncome)],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -189,20 +184,12 @@ export default function PLMonthlyPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader
-        title="Monthly P&amp;L"
-        icon={BarChart2}
-        action={
-          report && (
-            <Button variant="secondary" onClick={() => downloadCsv(report)}>
-              <Download className="h-4 w-4" /> Export CSV
-            </Button>
-          )
-        }
-      />
+      <PageHeader title="Monthly P&amp;L" icon={BarChart2} />
+
+      <ReportToolbar table={report ? buildTable(report) : null} disabled={loading} />
 
       {/* Controls */}
-      <Card className="p-5 mb-6 max-w-sm">
+      <Card className="p-5 mb-6 max-w-sm print-hidden">
         <div className="flex items-end gap-4">
           <div className="flex-1">
             <Label htmlFor="year">Year</Label>

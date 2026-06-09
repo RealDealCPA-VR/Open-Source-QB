@@ -19,18 +19,21 @@
 import { and, asc, eq, gt, gte, inArray, isNull, lt, ne, not, or, sql } from 'drizzle-orm';
 import {
   accounts,
+  billLines,
   bills,
   billPaymentApplications,
   billPayments,
+  companies,
   creditMemos,
   customers,
+  expenseLines,
   expenses,
   invoices,
   paymentsReceived,
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { notFound, type ServiceContext } from './_base';
+import { notFound, validation, writeAudit, type ServiceContext } from './_base';
 
 // ---------------------------------------------------------------------------
 // Customer Statement
@@ -584,4 +587,327 @@ export async function vendor1099Report(
   result.sort((a, b) => Money.of(b.total).comparedTo(Money.of(a.total)));
 
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// 1099 account → box mapping (companies.settings.tax1099)
+// ---------------------------------------------------------------------------
+
+/**
+ * Supported 1099 boxes:
+ *   nec_1  — 1099-NEC Box 1 (Nonemployee compensation)
+ *   misc_1 — 1099-MISC Box 1 (Rents)
+ *   misc_3 — 1099-MISC Box 3 (Other income)
+ */
+export type Tax1099Box = 'nec_1' | 'misc_1' | 'misc_3';
+
+export const TAX_1099_BOXES: Array<{ box: Tax1099Box; label: string }> = [
+  { box: 'nec_1', label: '1099-NEC Box 1 — Nonemployee Compensation' },
+  { box: 'misc_1', label: '1099-MISC Box 1 — Rents' },
+  { box: 'misc_3', label: '1099-MISC Box 3 — Other Income' },
+];
+
+export interface Tax1099Mapping {
+  boxes: Array<{ box: Tax1099Box; accountIds: string[] }>;
+}
+
+/** Read the saved 1099 account mapping from companies.settings.tax1099 (null when unset). */
+export async function get1099Mapping(ctx: ServiceContext): Promise<Tax1099Mapping | null> {
+  const [company] = await ctx.db
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId));
+  if (!company) throw notFound('Company');
+  const raw = (company.settings ?? {}) as Record<string, unknown>;
+  const mapping = raw.tax1099 as Tax1099Mapping | undefined;
+  if (!mapping || !Array.isArray(mapping.boxes)) return null;
+  return mapping;
+}
+
+/**
+ * Save the 1099 account mapping into companies.settings.tax1099. Validates box
+ * keys and that every account id belongs to this company. Passing an empty
+ * boxes array clears the mapping (back to "everything counts as NEC box 1").
+ */
+export async function set1099Mapping(ctx: ServiceContext, mapping: Tax1099Mapping) {
+  if (!mapping || !Array.isArray(mapping.boxes)) {
+    throw validation('mapping.boxes must be an array.');
+  }
+  const validBoxes = new Set<string>(TAX_1099_BOXES.map((b) => b.box));
+  const seen = new Set<string>();
+  const allAccountIds: string[] = [];
+  for (const entry of mapping.boxes) {
+    if (!validBoxes.has(entry.box)) {
+      throw validation(`Unknown 1099 box "${entry.box}". Valid: ${[...validBoxes].join(', ')}.`);
+    }
+    if (seen.has(entry.box)) {
+      throw validation(`Duplicate 1099 box "${entry.box}" in mapping.`);
+    }
+    seen.add(entry.box);
+    if (!Array.isArray(entry.accountIds)) {
+      throw validation(`accountIds for box "${entry.box}" must be an array.`);
+    }
+    allAccountIds.push(...entry.accountIds);
+  }
+
+  // One account cannot feed two boxes (a payment dollar lands in exactly one box).
+  if (new Set(allAccountIds).size !== allAccountIds.length) {
+    throw validation('An account can be mapped to only one 1099 box.');
+  }
+
+  // Verify account ownership.
+  if (allAccountIds.length > 0) {
+    const rows = await ctx.db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, allAccountIds)));
+    const found = new Set(rows.map((r) => r.id));
+    for (const id of allAccountIds) {
+      if (!found.has(id)) throw notFound(`Account ${id}`);
+    }
+  }
+
+  const [company] = await ctx.db
+    .select()
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId));
+  if (!company) throw notFound('Company');
+
+  const oldSettings = (company.settings ?? {}) as Record<string, unknown>;
+  const cleaned: Tax1099Mapping = {
+    boxes: mapping.boxes
+      .map((b) => ({ box: b.box, accountIds: [...new Set(b.accountIds)] }))
+      .filter((b) => b.accountIds.length > 0),
+  };
+  const newSettings = { ...oldSettings, tax1099: cleaned };
+
+  const [updated] = await ctx.db
+    .update(companies)
+    .set({ settings: newSettings, updatedAt: new Date() })
+    .where(eq(companies.id, ctx.companyId))
+    .returning();
+
+  await writeAudit(ctx, {
+    action: 'update',
+    entityType: 'company',
+    entityId: ctx.companyId,
+    oldValues: { tax1099: oldSettings.tax1099 ?? null },
+    newValues: { tax1099: cleaned },
+  });
+
+  return (updated.settings as Record<string, unknown>).tax1099 as Tax1099Mapping;
+}
+
+// ---------------------------------------------------------------------------
+// 1099 Worksheet (NEC + MISC, account-mapped)
+// ---------------------------------------------------------------------------
+
+export interface Vendor1099WorksheetRow {
+  vendorId: string;
+  vendorName: string;
+  taxId: string | null;
+  /** 1099-NEC Box 1 — Nonemployee compensation. */
+  nec1: string;
+  /** 1099-MISC Box 1 — Rents. */
+  misc1: string;
+  /** 1099-MISC Box 3 — Other income. */
+  misc3: string;
+  /** Sum of all boxes. */
+  total: string;
+  /** NEC form required (nec1 >= $600). */
+  necEligible: boolean;
+  /** MISC form required (misc1 >= $600 or misc3 >= $600). */
+  miscEligible: boolean;
+}
+
+export interface Vendor1099Worksheet {
+  year: number;
+  /** True when an account mapping is configured (otherwise everything counts as NEC box 1). */
+  mapped: boolean;
+  rows: Vendor1099WorksheetRow[];
+}
+
+/**
+ * 1099 worksheet for a calendar year, split by form/box using the saved
+ * account mapping (companies.settings.tax1099):
+ *
+ *  - When NO mapping is configured, every eligible payment dollar counts toward
+ *    1099-NEC Box 1 (the legacy behavior).
+ *  - When a mapping IS configured, payments count toward a box only when the
+ *    underlying expense/bill LINE hits a mapped account; lines on unmapped
+ *    accounts are excluded (QB Desktop "map accounts to boxes" semantics).
+ *
+ * Sources and exclusions mirror vendor1099Report:
+ *  - Bill payments applied to is_1099 vendors' bills. The applied amount is
+ *    prorated across the bill's lines by line amount, so each line's account
+ *    routes its share to the right box.
+ *  - Direct expenses to is_1099 vendors, per expense line account.
+ *  - Card-settled payments are EXCLUDED (method 'credit_card' or a credit-card
+ *    funding account): reportable on the processor's 1099-K instead.
+ *  - Voided expenses / bill payments are excluded.
+ */
+export async function vendor1099Worksheet(
+  ctx: ServiceContext,
+  { year }: { year: number },
+): Promise<Vendor1099Worksheet> {
+  const yearStart = new Date(`${year}-01-01T00:00:00.000Z`);
+  const yearEnd = new Date(`${year + 1}-01-01T00:00:00.000Z`);
+
+  const mapping = await get1099Mapping(ctx);
+  const accountBox = new Map<string, Tax1099Box>();
+  for (const entry of mapping?.boxes ?? []) {
+    for (const id of entry.accountIds) accountBox.set(id, entry.box);
+  }
+  const mapped = accountBox.size > 0;
+
+  /** Box for a GL account: NEC box 1 when unmapped company-wide, else mapping or excluded. */
+  const boxFor = (accountId: string): Tax1099Box | null =>
+    mapped ? (accountBox.get(accountId) ?? null) : 'nec_1';
+
+  const fundingAccountNotCreditCard = or(
+    isNull(accounts.id),
+    not(and(eq(accounts.type, 'liability'), eq(accounts.subtype, 'credit_card'))!),
+  );
+
+  // --- Bill payments applied to is_1099 vendors (per application) ---
+  const applicationRows = await ctx.db
+    .select({
+      billId: bills.id,
+      vendorId: vendors.id,
+      vendorName: vendors.displayName,
+      taxId: vendors.taxId,
+      amountApplied: billPaymentApplications.amountApplied,
+    })
+    .from(billPaymentApplications)
+    .innerJoin(billPayments, eq(billPaymentApplications.billPaymentId, billPayments.id))
+    .innerJoin(bills, eq(billPaymentApplications.billId, bills.id))
+    .innerJoin(vendors, eq(bills.vendorId, vendors.id))
+    .leftJoin(accounts, eq(billPayments.paymentAccountId, accounts.id))
+    .where(
+      and(
+        eq(billPayments.companyId, ctx.companyId),
+        eq(vendors.is1099, true),
+        gte(billPayments.date, yearStart),
+        lt(billPayments.date, yearEnd),
+        isNull(billPayments.voidedAt),
+        ne(billPayments.method, 'credit_card'),
+        fundingAccountNotCreditCard,
+      ),
+    );
+
+  // Load the lines of every involved bill for the account split.
+  const billIds = [...new Set(applicationRows.map((r) => r.billId))];
+  const linesByBill = new Map<string, Array<{ accountId: string; amount: string }>>();
+  if (billIds.length > 0) {
+    const lineRows = await ctx.db
+      .select({ billId: billLines.billId, accountId: billLines.accountId, amount: billLines.amount })
+      .from(billLines)
+      .where(inArray(billLines.billId, billIds));
+    for (const l of lineRows) {
+      const list = linesByBill.get(l.billId) ?? [];
+      list.push({ accountId: l.accountId, amount: l.amount });
+      linesByBill.set(l.billId, list);
+    }
+  }
+
+  // --- Direct expense lines to is_1099 vendors ---
+  const expenseLineRows = await ctx.db
+    .select({
+      vendorId: vendors.id,
+      vendorName: vendors.displayName,
+      taxId: vendors.taxId,
+      accountId: expenseLines.accountId,
+      amount: expenseLines.amount,
+    })
+    .from(expenseLines)
+    .innerJoin(expenses, eq(expenseLines.expenseId, expenses.id))
+    .innerJoin(vendors, eq(expenses.vendorId, vendors.id))
+    .leftJoin(accounts, eq(expenses.paymentAccountId, accounts.id))
+    .where(
+      and(
+        eq(expenses.companyId, ctx.companyId),
+        eq(vendors.is1099, true),
+        gte(expenses.date, yearStart),
+        lt(expenses.date, yearEnd),
+        isNull(expenses.voidedAt),
+        ne(expenses.method, 'credit_card'),
+        fundingAccountNotCreditCard,
+      ),
+    );
+
+  // --- Accumulate per vendor / box ---
+  type Acc = {
+    vendorName: string;
+    taxId: string | null;
+    boxes: Record<Tax1099Box, ReturnType<typeof Money.zero>>;
+  };
+  const totals = new Map<string, Acc>();
+
+  function add(
+    vendorId: string,
+    vendorName: string,
+    taxId: string | null,
+    box: Tax1099Box | null,
+    amount: ReturnType<typeof Money.zero>,
+  ) {
+    if (!box || amount.lessThanOrEqualTo(0)) return;
+    if (!totals.has(vendorId)) {
+      totals.set(vendorId, {
+        vendorName,
+        taxId,
+        boxes: { nec_1: Money.zero(), misc_1: Money.zero(), misc_3: Money.zero() },
+      });
+    }
+    const acc = totals.get(vendorId)!;
+    acc.boxes[box] = acc.boxes[box].plus(amount);
+  }
+
+  // Bill payments: prorate each application across the bill's lines by amount.
+  for (const app of applicationRows) {
+    const lines = linesByBill.get(app.billId) ?? [];
+    const applied = Money.of(app.amountApplied);
+    if (applied.lessThanOrEqualTo(0)) continue;
+    const lineSum = lines.reduce((s, l) => s.plus(Money.of(l.amount)), Money.zero());
+    if (lines.length === 0 || lineSum.lessThanOrEqualTo(0)) {
+      // No line detail — treat the whole application like a single unmapped line.
+      add(app.vendorId, app.vendorName, app.taxId ?? null, mapped ? null : 'nec_1', applied);
+      continue;
+    }
+    for (const line of lines) {
+      const share = applied.times(Money.of(line.amount)).dividedBy(lineSum);
+      add(app.vendorId, app.vendorName, app.taxId ?? null, boxFor(line.accountId), share);
+    }
+  }
+
+  // Expense lines: direct account → box.
+  for (const l of expenseLineRows) {
+    add(l.vendorId, l.vendorName, l.taxId ?? null, boxFor(l.accountId), Money.of(l.amount));
+  }
+
+  // --- Build rows + thresholds ---
+  const THRESHOLD = Money.of('600');
+  const rows: Vendor1099WorksheetRow[] = [];
+  for (const [vendorId, acc] of totals) {
+    const nec1 = acc.boxes.nec_1;
+    const misc1 = acc.boxes.misc_1;
+    const misc3 = acc.boxes.misc_3;
+    const total = nec1.plus(misc1).plus(misc3);
+    if (total.lessThanOrEqualTo(0)) continue;
+    rows.push({
+      vendorId,
+      vendorName: acc.vendorName,
+      taxId: acc.taxId,
+      nec1: toAmountString(nec1),
+      misc1: toAmountString(misc1),
+      misc3: toAmountString(misc3),
+      total: toAmountString(total),
+      necEligible: nec1.greaterThanOrEqualTo(THRESHOLD),
+      miscEligible:
+        misc1.greaterThanOrEqualTo(THRESHOLD) || misc3.greaterThanOrEqualTo(THRESHOLD),
+    });
+  }
+
+  rows.sort((a, b) => Money.of(b.total).comparedTo(Money.of(a.total)));
+
+  return { year, mapped, rows };
 }

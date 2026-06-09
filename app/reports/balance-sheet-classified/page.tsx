@@ -5,6 +5,7 @@ import { BarChart2 } from 'lucide-react';
 import { Button, Card, Badge, Input, Label, PageHeader, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
 
 // ---------------------------------------------------------------------------
 // Types (must match ClassifiedBalanceSheet from the service)
@@ -143,12 +144,48 @@ export default function ClassifiedBalanceSheetPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const sectionRows = (label: string, section: ClassifiedSection): (string | null)[][] => [
+    [label.toUpperCase(), null],
+    ...section.lines.map((l) => [`${l.code} ${l.name}`, l.amount] as (string | null)[]),
+    [`Total ${label}`, section.total],
+  ];
+  const table: ExportTable | null = report
+    ? {
+        filename: 'balance-sheet-classified',
+        title: 'Classified Balance Sheet',
+        subtitle: report.asOf ? `As of ${new Date(report.asOf).toLocaleDateString('en-US')}` : undefined,
+        columns: [{ header: 'Account' }, { header: 'Amount', numeric: true }],
+        rows: [
+          ...sectionRows('Current Assets', report.currentAssets),
+          ...sectionRows('Non-Current Assets', report.nonCurrentAssets),
+          ['Total Assets', report.totalAssets],
+          ['', null],
+          ...sectionRows('Current Liabilities', report.currentLiabilities),
+          ...sectionRows('Long-Term Liabilities', report.longTermLiabilities),
+          ['Total Liabilities', report.totalLiabilities],
+          ['', null],
+          ['EQUITY', null],
+          ...report.equity.map((l) => [`${l.code} ${l.name}`, l.amount] as (string | null)[]),
+          ['Retained Earnings (Net Income)', report.retainedEarnings],
+          ['Total Equity', report.totalEquity],
+        ],
+        totals: [
+          [
+            'Total Liabilities + Equity',
+            Money.add(report.totalLiabilities, report.totalEquity).toFixed(2),
+          ],
+        ],
+      }
+    : null;
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader title="Classified Balance Sheet" icon={BarChart2} />
 
+      <ReportToolbar table={table} disabled={loading} />
+
       {/* As-of filter */}
-      <Card className="p-4 mb-6 max-w-3xl">
+      <Card className="p-4 mb-6 max-w-3xl print-hidden">
         <form
           className="flex items-end gap-3 flex-wrap"
           onSubmit={(e) => {

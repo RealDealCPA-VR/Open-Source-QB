@@ -49,6 +49,7 @@ export const navGroups: NavGroup[] = [
     heading: 'Purchases',
     links: [
       { icon: ShoppingCart, label: 'Purchase Orders', path: '/purchase-orders' },
+      { icon: PackageSearch, label: 'Receive Items', path: '/item-receipts' },
       { icon: Receipt, label: 'Bills', path: '/bills' },
       { icon: HandCoins, label: 'Pay Bills', path: '/pay-bills' },
       { icon: Banknote, label: 'Write Checks', path: '/expenses' },
@@ -76,6 +77,7 @@ export const navGroups: NavGroup[] = [
       { icon: BookOpen, label: 'Chart of Accounts', path: '/accounts' },
       { icon: Landmark, label: 'Pay Liabilities', path: '/pay-liabilities' },
       { icon: UserSquare, label: 'Payroll', path: '/employees' },
+      { icon: CalendarClock, label: 'Pay Runs', path: '/pay-runs' },
       { icon: FileSpreadsheet, label: 'Pay Stubs', path: '/pay-stubs' },
       { icon: ClipboardList, label: 'Payroll Forms', path: '/payroll-forms' },
       { icon: Calculator, label: 'Payroll Tax', path: '/payroll-tax' },
@@ -97,6 +99,7 @@ export const navGroups: NavGroup[] = [
       { icon: CalendarRange, label: 'P&L by Month', path: '/reports/pl-monthly' },
       { icon: Scale, label: 'Balance Sheet (Cash)', path: '/reports/balance-sheet-cash' },
       { icon: Tag, label: 'P&L by Class', path: '/reports/pl-by-class' },
+      { icon: Boxes, label: 'Inventory Valuation', path: '/reports/inventory-valuation' },
       { icon: UserSquare, label: 'Payroll Reports', path: '/reports/payroll-summary' },
       { icon: Banknote, label: 'Reconciliation Reports', path: '/reports/reconciliation' },
       { icon: Network, label: 'Consolidated', path: '/reports/consolidated' },

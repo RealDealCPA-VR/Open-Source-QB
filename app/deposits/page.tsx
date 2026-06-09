@@ -1,12 +1,14 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { Suspense, useEffect, useState, useCallback } from 'react';
 import { Landmark, Plus, Trash2 } from 'lucide-react';
 import {
+  AmountInput,
   Badge,
   Button,
   Card,
   ConfirmDialog,
+  DateInput,
   EmptyState,
   Input,
   Select,
@@ -23,6 +25,7 @@ import {
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
+import { useNewParam } from '@/lib/useFocusParam';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -277,9 +280,8 @@ function MakeDepositModal({
         {/* Date */}
         <div>
           <Label htmlFor="dep-date">Date *</Label>
-          <Input
+          <DateInput
             id="dep-date"
-            type="date"
             value={date}
             onChange={(e) => setDate(e.target.value)}
           />
@@ -420,10 +422,7 @@ function MakeDepositModal({
                     />
                   </div>
                   <div className="w-28 shrink-0">
-                    <Input
-                      type="number"
-                      min="0.01"
-                      step="0.01"
+                    <AmountInput
                       placeholder="0.00"
                       value={l.amount}
                       onChange={(e) => patchExtraLine(idx, { amount: e.target.value })}
@@ -464,10 +463,7 @@ function MakeDepositModal({
               </Select>
             </div>
             <div className="w-28 shrink-0">
-              <Input
-                type="number"
-                min="0"
-                step="0.01"
+              <AmountInput
                 placeholder="0.00"
                 value={cashBackAmount}
                 onChange={(e) => setCashBackAmount(e.target.value)}
@@ -514,7 +510,7 @@ function MakeDepositModal({
 // Main page
 // ---------------------------------------------------------------------------
 
-export default function DepositsPage() {
+function DepositsPageContent() {
   const [deposits, setDeposits] = useState<Deposit[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [undepositedItems, setUndepositedItems] = useState<UndepositedItem[]>([]);
@@ -567,6 +563,9 @@ export default function DepositsPage() {
     fetchSupportingData();
     setShowModal(true);
   }
+
+  // Quick Actions navigate here with ?new=1 — open the Make Deposit modal.
+  useNewParam(openModal);
 
   function handleCreated() {
     fetchDeposits();
@@ -747,5 +746,13 @@ export default function DepositsPage() {
         onClose={() => setPendingVoid(null)}
       />
     </main>
+  );
+}
+
+export default function DepositsPage() {
+  return (
+    <Suspense fallback={null}>
+      <DepositsPageContent />
+    </Suspense>
   );
 }

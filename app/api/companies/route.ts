@@ -25,12 +25,16 @@ async function allowFirstRun(db: DB): Promise<boolean> {
   return !anyUser;
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   const db = await getDb();
   const userId = await getSessionUserId();
   if (userId) {
     // Scope to the caller's memberships — never list other tenants' company files.
-    return NextResponse.json(await listCompaniesForUser(db, userId));
+    // Archived (soft-deleted) files are hidden by default; ?includeArchived=1 overrides.
+    const includeArchived = req.nextUrl.searchParams.get('includeArchived') === '1';
+    return NextResponse.json(
+      await listCompaniesForUser(db, userId, { excludeArchived: !includeArchived }),
+    );
   }
   if (!(await allowFirstRun(db))) {
     return NextResponse.json({ error: 'Unauthorized', code: 'FORBIDDEN' }, { status: 401 });

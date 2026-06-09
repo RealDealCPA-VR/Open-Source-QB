@@ -8,6 +8,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { receivePayment, listPayments } from '@/lib/services/payments';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { receivePaymentSchema } from '@/lib/validation/payments';
 
 // Map ServiceError codes to HTTP status codes.
 function errorStatus(code: ServiceError['code']): number {
@@ -65,39 +67,13 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    // Basic shape validation
-    if (!body.customerId) {
-      return NextResponse.json({ error: 'customerId is required.', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (!body.date) {
-      return NextResponse.json({ error: 'date is required.', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (!body.method) {
-      return NextResponse.json({ error: 'method is required.', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (!body.amount) {
-      return NextResponse.json({ error: 'amount is required.', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (!Array.isArray(body.applications)) {
-      return NextResponse.json(
-        { error: 'applications must be an array.', code: 'VALIDATION' },
-        { status: 400 },
-      );
+    const body = await req.json().catch(() => ({}));
+    const parsed = receivePaymentSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const result = await receivePayment(ctx, {
-      customerId: body.customerId,
-      date: new Date(body.date),
-      method: body.method,
-      reference: body.reference ?? null,
-      amount: body.amount,
-      depositAccountId: body.depositAccountId ?? null,
-      applications: body.applications,
-      currency: body.currency ?? null,
-      exchangeRate: body.exchangeRate ?? null,
-    });
+    const result = await receivePayment(ctx, parsed.data);
 
     return NextResponse.json(result, { status: 201 });
   } catch (err) {

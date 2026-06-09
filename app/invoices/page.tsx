@@ -1,14 +1,17 @@
 'use client';
 
 import { Suspense, useEffect, useState, useCallback } from 'react';
-import { FileText, Plus, Trash2, PlusCircle, MinusCircle, Download, Mail, Pencil } from 'lucide-react';
+import { FileText, Plus, Trash2, PlusCircle, MinusCircle, Download, Mail, Package, Pencil, Send } from 'lucide-react';
 import {
+  AmountInput,
   Button,
   Card,
   ConfirmDialog,
+  DateInput,
   EmptyState,
   Input,
   Select,
+  useGridKeys,
   Label,
   Badge,
   Table,
@@ -23,7 +26,7 @@ import {
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
-import { useFocusParam } from '@/lib/useFocusParam';
+import { useFocusParam, useNewParam } from '@/lib/useFocusParam';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -34,14 +37,30 @@ interface Customer {
   displayName: string;
 }
 
+type ItemType =
+  | 'service' | 'inventory' | 'non_inventory' | 'bundle'
+  | 'other_charge' | 'discount' | 'subtotal' | 'payment' | 'sales_tax';
+
 interface Item {
   id: string;
   name: string;
-  type: 'service' | 'inventory' | 'non_inventory' | 'bundle';
+  type: ItemType;
   description: string | null;
   salesPrice: string | null;
   taxable: boolean;
   quantityOnHand: string | null;
+  unitOfMeasure: string | null;
+}
+
+interface BundleComponent {
+  componentItemId: string;
+  quantity: string;
+  name: string;
+  type: ItemType;
+  description: string | null;
+  salesPrice: string | null;
+  taxable: boolean;
+  unitOfMeasure: string | null;
 }
 
 interface TaxRate {
@@ -61,6 +80,8 @@ interface Job {
   customerId: string | null;
 }
 
+type InvoiceStatus = 'draft' | 'open' | 'partial' | 'paid' | 'void';
+
 interface Invoice {
   id: string;
   invoiceNumber: number;
@@ -69,7 +90,7 @@ interface Invoice {
   dueDate: string | null;
   total: string;
   balanceDue: string;
-  status: 'open' | 'partial' | 'paid' | 'void';
+  status: InvoiceStatus;
 }
 
 /** Full invoice (GET /api/invoices/:id) used to prefill the edit modal. */
@@ -81,6 +102,7 @@ interface InvoiceDetail extends Invoice {
   currency: string | null;
   exchangeRate: string | null;
   memo: string | null;
+  customFields: Record<string, string> | null;
   lines: Array<{
     id: string;
     itemId: string | null;
@@ -89,6 +111,9 @@ interface InvoiceDetail extends Invoice {
     rate: string;
     taxable: boolean;
     jobId: string | null;
+    itemName: string | null;
+    itemType: ItemType | null;
+    unitOfMeasure: string | null;
   }>;
 }
 
@@ -96,11 +121,15 @@ interface LineRow {
   /** Find-as-you-type item field (datalist); itemId resolves on exact name match. */
   itemName: string;
   itemId: string | null;
+  itemType: ItemType | null;
+  unitOfMeasure: string | null;
   description: string;
   quantity: string;
   rate: string;
   taxable: boolean;
   jobId: string;
+  /** Discount items only: interpret `rate` as a % of the preceding body lines. */
+  discountPercent: boolean;
 }
 
 /** Unbilled billable time & costs (GET /api/billables?customerId=). */
@@ -135,65 +164,134 @@ interface CustomerPrice {
   price: string;
 }
 
+interface CustomFieldDef {
+  name: string;
+}
+
 type DiscountType = 'amount' | 'percent';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function statusLabel(status: Invoice['status']): string {
+function statusLabel(status: InvoiceStatus): string {
+  if (status === 'draft') return 'Pending';
   if (status === 'open') return 'Open';
   if (status === 'partial') return 'Partial';
   if (status === 'paid') return 'Paid';
   return 'Void';
 }
 
-function computeLineTotal(line: LineRow): number {
-  const qty = parseFloat(line.quantity) || 0;
-  const rate = parseFloat(line.rate) || 0;
-  return qty * rate;
+type LineKind = 'income' | 'discount' | 'subtotal' | 'payment' | 'sales_tax';
+
+function lineKind(l: { itemType: ItemType | null }): LineKind {
+  if (l.itemType === 'discount' || l.itemType === 'subtotal' ||
+      l.itemType === 'payment' || l.itemType === 'sales_tax') {
+    return l.itemType;
+  }
+  return 'income';
 }
 
-interface Totals {
+const KIND_BADGES: Partial<Record<ItemType, { label: string; tone: 'info' | 'success' | 'warning' | 'danger' | 'neutral' }>> = {
+  bundle: { label: 'Bundle', tone: 'neutral' },
+  discount: { label: 'Discount', tone: 'danger' },
+  subtotal: { label: 'Subtotal', tone: 'neutral' },
+  payment: { label: 'Payment', tone: 'success' },
+  sales_tax: { label: 'Sales Tax', tone: 'warning' },
+  other_charge: { label: 'Other Charge', tone: 'info' },
+};
+
+interface LiveTotals {
+  /** Computed amount per line (same index as the lines array). */
+  amounts: number[];
   subtotal: number;
   discount: number;
   tax: number;
+  payments: number;
   total: number;
+  balanceDue: number;
 }
 
-/** Mirror the service math: tax applies to taxable lines (pre-discount).
- *  Selected billables flow in as extra non-taxable amounts. */
+/**
+ * Mirror the service math, item-type aware:
+ *  - income lines add to the subtotal (+ taxable base when taxed)
+ *  - discount lines subtract (flat qty*rate, or % of the preceding body lines)
+ *  - subtotal lines display the running body sum (and reset the group)
+ *  - payment lines reduce the balance due (not the subtotal)
+ *  - sales_tax lines add straight to the tax amount
+ * Selected billables flow in as extra non-taxable income.
+ */
 function computeTotals(
   lines: LineRow[],
   discount: string,
   discountType: DiscountType,
   taxRate: number,
   billablesAmount: number,
-): Totals {
-  const subtotal = lines.reduce((sum, l) => sum + computeLineTotal(l), 0) + billablesAmount;
-  const taxableSubtotal = lines.reduce(
-    (sum, l) => sum + (l.taxable ? computeLineTotal(l) : 0),
-    0,
-  );
+): LiveTotals {
+  let subtotal = 0;
+  let taxableSubtotal = 0;
+  let payments = 0;
+  let manualTax = 0;
+  let running = 0;
+  const amounts: number[] = [];
+
+  for (const l of lines) {
+    const kind = lineKind(l);
+    if (kind === 'subtotal') {
+      amounts.push(running);
+      running = 0;
+      continue;
+    }
+    const qty = parseFloat(l.quantity) || 0;
+    const rate = parseFloat(l.rate) || 0;
+    let amt: number;
+    if (kind === 'discount') {
+      amt = l.discountPercent
+        ? -(running * (Math.abs(rate) / 100))
+        : -Math.abs((qty || 1) * rate);
+    } else {
+      amt = qty * rate;
+    }
+    amounts.push(amt);
+
+    if (kind === 'income' || kind === 'discount') {
+      subtotal += amt;
+      running += amt;
+      if (l.taxable) taxableSubtotal += amt;
+    } else if (kind === 'payment') {
+      payments += amt;
+    } else if (kind === 'sales_tax') {
+      manualTax += amt;
+    }
+  }
+
+  subtotal += billablesAmount;
   const discValue = parseFloat(discount) || 0;
   const discAmount = discountType === 'percent' ? subtotal * (discValue / 100) : discValue;
-  const tax = taxableSubtotal * taxRate;
+  const tax = Math.max(0, taxableSubtotal) * taxRate + manualTax;
+  const total = Math.max(0, subtotal - discAmount + tax);
   return {
+    amounts,
     subtotal,
     discount: discAmount,
     tax,
-    total: Math.max(0, subtotal - discAmount + tax),
+    payments,
+    total,
+    balanceDue: Math.max(0, total - payments),
   };
 }
 
 const EMPTY_LINE: LineRow = {
   itemName: '',
   itemId: null,
+  itemType: null,
+  unitOfMeasure: null,
   description: '',
   quantity: '',
   rate: '',
   taxable: true,
   jobId: '',
+  discountPercent: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -210,6 +308,7 @@ interface InvoiceModalProps {
   taxRates: TaxRate[];
   classes: ClassRow[];
   jobs: Job[];
+  customFieldDefs: CustomFieldDef[];
   onSaved: () => void;
 }
 
@@ -222,6 +321,7 @@ function InvoiceModal({
   taxRates,
   classes,
   jobs,
+  customFieldDefs,
   onSaved,
 }: InvoiceModalProps) {
   const [customerId, setCustomerId] = useState('');
@@ -236,6 +336,8 @@ function InvoiceModal({
   const [memo, setMemo] = useState('');
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
   const [saving, setSaving] = useState(false);
+  const [saveAsPending, setSaveAsPending] = useState(false);
+  const [customValues, setCustomValues] = useState<Record<string, string>>({});
 
   // Customer price levels: itemId → custom price for the selected customer.
   const [customerPrices, setCustomerPrices] = useState<Map<string, string>>(new Map());
@@ -265,15 +367,20 @@ function InvoiceModal({
         editing.currency && editing.exchangeRate ? String(Number(editing.exchangeRate)) : '',
       );
       setMemo(editing.memo ?? '');
+      setSaveAsPending(editing.status === 'draft');
+      setCustomValues(editing.customFields ?? {});
       setLines(
         editing.lines.map((l) => ({
-          itemName: l.itemId ? (itemNameById.get(l.itemId) ?? '') : '',
+          itemName: l.itemName ?? (l.itemId ? (itemNameById.get(l.itemId) ?? '') : ''),
           itemId: l.itemId,
+          itemType: l.itemType,
+          unitOfMeasure: l.unitOfMeasure,
           description: l.description ?? '',
           quantity: String(Number(l.quantity)),
           rate: String(Number(l.rate)),
           taxable: l.taxable,
           jobId: l.jobId ?? '',
+          discountPercent: false,
         })),
       );
     } else {
@@ -287,6 +394,8 @@ function InvoiceModal({
       setCurrency('');
       setExchangeRate('');
       setMemo('');
+      setSaveAsPending(false);
+      setCustomValues({});
       setLines([{ ...EMPTY_LINE }]);
     }
     setBillables(null);
@@ -343,26 +452,80 @@ function InvoiceModal({
     });
   }
 
+  /** Expand a bundle item into its component lines (printed grouped under the bundle name). */
+  async function expandBundle(idx: number, bundle: Item) {
+    try {
+      const res = await api.get<{ components: BundleComponent[] }>(
+        `/api/items/${bundle.id}/components`,
+      );
+      const comps = res.components ?? [];
+      if (comps.length === 0) {
+        toast(`Bundle "${bundle.name}" has no components yet — added as a plain line.`, 'info');
+        return;
+      }
+      const componentLines: LineRow[] = comps.map((c) => ({
+        itemName: c.name,
+        itemId: c.componentItemId,
+        itemType: c.type,
+        unitOfMeasure: c.unitOfMeasure,
+        description: `${bundle.name}: ${c.description ?? c.name}`,
+        quantity: String(Number(c.quantity)),
+        rate:
+          customerPrices.get(c.componentItemId) != null
+            ? String(Number(customerPrices.get(c.componentItemId)))
+            : (c.salesPrice ?? '0'),
+        taxable: c.taxable,
+        jobId: '',
+        discountPercent: false,
+      }));
+      setLines((prev) => {
+        const next = [...prev];
+        next.splice(idx, 1, ...componentLines);
+        return next;
+      });
+      toast(`Expanded bundle "${bundle.name}" into ${comps.length} component line${comps.length !== 1 ? 's' : ''}.`, 'success');
+    } catch {
+      toast('Failed to load bundle components — added as a plain line.', 'danger');
+    }
+  }
+
   /** Item field changed: resolve exact (case-insensitive) name → auto-fill the line.
-   *  Price levels: a customer-specific price (customer_prices) wins over salesPrice. */
+   *  Price levels: a customer-specific price (customer_prices) wins over salesPrice.
+   *  Bundles expand into their component lines. Special types pre-fill sensibly. */
   function handleItemInput(idx: number, value: string) {
     const match = items.find((it) => it.name.toLowerCase() === value.trim().toLowerCase());
     if (match) {
+      if (match.type === 'bundle') {
+        // Replace this row with the bundle's component lines.
+        void expandBundle(idx, match);
+        return;
+      }
       const customerPrice = customerPrices.get(match.id);
+      const isSpecial =
+        match.type === 'discount' || match.type === 'subtotal' ||
+        match.type === 'payment' || match.type === 'sales_tax';
       updateLine(idx, {
         itemName: match.name,
         itemId: match.id,
+        itemType: match.type,
+        unitOfMeasure: match.unitOfMeasure,
         description: match.description ?? match.name,
-        rate: customerPrice != null ? String(Number(customerPrice)) : (match.salesPrice ?? ''),
-        taxable: match.taxable,
-        quantity: lines[idx].quantity || '1',
+        rate:
+          match.type === 'subtotal'
+            ? ''
+            : customerPrice != null
+              ? String(Number(customerPrice))
+              : (match.salesPrice ?? ''),
+        taxable: isSpecial ? match.type === 'discount' && match.taxable : match.taxable,
+        quantity: match.type === 'subtotal' ? '' : lines[idx].quantity || '1',
+        discountPercent: false,
       });
-      if (customerPrice != null) {
+      if (customerPrice != null && !isSpecial) {
         toast(`Customer price applied for ${match.name}: ${formatCurrency(customerPrice)}`, 'info');
       }
     } else {
       // No item match — stays a manual description line (itemId null).
-      updateLine(idx, { itemName: value, itemId: null });
+      updateLine(idx, { itemName: value, itemId: null, itemType: null, unitOfMeasure: null });
     }
   }
 
@@ -371,8 +534,12 @@ function InvoiceModal({
   }
 
   function removeLine(idx: number) {
-    setLines((prev) => prev.filter((_, i) => i !== idx));
+    // Keep at least one line (mirrors the per-row remove button being disabled).
+    setLines((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== idx) : prev));
   }
+
+  // Ctrl+Insert adds a line, Ctrl+Delete removes the focused row, Enter moves down.
+  const grid = useGridKeys({ addRow: addLine, removeRow: removeLine, disabled: saving });
 
   function toggleCost(id: string) {
     setSelectedCostIds((prev) => {
@@ -418,12 +585,24 @@ function InvoiceModal({
   async function handleSubmit() {
     if (!customerId) { toast('Please select a customer.', 'danger'); return; }
     if (!date) { toast('Please enter an invoice date.', 'danger'); return; }
-    const validLines = lines.filter((l) => l.itemId || l.description || l.quantity || l.rate);
-    if (validLines.length === 0 && !hasBillablesSelected) {
+
+    // Pair each line with its index so per-line live amounts stay aligned.
+    const indexed = lines
+      .map((l, idx) => ({ l, idx }))
+      .filter(({ l }) => l.itemId || l.description || l.quantity || l.rate);
+    if (indexed.length === 0 && !hasBillablesSelected) {
       toast('Add at least one line item or select billables.', 'danger'); return;
     }
-    for (let i = 0; i < validLines.length; i++) {
-      const l = validLines[i];
+    for (let i = 0; i < indexed.length; i++) {
+      const { l } = indexed[i];
+      const kind = lineKind(l);
+      if (kind === 'subtotal') continue; // computed server-side
+      if (kind === 'discount') {
+        if (!l.rate || (parseFloat(l.rate) || 0) === 0) {
+          toast(`Line ${i + 1}: enter a discount ${l.discountPercent ? 'percent' : 'amount'}.`, 'danger'); return;
+        }
+        continue;
+      }
       if (!l.quantity || parseFloat(l.quantity) <= 0) {
         toast(`Line ${i + 1}: quantity must be a positive number.`, 'danger'); return;
       }
@@ -443,15 +622,38 @@ function InvoiceModal({
       currency: currency || undefined,
       exchangeRate: exchangeRate || undefined,
       memo: memo || undefined,
-      lines: validLines.map((l) => ({
-        itemId: l.itemId,
-        description: l.description || null,
-        quantity: l.quantity,
-        rate: l.rate,
-        taxable: l.taxable,
-        jobId: l.jobId || null,
-      })),
+      customFields: customFieldDefs.length > 0 ? customValues : undefined,
+      lines: indexed.map(({ l, idx }) => {
+        const kind = lineKind(l);
+        if (kind === 'subtotal') {
+          // Server recomputes the amount from the preceding lines.
+          return { itemId: l.itemId, description: l.description || null, quantity: 1, rate: 0, taxable: false };
+        }
+        if (kind === 'discount' && l.discountPercent) {
+          // Convert the live %-of-preceding-lines amount into a flat negative rate.
+          return {
+            itemId: l.itemId,
+            description: l.description || null,
+            quantity: 1,
+            rate: totals.amounts[idx].toFixed(2),
+            taxable: l.taxable,
+            jobId: l.jobId || null,
+          };
+        }
+        return {
+          itemId: l.itemId,
+          description: l.description || null,
+          quantity: l.quantity,
+          rate: l.rate,
+          taxable: l.taxable,
+          jobId: l.jobId || null,
+        };
+      }),
     };
+
+    if (!editing) {
+      payload.status = saveAsPending ? 'draft' : 'open';
+    }
 
     if (!editing && hasBillablesSelected && billables) {
       payload.billables = {
@@ -473,7 +675,7 @@ function InvoiceModal({
         toast(`Invoice #${editing.invoiceNumber} updated.`, 'success');
       } else {
         await api.post('/api/invoices', payload);
-        toast('Invoice created.', 'success');
+        toast(saveAsPending ? 'Pending invoice saved (not posted).' : 'Invoice created.', 'success');
       }
       onSaved();
       onClose();
@@ -490,21 +692,42 @@ function InvoiceModal({
       size="lg"
       open={open}
       onClose={onClose}
-      title={editing ? `Edit Invoice #${editing.invoiceNumber}` : 'New Invoice'}
+      title={
+        editing
+          ? `Edit Invoice #${editing.invoiceNumber}${editing.status === 'draft' ? ' (Pending)' : ''}`
+          : 'New Invoice'
+      }
       footer={
         <>
+          {!editing && (
+            <label className="mr-auto flex items-center gap-2 text-sm text-navy/70 select-none">
+              <input
+                type="checkbox"
+                checked={saveAsPending}
+                onChange={(e) => setSaveAsPending(e.target.checked)}
+                className="accent-electric"
+              />
+              Save as pending (don&apos;t post yet)
+            </label>
+          )}
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
           <Button onClick={handleSubmit} loading={saving}>
-            {editing ? 'Save Changes' : 'Create Invoice'}
+            {editing ? 'Save Changes' : saveAsPending ? 'Save Pending' : 'Create Invoice'}
           </Button>
         </>
       }
     >
       <div className="space-y-4">
-        {editing && (
+        {editing && editing.status !== 'draft' && (
           <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
             Editing re-posts this invoice&apos;s GL entry (and any COGS). Allowed only while no
             payments are applied and the period is open.
+          </div>
+        )}
+        {editing && editing.status === 'draft' && (
+          <div className="rounded-lg bg-navy/5 px-3 py-2 text-xs text-navy/60">
+            This invoice is pending — nothing has been posted to the GL yet. Use{' '}
+            <span className="font-semibold">Post</span> on the invoice list when it is ready.
           </div>
         )}
 
@@ -528,18 +751,16 @@ function InvoiceModal({
         <div className="grid grid-cols-2 gap-3">
           <div>
             <Label htmlFor="inv-date">Invoice Date *</Label>
-            <Input
+            <DateInput
               id="inv-date"
-              type="date"
               value={date}
               onChange={(e) => setDate(e.target.value)}
             />
           </div>
           <div>
             <Label htmlFor="inv-due">Due Date</Label>
-            <Input
+            <DateInput
               id="inv-due"
-              type="date"
               value={dueDate}
               onChange={(e) => setDueDate(e.target.value)}
             />
@@ -578,6 +799,25 @@ function InvoiceModal({
           </div>
         </div>
 
+        {/* Custom fields (company-defined) */}
+        {customFieldDefs.length > 0 && (
+          <div className="grid grid-cols-2 gap-3">
+            {customFieldDefs.map((f) => (
+              <div key={f.name}>
+                <Label htmlFor={`inv-cf-${f.name}`}>{f.name}</Label>
+                <Input
+                  id={`inv-cf-${f.name}`}
+                  value={customValues[f.name] ?? ''}
+                  onChange={(e) =>
+                    setCustomValues((prev) => ({ ...prev, [f.name]: e.target.value }))
+                  }
+                  placeholder={f.name}
+                />
+              </div>
+            ))}
+          </div>
+        )}
+
         {/* Line items */}
         <div>
           <div className="flex items-center justify-between mb-2">
@@ -593,19 +833,31 @@ function InvoiceModal({
 
           {/* Find-as-you-type item options shared by all line rows */}
           <datalist id="inv-item-options">
-            {items.map((it) => (
-              <option key={it.id} value={it.name}>
-                {it.type === 'inventory'
-                  ? `${formatCurrency(customerPrices.get(it.id) ?? it.salesPrice ?? '0')} · ${Number(it.quantityOnHand ?? 0)} on hand`
-                  : formatCurrency(customerPrices.get(it.id) ?? it.salesPrice ?? '0')}
-              </option>
-            ))}
+            {items.map((it) => {
+              const typeTag = KIND_BADGES[it.type]?.label;
+              const price = formatCurrency(customerPrices.get(it.id) ?? it.salesPrice ?? '0');
+              const detail =
+                it.type === 'inventory'
+                  ? `${price} · ${Number(it.quantityOnHand ?? 0)} on hand`
+                  : typeTag
+                    ? `${typeTag}${it.type === 'subtotal' ? '' : ` · ${price}`}`
+                    : price;
+              return (
+                <option key={it.id} value={it.name}>
+                  {it.unitOfMeasure ? `${detail} · per ${it.unitOfMeasure}` : detail}
+                </option>
+              );
+            })}
           </datalist>
 
-          <div className="rounded-lg border border-slate-200 overflow-hidden">
-            {lines.map((line, idx) => (
+          <div className="rounded-lg border border-slate-200 overflow-hidden" onKeyDown={grid.onKeyDown}>
+            {lines.map((line, idx) => {
+              const kind = lineKind(line);
+              const badge = line.itemType ? KIND_BADGES[line.itemType] : undefined;
+              return (
               <div
                 key={idx}
+                data-grid-row
                 className="px-3 py-2 border-b border-slate-100 last:border-b-0 space-y-2"
               >
                 {/* Row 1: item lookup + description + remove */}
@@ -634,20 +886,16 @@ function InvoiceModal({
                 </div>
                 {/* Row 2: qty, rate, job, taxable, amount */}
                 <div className="grid grid-cols-[64px_84px_1fr_52px_76px] gap-2 items-center">
-                  <Input
+                  <AmountInput
                     placeholder="Qty"
-                    type="number"
-                    min="0"
-                    step="any"
-                    value={line.quantity}
+                    value={kind === 'subtotal' ? '' : line.quantity}
+                    disabled={kind === 'subtotal' || (kind === 'discount' && line.discountPercent)}
                     onChange={(e) => updateLine(idx, { quantity: e.target.value })}
                   />
-                  <Input
-                    placeholder="Rate"
-                    type="number"
-                    min="0"
-                    step="any"
-                    value={line.rate}
+                  <AmountInput
+                    placeholder={kind === 'discount' ? (line.discountPercent ? '%' : 'Amount') : 'Rate'}
+                    value={kind === 'subtotal' ? '' : line.rate}
+                    disabled={kind === 'subtotal'}
                     onChange={(e) => updateLine(idx, { rate: e.target.value })}
                   />
                   <Select
@@ -664,17 +912,44 @@ function InvoiceModal({
                     <input
                       type="checkbox"
                       checked={line.taxable}
+                      disabled={kind === 'subtotal' || kind === 'payment' || kind === 'sales_tax'}
                       onChange={(e) => updateLine(idx, { taxable: e.target.checked })}
                       className="accent-electric"
                     />
                     Tax
                   </label>
                   <span className="text-right text-xs font-semibold text-navy/70 tabular-nums">
-                    {formatCurrency(computeLineTotal(line).toFixed(2))}
+                    {formatCurrency((totals.amounts[idx] ?? 0).toFixed(2))}
                   </span>
                 </div>
+                {/* Row 3 (special types / UoM): badge + helpers */}
+                {(badge || line.unitOfMeasure) && (
+                  <div className="flex items-center gap-2 text-xs text-navy/50">
+                    {badge && <Badge tone={badge.tone}>{badge.label}</Badge>}
+                    {line.unitOfMeasure && <span>per {line.unitOfMeasure}</span>}
+                    {kind === 'subtotal' && (
+                      <span>Sum of the lines above — computed automatically.</span>
+                    )}
+                    {kind === 'payment' && <span>Reduces the balance due (Dr Undeposited Funds / Cr A/R).</span>}
+                    {kind === 'sales_tax' && <span>Manual tax amount added to Sales Tax Payable.</span>}
+                    {kind === 'discount' && (
+                      <label className="flex items-center gap-1 select-none cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={line.discountPercent}
+                          onChange={(e) =>
+                            updateLine(idx, { discountPercent: e.target.checked, quantity: '1' })
+                          }
+                          className="accent-electric"
+                        />
+                        % of the lines above
+                      </label>
+                    )}
+                  </div>
+                )}
               </div>
-            ))}
+              );
+            })}
           </div>
         </div>
 
@@ -780,22 +1055,16 @@ function InvoiceModal({
                 %
               </button>
             </div>
-            <Input
+            <AmountInput
               id="inv-discount"
               placeholder={discountType === 'percent' ? '0' : '0.00'}
-              type="number"
-              min="0"
-              max={discountType === 'percent' ? 100 : undefined}
-              step="any"
               value={discount}
               onChange={(e) => setDiscount(e.target.value)}
             />
           </div>
           {discountType === 'percent' && discount && (
             <p className="mt-1 text-xs text-navy/50">
-              = {formatCurrency(
-                ((lines.reduce((s, l) => s + computeLineTotal(l), 0) + billablesAmount) * (parseFloat(discount) / 100)).toFixed(2)
-              )} off
+              = {formatCurrency((totals.subtotal * ((parseFloat(discount) || 0) / 100)).toFixed(2))} off
             </p>
           )}
         </div>
@@ -851,6 +1120,22 @@ function InvoiceModal({
               {formatCurrency(totals.total.toFixed(2), currency || 'USD')}
             </span>
           </div>
+          {totals.payments > 0 && (
+            <>
+              <div className="flex items-center justify-between text-sm text-navy/60">
+                <span>Less payments received</span>
+                <span className="tabular-nums">
+                  -{formatCurrency(totals.payments.toFixed(2), currency || 'USD')}
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-semibold text-navy/70">Balance Due</span>
+                <span className="text-base font-bold text-navy tabular-nums">
+                  {formatCurrency(totals.balanceDue.toFixed(2), currency || 'USD')}
+                </span>
+              </div>
+            </>
+          )}
         </div>
       </div>
     </Modal>
@@ -868,8 +1153,10 @@ function InvoicesPageContent() {
   const [taxRates, setTaxRates] = useState<TaxRate[]>([]);
   const [classes, setClasses] = useState<ClassRow[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [customFieldDefs, setCustomFieldDefs] = useState<CustomFieldDef[]>([]);
   const [loading, setLoading] = useState(true);
   const [showNew, setShowNew] = useState(false);
+  const [statusFilter, setStatusFilter] = useState<'all' | InvoiceStatus>('all');
 
   // Edit state — the full invoice (with lines) being edited.
   const [editTarget, setEditTarget] = useState<InvoiceDetail | null>(null);
@@ -878,6 +1165,10 @@ function InvoicesPageContent() {
   // Void state
   const [voidTarget, setVoidTarget] = useState<Invoice | null>(null);
   const [voiding, setVoiding] = useState(false);
+
+  // Post (pending → posted) state
+  const [postTarget, setPostTarget] = useState<Invoice | null>(null);
+  const [posting, setPosting] = useState(false);
 
   // Email state
   const [emailConfigured, setEmailConfigured] = useState(true);
@@ -913,11 +1204,24 @@ function InvoicesPageContent() {
     } finally {
       setLoading(false);
     }
+    // Custom field definitions are optional — never block the page on them.
+    try {
+      const res = await api.get<{ fields: CustomFieldDef[] }>('/api/invoices/custom-fields');
+      setCustomFieldDefs(res.fields ?? []);
+    } catch {
+      setCustomFieldDefs([]);
+    }
   }, []);
 
   useEffect(() => {
     fetchData();
   }, [fetchData]);
+
+  // Ctrl+I / Quick Actions navigate here with ?new=1 — open the create modal.
+  useNewParam(() => {
+    setEditTarget(null);
+    setShowNew(true);
+  });
 
   // Scroll to + highlight the row when arriving via global search (?focus=<id>)
   const [focusedId, setFocusedId] = useState<string | null>(null);
@@ -957,6 +1261,22 @@ function InvoicesPageContent() {
     }
   }
 
+  async function handlePost() {
+    if (!postTarget) return;
+    setPosting(true);
+    try {
+      await api.post(`/api/invoices/${postTarget.id}/post`, {});
+      toast(`Invoice #${postTarget.invoiceNumber} posted to the GL.`, 'success');
+      setPostTarget(null);
+      fetchData();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to post invoice.';
+      toast(msg, 'danger');
+    } finally {
+      setPosting(false);
+    }
+  }
+
   async function handleEmail() {
     if (!emailTarget) return;
     setEmailing(true);
@@ -973,15 +1293,34 @@ function InvoicesPageContent() {
     }
   }
 
+  const visibleInvoices =
+    statusFilter === 'all' ? invoices : invoices.filter((i) => i.status === statusFilter);
+  const pendingCount = invoices.filter((i) => i.status === 'draft').length;
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
         title="Invoices"
         icon={FileText}
         action={
-          <Button onClick={() => setShowNew(true)}>
-            <Plus className="h-4 w-4" /> New Invoice
-          </Button>
+          <div className="flex items-center gap-2">
+            <Select
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value as 'all' | InvoiceStatus)}
+              aria-label="Filter by status"
+              className="w-36"
+            >
+              <option value="all">All statuses</option>
+              <option value="draft">Pending{pendingCount > 0 ? ` (${pendingCount})` : ''}</option>
+              <option value="open">Open</option>
+              <option value="partial">Partial</option>
+              <option value="paid">Paid</option>
+              <option value="void">Void</option>
+            </Select>
+            <Button onClick={() => setShowNew(true)}>
+              <Plus className="h-4 w-4" /> New Invoice
+            </Button>
+          </div>
         }
       />
 
@@ -990,15 +1329,21 @@ function InvoicesPageContent() {
           <div className="flex items-center justify-center py-20 text-navy/40">
             <Spinner className="h-6 w-6" />
           </div>
-        ) : invoices.length === 0 ? (
+        ) : visibleInvoices.length === 0 ? (
           <EmptyState
             icon={FileText}
-            title="No invoices yet"
-            message="Create your first invoice to get started."
+            title={statusFilter === 'all' ? 'No invoices yet' : `No ${statusLabel(statusFilter as InvoiceStatus).toLowerCase()} invoices`}
+            message={
+              statusFilter === 'all'
+                ? 'Create your first invoice to get started.'
+                : 'Try a different status filter.'
+            }
             action={
-              <Button onClick={() => setShowNew(true)}>
-                <Plus className="h-4 w-4" /> New Invoice
-              </Button>
+              statusFilter === 'all' ? (
+                <Button onClick={() => setShowNew(true)}>
+                  <Plus className="h-4 w-4" /> New Invoice
+                </Button>
+              ) : undefined
             }
           />
         ) : (
@@ -1016,7 +1361,7 @@ function InvoicesPageContent() {
               </Tr>
             </thead>
             <tbody>
-              {invoices.map((inv) => {
+              {visibleInvoices.map((inv) => {
                 const overdue =
                   (inv.status === 'open' || inv.status === 'partial') &&
                   !!inv.dueDate &&
@@ -1038,12 +1383,23 @@ function InvoicesPageContent() {
                     {formatCurrency(inv.balanceDue)}
                   </Td>
                   <Td>
-                    <Badge tone={overdue ? 'overdue' : inv.status}>
+                    <Badge tone={inv.status === 'draft' ? 'warning' : overdue ? 'overdue' : inv.status}>
                       {overdue ? 'Overdue' : statusLabel(inv.status)}
                     </Badge>
                   </Td>
                   <Td className="text-right">
                     <span className="inline-flex items-center gap-1">
+                      {inv.status === 'draft' && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setPostTarget(inv)}
+                          className="text-emerald hover:bg-emerald/10"
+                          title="Post this pending invoice to the GL"
+                        >
+                          <Send className="h-3.5 w-3.5" /> Post
+                        </Button>
+                      )}
                       <Button
                         variant="ghost"
                         size="sm"
@@ -1052,18 +1408,30 @@ function InvoicesPageContent() {
                       >
                         <Download className="h-3.5 w-3.5" /> PDF
                       </Button>
-                      {inv.status === 'open' && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => window.open(`/api/invoices/${inv.id}/packing-slip`, '_blank')}
+                        title="View packing slip (quantities only, no prices)"
+                      >
+                        <Package className="h-3.5 w-3.5" /> Packing Slip
+                      </Button>
+                      {(inv.status === 'open' || inv.status === 'draft') && (
                         <Button
                           variant="ghost"
                           size="sm"
                           onClick={() => handleEdit(inv)}
                           loading={loadingEditId === inv.id}
-                          title="Edit invoice (re-posts the GL entry)"
+                          title={
+                            inv.status === 'draft'
+                              ? 'Edit pending invoice (nothing posted yet)'
+                              : 'Edit invoice (re-posts the GL entry)'
+                          }
                         >
                           <Pencil className="h-3.5 w-3.5" /> Edit
                         </Button>
                       )}
-                      {inv.status !== 'void' && (
+                      {inv.status !== 'void' && inv.status !== 'draft' && (
                         <Button
                           variant="ghost"
                           size="sm"
@@ -1079,9 +1447,9 @@ function InvoicesPageContent() {
                           size="sm"
                           onClick={() => setVoidTarget(inv)}
                           className="text-red-500 hover:bg-red-50"
-                          title="Void invoice"
+                          title={inv.status === 'draft' ? 'Discard pending invoice' : 'Void invoice'}
                         >
-                          <Trash2 className="h-3.5 w-3.5" /> Void
+                          <Trash2 className="h-3.5 w-3.5" /> {inv.status === 'draft' ? 'Discard' : 'Void'}
                         </Button>
                       )}
                     </span>
@@ -1106,12 +1474,18 @@ function InvoicesPageContent() {
               {invoices.filter((i) => i.status === 'open' || i.status === 'partial').length}
             </span>
           </span>
+          {pendingCount > 0 && (
+            <span>
+              Pending:{' '}
+              <span className="font-semibold text-navy/70">{pendingCount}</span>
+            </span>
+          )}
           <span>
             Total outstanding:{' '}
             <span className="font-semibold text-navy/70">
               {formatCurrency(
                 invoices
-                  .filter((i) => i.status !== 'void')
+                  .filter((i) => i.status !== 'void' && i.status !== 'draft')
                   .reduce((s, i) => s + Number(i.balanceDue), 0)
                   .toFixed(2),
               )}
@@ -1129,24 +1503,48 @@ function InvoicesPageContent() {
         taxRates={taxRates}
         classes={classes}
         jobs={jobs}
+        customFieldDefs={customFieldDefs}
         onSaved={fetchData}
       />
 
       <ConfirmDialog
         open={!!voidTarget}
-        title="Void Invoice"
+        title={voidTarget?.status === 'draft' ? 'Discard Pending Invoice' : 'Void Invoice'}
         message={
-          <>
-            Are you sure you want to void{' '}
-            <strong>Invoice #{voidTarget?.invoiceNumber}</strong>? This will reverse the GL
-            entry and cannot be undone.
-          </>
+          voidTarget?.status === 'draft' ? (
+            <>
+              Discard pending <strong>Invoice #{voidTarget?.invoiceNumber}</strong>? Nothing was
+              posted to the GL, so this just marks the draft void.
+            </>
+          ) : (
+            <>
+              Are you sure you want to void{' '}
+              <strong>Invoice #{voidTarget?.invoiceNumber}</strong>? This will reverse the GL
+              entry and cannot be undone.
+            </>
+          )
         }
-        confirmLabel="Void Invoice"
+        confirmLabel={voidTarget?.status === 'draft' ? 'Discard' : 'Void Invoice'}
         tone="danger"
         loading={voiding}
         onConfirm={handleVoid}
         onClose={() => setVoidTarget(null)}
+      />
+
+      <ConfirmDialog
+        open={!!postTarget}
+        title="Post Pending Invoice"
+        message={
+          <>
+            Post <strong>Invoice #{postTarget?.invoiceNumber}</strong> to the general ledger? This
+            records A/R and income (and relieves inventory) as of the invoice date. The fiscal
+            period is checked now.
+          </>
+        }
+        confirmLabel="Post Invoice"
+        loading={posting}
+        onConfirm={handlePost}
+        onClose={() => setPostTarget(null)}
       />
 
       {/* Email Invoice Modal */}

@@ -6,6 +6,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { createSalesReceipt, listSalesReceipts } from '@/lib/services/salesReceipts';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createSalesReceiptSchema } from '@/lib/validation/salesReceipts';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -41,38 +43,13 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    // Basic shape check — detailed validation happens inside the service.
-    if (!body.date) {
-      return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (!Array.isArray(body.lines) || body.lines.length === 0) {
-      return NextResponse.json(
-        { error: 'lines must be a non-empty array', code: 'VALIDATION' },
-        { status: 400 },
-      );
+    const body = await req.json().catch(() => ({}));
+    const parsed = createSalesReceiptSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const receipt = await createSalesReceipt(ctx, {
-      customerId: body.customerId ?? null,
-      date: new Date(body.date),
-      taxRateId: body.taxRateId ?? null,
-      depositAccountId: body.depositAccountId ?? null,
-      method: body.method ?? null,
-      reference: body.reference ?? null,
-      memo: body.memo ?? null,
-      classId: body.classId ?? null,
-      lines: body.lines.map((l: Record<string, unknown>) => ({
-        itemId: (l.itemId as string | undefined) ?? null,
-        accountId: (l.accountId as string | undefined) ?? null,
-        description: (l.description as string | undefined) ?? null,
-        quantity: l.quantity as string | number,
-        rate: l.rate as string | number,
-        taxable: l.taxable !== undefined ? Boolean(l.taxable) : true,
-        taxRateId: (l.taxRateId as string | undefined) ?? null,
-      })),
-    });
+    const receipt = await createSalesReceipt(ctx, parsed.data);
 
     return NextResponse.json(receipt, { status: 201 });
   } catch (err) {

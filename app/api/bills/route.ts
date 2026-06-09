@@ -6,6 +6,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { createBill, listBills } from '@/lib/services/bills';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createBillSchema } from '@/lib/validation/bills';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -41,38 +43,13 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    // Basic shape check — detailed validation happens inside the service.
-    if (!body.vendorId) {
-      return NextResponse.json({ error: 'vendorId is required', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (!body.date) {
-      return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (!Array.isArray(body.lines) || body.lines.length === 0) {
-      return NextResponse.json({ error: 'lines must be a non-empty array', code: 'VALIDATION' }, { status: 400 });
+    const body = await req.json().catch(() => ({}));
+    const parsed = createBillSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const bill = await createBill(ctx, {
-      vendorId: body.vendorId,
-      billNumber: body.billNumber ?? null,
-      date: new Date(body.date),
-      dueDate: body.dueDate ? new Date(body.dueDate) : null,
-      memo: body.memo ?? null,
-      classId: (body.classId as string | undefined) ?? null,
-      lines: body.lines.map((l: Record<string, unknown>) => ({
-        accountId: (l.accountId as string | undefined) ?? null,
-        itemId: (l.itemId as string | undefined) ?? null,
-        description: (l.description as string | undefined) ?? null,
-        quantity: l.quantity as string | number | undefined,
-        unitCost: (l.unitCost as string | number | undefined) ?? null,
-        amount: (l.amount as string | number | undefined) ?? null,
-        classId: (l.classId as string | undefined) ?? null,
-        customerId: (l.customerId as string | undefined) ?? null,
-        jobId: (l.jobId as string | undefined) ?? null,
-      })),
-    });
+    const bill = await createBill(ctx, parsed.data);
 
     return NextResponse.json(bill, { status: 201 });
   } catch (err) {

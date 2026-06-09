@@ -43,6 +43,22 @@ interface DueAmounts {
   payrollLiabilitiesDue: string;
 }
 
+interface AgencyLiabilityRow {
+  agencyId: string | null;
+  agencyName: string | null;
+  liabilityAccountId: string | null;
+  collected: string;
+  paid: string;
+  balance: string;
+}
+
+interface AgencyLiabilities {
+  rows: AgencyLiabilityRow[];
+  totalCollected: string;
+  totalPaid: string;
+  totalBalance: string;
+}
+
 interface LiabilityItem {
   name: string;
   kind: 'tax' | 'deduction' | 'employer_contribution';
@@ -146,12 +162,15 @@ function LiabilityTile({
 function PayModal({
   open,
   type,
+  agency,
   accounts,
   onClose,
   onSuccess,
 }: {
   open: boolean;
   type: LiabilityType | null;
+  /** Set when paying a specific tax agency: posts against its liability account. */
+  agency?: { id: string; name: string; defaultAmount: string } | null;
   accounts: Account[];
   onClose: () => void;
   onSuccess: () => void;
@@ -159,9 +178,16 @@ function PayModal({
   const [form, setForm] = useState<PayForm>(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
 
-  // Reset form whenever the modal opens
+  // Reset form whenever the modal opens; agency payments prefill the balance due.
   useEffect(() => {
-    if (open) setForm(EMPTY_FORM);
+    if (open) {
+      setForm(
+        agency && Number(agency.defaultAmount) > 0
+          ? { ...EMPTY_FORM, amount: agency.defaultAmount }
+          : EMPTY_FORM,
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   function update(field: keyof PayForm, value: string) {
@@ -189,6 +215,7 @@ function PayModal({
         amount: parseFloat(form.amount).toFixed(2),
         date: new Date(form.date).toISOString(),
         paymentAccountId: form.paymentAccountId,
+        agencyId: agency?.id,
         memo: form.memo.trim() || undefined,
       });
       toast(
@@ -203,8 +230,11 @@ function PayModal({
     }
   }
 
-  const title =
-    type === 'sales_tax' ? 'Pay Sales Tax (2200)' : 'Pay Payroll Liabilities (2300)';
+  const title = agency
+    ? `Pay Sales Tax — ${agency.name}`
+    : type === 'sales_tax'
+      ? 'Pay Sales Tax (2200)'
+      : 'Pay Payroll Liabilities (2300)';
 
   // Only offer asset accounts as payment sources (bank, checking, savings)
   const bankAccounts = accounts.filter((a) => a.type === 'asset');
@@ -500,23 +530,27 @@ export default function PayLiabilitiesPage() {
   const [due, setDue] = useState<DueAmounts>({ salesTaxDue: '0.00', payrollLiabilitiesDue: '0.00' });
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [balances, setBalances] = useState<LiabilityBalances | null>(null);
+  const [agencyData, setAgencyData] = useState<AgencyLiabilities | null>(null);
   const [loading, setLoading] = useState(true);
 
   // Modal state
   const [payType, setPayType] = useState<LiabilityType | null>(null);
+  const [payAgency, setPayAgency] = useState<{ id: string; name: string; defaultAmount: string } | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
 
   async function fetchData() {
     setLoading(true);
     try {
-      const [dueData, acctData, balanceData] = await Promise.all([
+      const [dueData, acctData, balanceData, agencyRows] = await Promise.all([
         api.get<DueAmounts>('/api/pay-liabilities'),
         api.get<Account[]>('/api/accounts'),
         api.get<LiabilityBalances>('/api/pay-liabilities/by-item'),
+        api.get<AgencyLiabilities>('/api/pay-liabilities/sales-tax'),
       ]);
       setDue(dueData);
       setAccounts(acctData);
       setBalances(balanceData);
+      setAgencyData(agencyRows);
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to load data.', 'danger');
     } finally {
@@ -531,12 +565,25 @@ export default function PayLiabilitiesPage() {
 
   function openPayModal(type: LiabilityType) {
     setPayType(type);
+    setPayAgency(null);
+    setModalOpen(true);
+  }
+
+  function openAgencyPayModal(row: AgencyLiabilityRow) {
+    if (!row.agencyId) return;
+    setPayType('sales_tax');
+    setPayAgency({
+      id: row.agencyId,
+      name: row.agencyName ?? 'Tax Agency',
+      defaultAmount: Number(row.balance) > 0 ? row.balance : '',
+    });
     setModalOpen(true);
   }
 
   function closeModal() {
     setModalOpen(false);
     setPayType(null);
+    setPayAgency(null);
   }
 
   async function handleSuccess() {
@@ -576,6 +623,108 @@ export default function PayLiabilitiesPage() {
             </Card>
           </div>
 
+          {/* ---- Pay Sales Tax by agency (QB Pay Sales Tax grid) ---- */}
+          <div className="mt-6 max-w-5xl">
+            <Card className="p-0 overflow-hidden">
+              <div className="p-6 pb-4">
+                <div className="flex items-center gap-3">
+                  <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-electric/10">
+                    <Receipt className="h-5 w-5 text-electric" />
+                  </span>
+                  <div>
+                    <p className="text-xs font-semibold text-navy/50 uppercase tracking-wide">
+                      Sales tax — by agency
+                    </p>
+                    <p className="text-base font-bold text-navy">Pay Sales Tax</p>
+                  </div>
+                </div>
+                <p className="text-xs text-navy/50 mt-2">
+                  Tax collected is allocated to agencies through combined-rate components. Payments
+                  post against the agency&apos;s own liability account when one is set (otherwise 2200).
+                </p>
+              </div>
+
+              {!agencyData || agencyData.rows.length === 0 ? (
+                <div className="px-6 pb-6 text-sm text-navy/40">
+                  No tax agencies or collected sales tax yet. Set up agencies and rates on the
+                  Sales Tax settings page.
+                </div>
+              ) : (
+                <Table>
+                  <thead>
+                    <tr>
+                      <Th>Agency</Th>
+                      <Th numeric>Collected</Th>
+                      <Th numeric>Paid</Th>
+                      <Th numeric>Balance</Th>
+                      <Th className="text-right">Actions</Th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {agencyData.rows.map((row) => (
+                      <Tr key={row.agencyId ?? '__unassigned__'}>
+                        <Td className="font-semibold text-navy">
+                          {row.agencyName ?? (
+                            <span className="italic text-navy/50">Unassigned (no agency on rate)</span>
+                          )}
+                          {row.agencyId && !row.liabilityAccountId && (
+                            <span className="ml-2 text-[11px] font-normal text-navy/40">
+                              posts to 2200
+                            </span>
+                          )}
+                        </Td>
+                        <Td numeric className="text-navy/70">{formatCurrency(row.collected)}</Td>
+                        <Td numeric className="text-navy/70">{formatCurrency(row.paid)}</Td>
+                        <Td
+                          numeric
+                          className={`font-semibold ${
+                            Number(row.balance) > 0 ? 'text-red-500' : 'text-navy/40'
+                          }`}
+                        >
+                          {formatCurrency(row.balance)}
+                        </Td>
+                        <Td className="text-right">
+                          {row.agencyId ? (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              disabled={Number(row.balance) <= 0}
+                              onClick={() => openAgencyPayModal(row)}
+                            >
+                              Pay
+                            </Button>
+                          ) : (
+                            <span
+                              className="text-xs text-navy/40"
+                              title="Link this tax to an agency via rate components to pay it per-agency"
+                            >
+                              —
+                            </span>
+                          )}
+                        </Td>
+                      </Tr>
+                    ))}
+                  </tbody>
+                  <tfoot>
+                    <tr className="border-t-2 border-navy/20 bg-navy/5 font-bold text-navy">
+                      <td className="py-3 px-4">Total</td>
+                      <td className="py-3 px-4 text-right tabular-nums">
+                        {formatCurrency(agencyData.totalCollected)}
+                      </td>
+                      <td className="py-3 px-4 text-right tabular-nums">
+                        {formatCurrency(agencyData.totalPaid)}
+                      </td>
+                      <td className="py-3 px-4 text-right tabular-nums">
+                        {formatCurrency(agencyData.totalBalance)}
+                      </td>
+                      <td />
+                    </tr>
+                  </tfoot>
+                </Table>
+              )}
+            </Card>
+          </div>
+
           <div className="mt-6 max-w-5xl">
             <PayrollByItemCard balances={balances} accounts={accounts} onPaid={fetchData} />
           </div>
@@ -585,6 +734,7 @@ export default function PayLiabilitiesPage() {
       <PayModal
         open={modalOpen}
         type={payType}
+        agency={payAgency}
         accounts={accounts}
         onClose={closeModal}
         onSuccess={handleSuccess}

@@ -1,0 +1,56 @@
+/**
+ * POST /api/assemblies/pending/:id
+ *
+ * Body: { action: 'finalize' | 'cancel' }
+ *
+ * finalize — runs buildAssembly for the queued quantity (blocked with
+ *            per-component shortage detail when stock is insufficient).
+ * cancel   — marks the pending build cancelled; no stock moves.
+ */
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerContext } from '@/lib/context';
+import { cancelPendingBuild, finalizePendingBuild } from '@/lib/services/assemblies';
+import { ServiceError } from '@/lib/services/_base';
+
+function serviceErrorToResponse(err: ServiceError): NextResponse {
+  const statusMap: Record<string, number> = {
+    NOT_FOUND: 404,
+    VALIDATION: 400,
+    UNBALANCED: 400,
+    FORBIDDEN: 403,
+    CONFLICT: 409,
+    PERIOD_CLOSED: 409,
+  };
+  const status = statusMap[err.code] ?? 500;
+  return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
+}
+
+interface RouteParams {
+  params: Promise<{ id: string }>;
+}
+
+export async function POST(req: NextRequest, { params }: RouteParams): Promise<NextResponse> {
+  try {
+    const { id } = await params;
+    const ctx = await getServerContext();
+    const body = (await req.json()) as { action?: string };
+
+    if (body.action === 'finalize') {
+      const result = await finalizePendingBuild(ctx, id);
+      return NextResponse.json(result);
+    }
+    if (body.action === 'cancel') {
+      const result = await cancelPendingBuild(ctx, id);
+      return NextResponse.json(result);
+    }
+
+    return NextResponse.json(
+      { error: 'action must be "finalize" or "cancel"', code: 'VALIDATION' },
+      { status: 400 },
+    );
+  } catch (err) {
+    if (err instanceof ServiceError) return serviceErrorToResponse(err);
+    console.error('[POST /api/assemblies/pending/:id]', err);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}

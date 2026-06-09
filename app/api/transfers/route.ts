@@ -6,6 +6,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listTransfers, createTransfer } from '@/lib/services/transfers';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createTransferSchema } from '@/lib/validation/transfers';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -34,15 +36,13 @@ export async function GET(_req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await req.json().catch(() => ({}));
+    const parsed = createTransferSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
 
-    const transfer = await createTransfer(ctx, {
-      date: new Date(body.date),
-      fromAccountId: body.fromAccountId,
-      toAccountId: body.toAccountId,
-      amount: body.amount,
-      memo: body.memo ?? null,
-    });
+    const transfer = await createTransfer(ctx, parsed.data);
 
     return NextResponse.json(transfer, { status: 201 });
   } catch (err) {

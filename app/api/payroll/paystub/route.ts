@@ -121,6 +121,8 @@ export async function GET(req: NextRequest) {
         amount:    l.amount,
         ytdAmount: l.ytdAmount,
       })),
+      // Sick/vacation balances — rendered only when the employee has an accrual policy.
+      accruals: stub.accruals,
     });
 
     // Slice to an owned ArrayBuffer (same pattern as the invoice PDF route).

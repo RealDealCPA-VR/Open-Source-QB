@@ -83,7 +83,10 @@ export async function GET(_req: NextRequest, { params }: RouteContext) {
         balanceDue: invoice.balanceDue,
       },
       lines: invoice.lines.map((l) => ({
-        description: l.description ?? '',
+        // Unit of measure prints as a description suffix, e.g. "Consulting (hr)".
+        description: l.unitOfMeasure
+          ? `${l.description ?? ''} (${l.unitOfMeasure})`.trim()
+          : (l.description ?? ''),
         quantity: l.quantity,
         rate: l.rate,
         amount: l.amount,

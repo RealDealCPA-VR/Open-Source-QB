@@ -1,8 +1,9 @@
 /**
  * Bank file import service — parse, dedupe, and stage bank transactions.
  *
- * Supports OFX (Open Financial Exchange), QBO (QuickBooks Online export, which is OFX/SGML),
- * and CSV. Parsed rows land in the `bank_transactions` staging table with `matched = false`.
+ * Supports OFX (Open Financial Exchange), QFX (Quicken/Web Connect — OFX with an Intuit
+ * header), QBO (QuickBooks Online export, which is OFX/SGML), and CSV. Parsed rows land in
+ * the `bank_transactions` staging table with `matched = false`.
  * Categorization rules are applied immediately to set `suggestedAccountId`.
  *
  * IMPORTANT: No GL posting happens here. The reconcile/match step handles posting.
@@ -20,11 +21,11 @@ const Papa = require('papaparse') as {
       skipEmptyLines?: boolean;
       transformHeader?: (header: string) => string;
     },
-  ): { data: T[]; errors: Array<{ message: string }> };
+  ): { data: T[]; errors: Array<{ message: string }>; meta?: { fields?: string[] } };
 };
 import { and, eq } from 'drizzle-orm';
 import { bankAccounts, bankTransactions, fileImports } from '@/lib/db/schema';
-import { toAmountString } from '@/lib/money';
+import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, notFound, validation, writeAudit } from './_base';
 import { listRules, matchRule } from './rules';
 
@@ -41,7 +42,8 @@ export interface ParsedTransaction {
   amount: string; // decimal string, stored directly in DB
 }
 
-export type FileType = 'ofx' | 'qbo' | 'csv';
+/** 'qfx' (Quicken/Web Connect) is structurally identical to OFX and parsed the same way. */
+export type FileType = 'ofx' | 'qfx' | 'qbo' | 'csv';
 
 export interface CsvMapping {
   /** Column name or 0-based index for each field. */
@@ -54,6 +56,10 @@ export interface CsvMapping {
   fitIdCol?: string | number;
   /** Moment/date-fns-style format hint, e.g. "MM/DD/YYYY". */
   dateFormat?: string;
+  /** Number of leading lines to drop BEFORE the header row (bank export preambles). */
+  skipRows?: number;
+  /** Flip the sign of every amount (for banks that export withdrawals as positive). */
+  flipSign?: boolean;
 }
 
 export interface ImportSummary {
@@ -288,8 +294,14 @@ function parseWithFormat(rawDate: string, format: string): Date {
   return new Date(Date.UTC(year, month - 1, day));
 }
 
+/** Drop the first `skipRows` physical lines (bank-export preamble before the header). */
+function applySkipRows(content: string, skipRows?: number): string {
+  if (!skipRows || skipRows <= 0) return content;
+  return content.split(/\r?\n/).slice(skipRows).join('\n');
+}
+
 export function parseCSV(content: string, mapping: CsvMapping): ParsedTransaction[] {
-  const result = Papa.parse<Record<string, string>>(content, {
+  const result = Papa.parse<Record<string, string>>(applySkipRows(content, mapping.skipRows), {
     header: true,
     skipEmptyLines: true,
     transformHeader: (h) => h.trim(),
@@ -332,6 +344,11 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
       amount = toAmountString(rawAmt);
     }
 
+    // Sign flip — for banks that export withdrawals as positive numbers.
+    if (mapping.flipSign) {
+      amount = toAmountString(Money.neg(amount));
+    }
+
     // Description
     const description = col(mapping.descriptionCol) || 'Imported transaction';
 
@@ -343,6 +360,69 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
 
     return { fitId, date, description, amount };
   });
+}
+
+// ---------------------------------------------------------------------------
+// CSV preview (mapper UI support) — parse WITHOUT committing anything
+// ---------------------------------------------------------------------------
+
+export interface CsvPreviewRow {
+  /** ISO date string of the parsed transaction date. */
+  date: string;
+  description: string;
+  amount: string;
+  fitId?: string;
+}
+
+export interface CsvPreviewResult {
+  /** Header names detected after skipRows are applied (for column dropdowns). */
+  headers: string[];
+  /** Up to `limit` parsed rows. Empty when `error` is set. */
+  rows: CsvPreviewRow[];
+  /** Total rows the full parse produced (0 when `error` is set). */
+  totalParsed: number;
+  /** Parse/mapping error message, or null when the mapping parses cleanly. */
+  error: string | null;
+}
+
+/**
+ * Dry-run a CSV mapping: returns the detected headers plus the first `limit`
+ * parsed rows. Never throws for mapping/parse problems — they come back in
+ * `error` so the UI can keep the headers visible for re-mapping.
+ */
+export function previewCSV(content: string, mapping: CsvMapping, limit = 10): CsvPreviewResult {
+  // Headers are detected independently of the field mapping, so a wrong
+  // mapping still yields the header list the user needs to fix it.
+  const head = Papa.parse<Record<string, string>>(applySkipRows(content, mapping.skipRows), {
+    header: true,
+    skipEmptyLines: true,
+    transformHeader: (h) => h.trim(),
+  });
+  const headers =
+    head.meta?.fields?.map((f) => f.trim()).filter(Boolean) ??
+    (head.data[0] ? Object.keys(head.data[0]) : []);
+
+  try {
+    const parsed = parseCSV(content, mapping);
+    return {
+      headers,
+      rows: parsed.slice(0, Math.max(0, limit)).map((t) => ({
+        date: t.date.toISOString(),
+        description: t.description,
+        amount: t.amount,
+        ...(t.fitId ? { fitId: t.fitId } : {}),
+      })),
+      totalParsed: parsed.length,
+      error: null,
+    };
+  } catch (err) {
+    return {
+      headers,
+      rows: [],
+      totalParsed: 0,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -376,7 +456,7 @@ function hashFitId(
 
 export interface ImportTransactionsInput {
   bankAccountId: string;
-  /** 'ofx' and 'qbo' are treated identically. */
+  /** 'ofx', 'qfx', and 'qbo' are treated identically (same parser). */
   fileType: FileType;
   content: string;
   csvMapping?: CsvMapping;
@@ -408,8 +488,10 @@ export async function importTransactions(
     );
   if (!bankAccount) throw notFound('Bank account');
 
-  // Map fileType enum: 'qbo' → stored as 'qbo', 'ofx' → stored as 'ofx', 'csv' → 'csv'.
-  const fileTypeForDb = input.fileType === 'ofx' ? 'ofx' : input.fileType === 'qbo' ? 'qbo' : 'csv';
+  // Map fileType enum for the fileImports row. 'qfx' is OFX-on-the-wire and the
+  // file_type enum predates it (schema is frozen), so it is stored as 'ofx'.
+  const fileTypeForDb =
+    input.fileType === 'csv' ? 'csv' : input.fileType === 'qbo' ? 'qbo' : 'ofx';
 
   // 2. Create fileImports row.
   const [importRow] = await ctx.db

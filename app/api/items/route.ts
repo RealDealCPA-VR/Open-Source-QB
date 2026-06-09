@@ -8,6 +8,8 @@ import { listItems, createItem } from '@/lib/services/items';
 import { setReorderPoint } from '@/lib/services/inventory';
 import { ServiceError } from '@/lib/services/_base';
 import type { ItemType } from '@/lib/services/items';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createItemSchema } from '@/lib/validation/items';
 
 // ── Error helper ──────────────────────────────────────────────────────────────
 
@@ -51,25 +53,19 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 export async function POST(req: NextRequest): Promise<NextResponse> {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await req.json().catch(() => ({}));
+    const parsed = createItemSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
+    const { reorderPoint, ...input } = parsed.data;
 
-    let item = await createItem(ctx, {
-      name: body.name,
-      sku: body.sku ?? null,
-      type: body.type ?? 'service',
-      description: body.description ?? null,
-      salesPrice: body.salesPrice ?? null,
-      purchaseCost: body.purchaseCost ?? null,
-      incomeAccountId: body.incomeAccountId ?? null,
-      expenseAccountId: body.expenseAccountId ?? null,
-      assetAccountId: body.assetAccountId ?? null,
-      taxable: body.taxable ?? true,
-    });
+    let item = await createItem(ctx, input);
 
     // Reorder point is managed by the inventory service (it drives the
     // reorder report and low-stock alerts) rather than the item master data.
-    if (body.reorderPoint != null && body.reorderPoint !== '') {
-      item = await setReorderPoint(ctx, item.id, body.reorderPoint);
+    if (reorderPoint != null && reorderPoint !== '') {
+      item = await setReorderPoint(ctx, item.id, reorderPoint);
     }
 
     return NextResponse.json({ item }, { status: 201 });

@@ -6,6 +6,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { createVendor, listVendors } from '@/lib/services/vendors';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createVendorSchema } from '@/lib/validation/vendors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -39,29 +41,12 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    // Minimal shape check — the service validates further.
-    if (!body.displayName) {
-      return NextResponse.json(
-        { error: 'displayName is required', code: 'VALIDATION' },
-        { status: 400 },
-      );
+    const body = await req.json().catch(() => ({}));
+    const parsed = createVendorSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
-
-    const vendor = await createVendor(ctx, {
-      displayName: body.displayName,
-      companyName: body.companyName ?? null,
-      email: body.email ?? null,
-      phone: body.phone ?? null,
-      address: body.address ?? null,
-      terms: body.terms ?? null,
-      is1099: typeof body.is1099 === 'boolean' ? body.is1099 : undefined,
-      taxId: body.taxId ?? null,
-      defaultExpenseAccountId: body.defaultExpenseAccountId ?? null,
-      notes: body.notes ?? null,
-    });
-
+    const vendor = await createVendor(ctx, parsed.data);
     return NextResponse.json(vendor, { status: 201 });
   } catch (err) {
     return errorResponse(err);

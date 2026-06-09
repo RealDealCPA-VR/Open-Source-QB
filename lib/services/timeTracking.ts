@@ -321,3 +321,68 @@ export async function billTimeToInvoice(
     return invoice;
   });
 }
+
+// ---------------------------------------------------------------------------
+// markTimeEntriesPaidInPayroll  (payroll-suite: time -> payroll link)
+// ---------------------------------------------------------------------------
+
+/**
+ * Tag prefix appended to a time entry's description when its hours were pulled
+ * into a paycheck. `time_entries` has no paycheck FK (schema is frozen), so the
+ * link is recorded as a `[payroll:<paycheckId>]` marker in the description plus
+ * an audit-trail row per entry. Payroll's "unpaid time" query excludes entries
+ * whose description contains this tag.
+ */
+export const PAYROLL_PAID_TAG = '[payroll:';
+
+/**
+ * Mark time entries as consumed by a paycheck. Each entry gets the
+ * `[payroll:<paycheckId>]` tag appended to its description and an audit row
+ * (action 'update', entityType 'time_entry') recording the paycheck id.
+ * Entries already carrying a payroll tag are rejected (double-pay guard).
+ */
+export async function markTimeEntriesPaidInPayroll(
+  ctx: ServiceContext,
+  entryIds: string[],
+  paycheckId: string,
+) {
+  const ids = [...new Set(entryIds)];
+  if (ids.length === 0) return [];
+
+  const rows = await ctx.db
+    .select()
+    .from(timeEntries)
+    .where(and(eq(timeEntries.companyId, ctx.companyId), inArray(timeEntries.id, ids)));
+  if (rows.length !== ids.length) throw notFound('Time entry');
+
+  const already = rows.find((r) => (r.description ?? '').includes(PAYROLL_PAID_TAG));
+  if (already) {
+    throw new ServiceError(
+      'CONFLICT',
+      'One or more time entries were already used on a paycheck.',
+    );
+  }
+
+  const tag = `${PAYROLL_PAID_TAG}${paycheckId}]`;
+
+  return inTransaction(ctx, async (tx) => {
+    const updated: Array<typeof timeEntries.$inferSelect> = [];
+    for (const row of rows) {
+      const description = row.description ? `${row.description} ${tag}` : tag;
+      const [u] = await tx.db
+        .update(timeEntries)
+        .set({ description })
+        .where(and(eq(timeEntries.companyId, tx.companyId), eq(timeEntries.id, row.id)))
+        .returning();
+      updated.push(u);
+      await writeAudit(tx, {
+        action: 'update',
+        entityType: 'time_entry',
+        entityId: row.id,
+        oldValues: { description: row.description },
+        newValues: { description, usedInPaycheckId: paycheckId },
+      });
+    }
+    return updated;
+  });
+}

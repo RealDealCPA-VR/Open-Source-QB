@@ -1,11 +1,19 @@
 /**
- * GET  /api/sales-orders/:id                   — fetch a single sales order with lines
- * POST /api/sales-orders/:id  { action: 'convert' } — convert order to an invoice
+ * GET  /api/sales-orders/:id — fetch a single sales order with lines
+ *      (lines include quantityInvoiced for backorder tracking).
+ * POST /api/sales-orders/:id  { action: 'convert', lines?, date? } — convert the
+ *      order to an invoice. `lines` ([{ lineId, quantity }]) invoices a partial
+ *      quantity per line (omitted lines stay on backorder); without `lines` the
+ *      full remaining quantity of every line is invoiced.
+ * POST /api/sales-orders/:id  { action: 'status', status } — manually set the
+ *      status (close a backorder / void an untouched order).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { getSalesOrder, convertToInvoice } from '@/lib/services/salesOrders';
+import { getSalesOrder, convertToInvoice, updateStatus } from '@/lib/services/salesOrders';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { salesOrderActionSchema } from '@/lib/validation/salesOrders';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -42,17 +50,23 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await req.json().catch(() => ({}));
+    const parsed = salesOrderActionSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
 
-    if (body.action === 'convert') {
-      const invoice = await convertToInvoice(ctx, id);
+    if (parsed.data.action === 'convert') {
+      const invoice = await convertToInvoice(ctx, id, {
+        lines: parsed.data.lines,
+        date: parsed.data.date,
+      });
       return NextResponse.json(invoice, { status: 201 });
     }
 
-    return NextResponse.json(
-      { error: `Unknown action: ${body.action}`, code: 'VALIDATION' },
-      { status: 400 },
-    );
+    // action === 'status'
+    const updated = await updateStatus(ctx, id, parsed.data.status);
+    return NextResponse.json(updated);
   } catch (err) {
     return errorResponse(err);
   }

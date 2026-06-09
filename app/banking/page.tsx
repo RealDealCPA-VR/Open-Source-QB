@@ -53,6 +53,23 @@ interface ImportSummary {
   errors: number;
 }
 
+interface CsvPreviewRow {
+  date: string;
+  description: string;
+  amount: string;
+  fitId?: string;
+}
+
+interface CsvPreviewResult {
+  headers: string[];
+  rows: CsvPreviewRow[];
+  totalParsed: number;
+  error: string | null;
+}
+
+/** Common bank-export date formats offered in the mapper. '' = auto-detect. */
+const DATE_FORMATS = ['MM/DD/YYYY', 'DD/MM/YYYY', 'YYYY-MM-DD', 'MM-DD-YYYY', 'DD.MM.YYYY'];
+
 interface Rule {
   id: string;
   name: string;
@@ -319,6 +336,55 @@ function AddRuleModal({
 }
 
 // ---------------------------------------------------------------------------
+// CSV column picker — a free-text Input until a preview detects the headers,
+// then a Select over the detected column names (current value kept selectable).
+// ---------------------------------------------------------------------------
+
+function ColumnPicker({
+  id,
+  label,
+  value,
+  onChange,
+  headers,
+  placeholder,
+  allowEmpty,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  headers?: string[];
+  placeholder?: string;
+  /** Render a "(none)" option (for optional columns like the transaction ID). */
+  allowEmpty?: boolean;
+}) {
+  const hasHeaders = !!headers && headers.length > 0;
+  return (
+    <div>
+      <Label htmlFor={id}>{label}</Label>
+      {hasHeaders ? (
+        <Select id={id} value={value} onChange={(e) => onChange(e.target.value)}>
+          {allowEmpty && <option value="">(none)</option>}
+          {!allowEmpty && value && !headers!.includes(value) && (
+            <option value={value}>{value} (not found)</option>
+          )}
+          {headers!.map((h) => (
+            <option key={h} value={h}>{h}</option>
+          ))}
+        </Select>
+      ) : (
+        <Input
+          id={id}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main page
 // ---------------------------------------------------------------------------
 
@@ -355,10 +421,80 @@ export default function BankingPage() {
   const [importing, setImporting] = useState(false);
   const [importSummary, setImportSummary] = useState<ImportSummary | null>(null);
 
-  // CSV mapping (simple mode: column names)
+  // CSV mapping — the full mapper the import service supports
   const [csvDateCol, setCsvDateCol] = useState('Date');
   const [csvDescCol, setCsvDescCol] = useState('Description');
   const [csvAmountCol, setCsvAmountCol] = useState('Amount');
+  const [csvSplitDebitCredit, setCsvSplitDebitCredit] = useState(false);
+  const [csvDebitCol, setCsvDebitCol] = useState('Debit');
+  const [csvCreditCol, setCsvCreditCol] = useState('Credit');
+  const [csvFitIdCol, setCsvFitIdCol] = useState('');
+  const [csvDateFormat, setCsvDateFormat] = useState('');
+  const [csvSkipRows, setCsvSkipRows] = useState('0');
+  const [csvFlipSign, setCsvFlipSign] = useState(false);
+
+  // CSV preview (server-side dry run via /api/import/csv-preview)
+  const [csvPreview, setCsvPreview] = useState<CsvPreviewResult | null>(null);
+  // Detected headers persist across mapping edits (they only depend on the file
+  // + skipRows), so the column dropdowns stay usable while re-mapping.
+  const [csvHeaders, setCsvHeaders] = useState<string[]>([]);
+  const [previewing, setPreviewing] = useState(false);
+
+  // Browser file input fallback (Electron picker preferred when available)
+  const importFileRef = useRef<HTMLInputElement>(null);
+
+  function buildCsvMapping(): Record<string, unknown> {
+    const skip = parseInt(csvSkipRows, 10);
+    return {
+      dateCol: csvDateCol,
+      descriptionCol: csvDescCol,
+      amountCol: csvAmountCol,
+      ...(csvSplitDebitCredit ? { debitCol: csvDebitCol, creditCol: csvCreditCol } : {}),
+      ...(csvFitIdCol.trim() ? { fitIdCol: csvFitIdCol.trim() } : {}),
+      ...(csvDateFormat ? { dateFormat: csvDateFormat } : {}),
+      ...(Number.isFinite(skip) && skip > 0 ? { skipRows: skip } : {}),
+      ...(csvFlipSign ? { flipSign: true } : {}),
+    };
+  }
+
+  // Any mapping/content change invalidates the current preview — the user must
+  // re-preview before committing, so the table always reflects what will import.
+  useEffect(() => {
+    setCsvPreview(null);
+  }, [
+    importContent, importFileType, csvDateCol, csvDescCol, csvAmountCol,
+    csvSplitDebitCredit, csvDebitCol, csvCreditCol, csvFitIdCol,
+    csvDateFormat, csvSkipRows, csvFlipSign,
+  ]);
+
+  // Headers only change with the file content (or skipped preamble rows).
+  useEffect(() => {
+    setCsvHeaders([]);
+  }, [importContent, importFileType]);
+
+  async function runCsvPreview(content?: string): Promise<CsvPreviewResult | null> {
+    const text = content ?? importContent;
+    if (!text.trim()) {
+      toast('Paste or load the CSV content first.', 'danger');
+      return null;
+    }
+    setPreviewing(true);
+    try {
+      const result = await api.post<CsvPreviewResult>('/api/import/csv-preview', {
+        content: text,
+        csvMapping: buildCsvMapping(),
+        limit: 10,
+      });
+      setCsvPreview(result);
+      if (result.headers.length > 0) setCsvHeaders(result.headers);
+      return result;
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Preview failed.', 'danger');
+      return null;
+    } finally {
+      setPreviewing(false);
+    }
+  }
 
   // Fetch helpers
   const fetchBankAccounts = useCallback(async () => {
@@ -408,10 +544,29 @@ export default function BankingPage() {
     }
   }, [bankAccounts, importBankAccountId]);
 
-  // Electron file picker
+  /** Infer the import file type from a filename extension. .qfx is OFX-on-the-wire. */
+  function fileTypeFromName(name: string): 'ofx' | 'qbo' | 'csv' | null {
+    const ext = name.toLowerCase().split('.').pop() ?? '';
+    if (ext === 'ofx' || ext === 'qfx') return 'ofx';
+    if (ext === 'qbo') return 'qbo';
+    if (ext === 'csv') return 'csv';
+    return null;
+  }
+
+  function applyLoadedFile(content: string, filename: string) {
+    setImportContent(content);
+    setImportFilename(filename);
+    const inferred = fileTypeFromName(filename);
+    if (inferred) setImportFileType(inferred);
+    setImportSummary(null);
+    toast(`Loaded: ${filename}`, 'info');
+  }
+
+  // Electron file picker (browser <input type=file> fallback below)
   async function handleOpenFile() {
+    // .qfx is accepted everywhere .ofx is.
     const extensions: Record<string, string[]> = {
-      ofx: ['ofx'],
+      ofx: ['ofx', 'qfx'],
       qbo: ['qbo'],
       csv: ['csv'],
     };
@@ -419,13 +574,21 @@ export default function BankingPage() {
       const result = await window.bookkeeper.openFile({
         filters: [{ name: 'Bank file', extensions: extensions[importFileType] ?? ['*'] }],
       });
-      if (result) {
-        setImportContent(result.content);
-        setImportFilename(result.filename);
-        toast(`Loaded: ${result.filename}`, 'info');
-      }
+      if (result) applyLoadedFile(result.content, result.filename);
     } else {
-      toast('File picker is only available in the desktop app. Paste content below.', 'info');
+      importFileRef.current?.click();
+    }
+  }
+
+  async function handleBrowserFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0] ?? null;
+    e.target.value = ''; // allow re-selecting the same file
+    if (!file) return;
+    try {
+      const text = await file.text();
+      applyLoadedFile(text, file.name);
+    } catch {
+      toast('Could not read that file.', 'danger');
     }
   }
 
@@ -439,6 +602,16 @@ export default function BankingPage() {
       toast('Paste or load the file content.', 'danger');
       return;
     }
+    // CSV requires a clean preview of the CURRENT mapping before committing.
+    if (importFileType === 'csv') {
+      let preview = csvPreview;
+      if (!preview) preview = await runCsvPreview();
+      if (!preview) return;
+      if (preview.error) {
+        toast('Fix the column mapping — the preview shows a parse error.', 'danger');
+        return;
+      }
+    }
     setImporting(true);
     setImportSummary(null);
     try {
@@ -449,11 +622,7 @@ export default function BankingPage() {
         ...(importFilename ? { filename: importFilename } : {}),
       };
       if (importFileType === 'csv') {
-        body.csvMapping = {
-          dateCol: csvDateCol,
-          descriptionCol: csvDescCol,
-          amountCol: csvAmountCol,
-        };
+        body.csvMapping = buildCsvMapping();
       }
       const summary = await api.post<ImportSummary>('/api/import', body);
       setImportSummary(summary);
@@ -579,47 +748,181 @@ export default function BankingPage() {
                   setImportSummary(null);
                 }}
               >
-                <option value="ofx">OFX</option>
+                <option value="ofx">OFX / QFX</option>
                 <option value="qbo">QBO (QuickBooks Online)</option>
                 <option value="csv">CSV</option>
               </Select>
             </div>
           </div>
 
-          {/* CSV column mapping */}
+          {/* CSV column mapping — full mapper + server-side preview */}
           {importFileType === 'csv' && (
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 p-4 rounded-lg bg-slate-50 border border-slate-200">
-              <div>
-                <Label htmlFor="csv-date">Date column</Label>
-                <Input
+            <div className="flex flex-col gap-4 p-4 rounded-lg bg-slate-50 border border-slate-200">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <ColumnPicker
                   id="csv-date"
+                  label="Date column"
                   value={csvDateCol}
-                  onChange={(e) => setCsvDateCol(e.target.value)}
+                  onChange={setCsvDateCol}
+                  headers={csvHeaders}
                   placeholder="Date"
                 />
-              </div>
-              <div>
-                <Label htmlFor="csv-desc">Description column</Label>
-                <Input
+                <ColumnPicker
                   id="csv-desc"
+                  label="Description column"
                   value={csvDescCol}
-                  onChange={(e) => setCsvDescCol(e.target.value)}
+                  onChange={setCsvDescCol}
+                  headers={csvHeaders}
                   placeholder="Description"
                 />
+                {!csvSplitDebitCredit && (
+                  <ColumnPicker
+                    id="csv-amount"
+                    label="Amount column"
+                    value={csvAmountCol}
+                    onChange={setCsvAmountCol}
+                    headers={csvHeaders}
+                    placeholder="Amount"
+                  />
+                )}
               </div>
-              <div>
-                <Label htmlFor="csv-amount">Amount column</Label>
-                <Input
-                  id="csv-amount"
-                  value={csvAmountCol}
-                  onChange={(e) => setCsvAmountCol(e.target.value)}
-                  placeholder="Amount"
+
+              <label className="flex items-center gap-2 text-sm text-navy/80">
+                <input
+                  type="checkbox"
+                  checked={csvSplitDebitCredit}
+                  onChange={(e) => setCsvSplitDebitCredit(e.target.checked)}
+                  className="rounded border-slate-300"
                 />
+                File has separate debit and credit columns
+              </label>
+
+              {csvSplitDebitCredit && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <ColumnPicker
+                    id="csv-debit"
+                    label="Debit column (money out)"
+                    value={csvDebitCol}
+                    onChange={setCsvDebitCol}
+                    headers={csvHeaders}
+                    placeholder="Debit"
+                  />
+                  <ColumnPicker
+                    id="csv-credit"
+                    label="Credit column (money in)"
+                    value={csvCreditCol}
+                    onChange={setCsvCreditCol}
+                    headers={csvHeaders}
+                    placeholder="Credit"
+                  />
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <ColumnPicker
+                  id="csv-fitid"
+                  label="Transaction ID column (optional)"
+                  value={csvFitIdCol}
+                  onChange={setCsvFitIdCol}
+                  headers={csvHeaders}
+                  placeholder="(none — auto-dedupe)"
+                  allowEmpty
+                />
+                <div>
+                  <Label htmlFor="csv-date-format">Date format</Label>
+                  <Select
+                    id="csv-date-format"
+                    value={csvDateFormat}
+                    onChange={(e) => setCsvDateFormat(e.target.value)}
+                  >
+                    <option value="">Auto-detect</option>
+                    {DATE_FORMATS.map((f) => (
+                      <option key={f} value={f}>{f}</option>
+                    ))}
+                  </Select>
+                </div>
+                <div>
+                  <Label htmlFor="csv-skip-rows">Skip rows before header</Label>
+                  <Input
+                    id="csv-skip-rows"
+                    type="number"
+                    min={0}
+                    value={csvSkipRows}
+                    onChange={(e) => setCsvSkipRows(e.target.value)}
+                  />
+                </div>
+                <div className="flex items-end pb-2">
+                  <label className="flex items-center gap-2 text-sm text-navy/80">
+                    <input
+                      type="checkbox"
+                      checked={csvFlipSign}
+                      onChange={(e) => setCsvFlipSign(e.target.checked)}
+                      className="rounded border-slate-300"
+                    />
+                    Flip sign of amounts
+                  </label>
+                </div>
               </div>
+
+              <div className="flex items-center gap-3">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => runCsvPreview()}
+                  loading={previewing}
+                  disabled={!importContent.trim()}
+                >
+                  Preview parsed rows
+                </Button>
+                {csvPreview && !csvPreview.error && (
+                  <span className="text-xs text-navy/60">
+                    {csvPreview.totalParsed} row{csvPreview.totalParsed === 1 ? '' : 's'} parsed
+                    {csvPreview.totalParsed > csvPreview.rows.length
+                      ? ` — showing first ${csvPreview.rows.length}`
+                      : ''}
+                  </span>
+                )}
+              </div>
+
+              {csvPreview?.error && (
+                <p className="text-sm text-red-600">
+                  Parse error: {csvPreview.error}
+                  {csvPreview.headers.length > 0 && (
+                    <span className="block text-xs text-navy/60 mt-1">
+                      Detected columns: {csvPreview.headers.join(', ')}
+                    </span>
+                  )}
+                </p>
+              )}
+
+              {csvPreview && !csvPreview.error && csvPreview.rows.length > 0 && (
+                <Table>
+                  <thead>
+                    <Tr>
+                      <Th>Date</Th>
+                      <Th>Description</Th>
+                      <Th numeric>Amount</Th>
+                    </Tr>
+                  </thead>
+                  <tbody>
+                    {csvPreview.rows.map((r, i) => (
+                      <Tr key={i}>
+                        <Td>{formatDate(r.date)}</Td>
+                        <Td>{r.description}</Td>
+                        <Td numeric>{formatCurrency(r.amount)}</Td>
+                      </Tr>
+                    ))}
+                  </tbody>
+                </Table>
+              )}
+              {csvPreview && !csvPreview.error && csvPreview.rows.length === 0 && (
+                <p className="text-sm text-navy/60">The file parsed but contains no data rows.</p>
+              )}
             </div>
           )}
 
-          {/* File loader (Electron) or paste */}
+          {/* File loader (Electron picker or browser file input) or paste */}
           <div>
             <div className="flex items-center justify-between mb-1">
               <Label htmlFor="import-content">File Content</Label>
@@ -631,12 +934,20 @@ export default function BankingPage() {
                 Open file…
               </button>
             </div>
+            {/* Hidden browser fallback — accepts .qfx everywhere .ofx is accepted */}
+            <input
+              ref={importFileRef}
+              type="file"
+              accept=".ofx,.qfx,.qbo,.csv,.txt"
+              className="hidden"
+              onChange={handleBrowserFile}
+            />
             <textarea
               id="import-content"
               value={importContent}
               onChange={(e) => setImportContent(e.target.value)}
               rows={8}
-              placeholder={`Paste your ${importFileType.toUpperCase()} file content here, or click "Open file…" above (desktop app only).`}
+              placeholder={`Paste your ${importFileType === 'ofx' ? 'OFX/QFX' : importFileType.toUpperCase()} file content here, or click "Open file…" above.`}
               className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy font-mono outline-none focus:border-electric focus:ring-2 focus:ring-electric/30 placeholder:text-navy/30 resize-y"
             />
             {importFilename && (
@@ -646,7 +957,7 @@ export default function BankingPage() {
 
           <div className="flex items-center gap-4">
             <Button type="submit" loading={importing}>
-              Import
+              {importFileType === 'csv' ? 'Commit Import' : 'Import'}
             </Button>
             {importSummary && (
               <div className="flex gap-3 text-sm">

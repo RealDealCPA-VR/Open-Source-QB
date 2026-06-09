@@ -10,7 +10,7 @@
  */
 
 import { useEffect, useRef } from 'react';
-import { useSearchParams } from 'next/navigation';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 
 export function useFocusParam<T extends { id: string }>(
   records: T[],
@@ -32,4 +32,31 @@ export function useFocusParam<T extends { id: string }>(
     const match = records.find((r) => r.id === focusId);
     if (match) onFocusRef.current(match);
   }, [focusId, loading, records]);
+}
+
+/**
+ * useNewParam — reads the `?new=1` query param produced by the global
+ * keyboard shortcuts and Quick Actions (e.g. Ctrl+I → /invoices?new=1) and
+ * invokes `onNew` (typically: open the page's create modal). The param is
+ * then stripped via router.replace so closing the modal and pressing the
+ * shortcut again re-triggers it — this also makes it work when the user is
+ * already on the page (router.push only changes the query string).
+ *
+ * Callers use useSearchParams, so the page component must be rendered inside
+ * a <Suspense> boundary.
+ */
+export function useNewParam(onNew: () => void): void {
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const pathname = usePathname();
+  const isNew = searchParams.get('new') === '1';
+
+  const onNewRef = useRef(onNew);
+  onNewRef.current = onNew;
+
+  useEffect(() => {
+    if (!isNew) return;
+    onNewRef.current();
+    router.replace(pathname, { scroll: false });
+  }, [isNew, pathname, router]);
 }

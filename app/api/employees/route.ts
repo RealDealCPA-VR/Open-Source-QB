@@ -9,6 +9,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listEmployees, createEmployee } from '@/lib/services/payroll';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createEmployeeSchema } from '@/lib/validation/employees';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -49,14 +51,12 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-    const employee = await createEmployee(ctx, {
-      firstName: body.firstName,
-      lastName: body.lastName,
-      email: body.email ?? null,
-      payType: body.payType,
-      payRate: body.payRate,
-    });
+    const body = await req.json().catch(() => ({}));
+    const parsed = createEmployeeSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
+    const employee = await createEmployee(ctx, parsed.data);
     return NextResponse.json(employee, { status: 201 });
   } catch (err) {
     return errorResponse(err);

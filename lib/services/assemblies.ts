@@ -29,8 +29,8 @@
  *     build/unbuild, since this module's averageCost math never touches
  *     layers; route those items through fifo.ts instead.
  */
-import { and, eq, inArray } from 'drizzle-orm';
-import { assemblyComponents, items } from '@/lib/db/schema';
+import { and, desc, eq, inArray } from 'drizzle-orm';
+import { assemblyComponents, items, pendingBuilds } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
@@ -566,5 +566,295 @@ export async function unbuildAssembly(
       quantityUnbuilt: unbuildQty.toFixed(4),
       newAssemblyQty: newAssemblyQty.toFixed(4),
     };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Pending builds (QB "Pending Builds")
+// ---------------------------------------------------------------------------
+//
+// A pending build is a queued buildAssembly: it records the intent to build N
+// units of an assembly without moving any stock. Finalizing runs the normal
+// buildAssembly (with all its guards); it is blocked with per-component
+// shortage detail while components are insufficient. Pending builds can also
+// be cancelled. Statuses: 'pending' -> 'built' | 'cancelled'.
+
+export interface ComponentAvailabilityRow {
+  componentItemId: string;
+  componentName: string;
+  componentSku: string | null;
+  /** Quantity required for the full pending build (bomQty * buildQty). */
+  required: string;
+  onHand: string;
+  /** max(required - onHand, 0). */
+  shortage: string;
+}
+
+/**
+ * Component availability for building `quantity` units of an assembly:
+ * required vs on-hand per BOM component, plus an overall canBuild flag.
+ */
+export async function componentAvailability(
+  ctx: ServiceContext,
+  assemblyItemId: string,
+  quantity: string | number,
+): Promise<{ components: ComponentAvailabilityRow[]; canBuild: boolean }> {
+  const buildQty = Money.of(quantity);
+  const bom = await getBom(ctx, assemblyItemId);
+  if (bom.length === 0) return { components: [], canBuild: false };
+
+  const componentIds = bom.map((b) => b.componentItemId);
+  const componentRows = await ctx.db
+    .select({ id: items.id, quantityOnHand: items.quantityOnHand })
+    .from(items)
+    .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, componentIds)));
+  const onHandById = new Map(componentRows.map((r) => [r.id, Money.of(r.quantityOnHand ?? '0')]));
+
+  let canBuild = true;
+  const components: ComponentAvailabilityRow[] = bom.map((line) => {
+    const required = buildQty.times(Money.of(line.quantity));
+    const onHand = onHandById.get(line.componentItemId) ?? Money.zero();
+    const shortage = required.greaterThan(onHand) ? required.minus(onHand) : Money.zero();
+    if (shortage.greaterThan(0)) canBuild = false;
+    return {
+      componentItemId: line.componentItemId,
+      componentName: line.componentName,
+      componentSku: line.componentSku,
+      required: required.toFixed(4),
+      onHand: onHand.toFixed(4),
+      shortage: shortage.toFixed(4),
+    };
+  });
+
+  return { components, canBuild };
+}
+
+export interface PendingBuildRow {
+  id: string;
+  assemblyItemId: string;
+  assemblyName: string;
+  assemblySku: string | null;
+  quantity: string;
+  date: Date;
+  memo: string | null;
+  status: string;
+  createdAt: Date;
+  /** Live availability — only computed for status 'pending'. */
+  components: ComponentAvailabilityRow[];
+  canBuild: boolean;
+  shortageCount: number;
+}
+
+export interface CreatePendingBuildInput {
+  assemblyItemId: string;
+  quantity: string | number;
+  date: Date;
+  memo?: string | null;
+}
+
+/**
+ * Queue a pending build. Validates the assembly belongs to the company, the
+ * quantity is positive, and a BOM exists; returns the live component
+ * availability so the UI can flag shortages immediately.
+ */
+export async function createPendingBuild(
+  ctx: ServiceContext,
+  input: CreatePendingBuildInput,
+): Promise<PendingBuildRow> {
+  const qty = Money.of(input.quantity);
+  if (!qty.greaterThan(0)) throw validation('Pending build quantity must be greater than zero.');
+
+  const assembly = await loadItem(ctx, input.assemblyItemId);
+  const bom = await getBom(ctx, input.assemblyItemId);
+  if (bom.length === 0) {
+    throw validation('Assembly has no bill of materials. Add components before queueing a build.');
+  }
+
+  const availability = await componentAvailability(ctx, input.assemblyItemId, qty.toFixed(4));
+
+  return inTransaction(ctx, async (tx) => {
+    const [row] = await tx.db
+      .insert(pendingBuilds)
+      .values({
+        companyId: tx.companyId,
+        assemblyItemId: input.assemblyItemId,
+        quantity: qty.toFixed(4),
+        date: input.date,
+        memo: input.memo ?? null,
+        status: 'pending',
+      })
+      .returning();
+
+    await writeAudit(tx, {
+      action: 'create',
+      entityType: 'pending_build',
+      entityId: row.id,
+      newValues: {
+        assemblyItemId: input.assemblyItemId,
+        quantity: qty.toFixed(4),
+        date: input.date.toISOString(),
+        memo: input.memo ?? null,
+      },
+    });
+
+    return {
+      id: row.id,
+      assemblyItemId: row.assemblyItemId,
+      assemblyName: assembly.name,
+      assemblySku: assembly.sku ?? null,
+      quantity: row.quantity,
+      date: row.date,
+      memo: row.memo,
+      status: row.status,
+      createdAt: row.createdAt,
+      components: availability.components,
+      canBuild: availability.canBuild,
+      shortageCount: availability.components.filter((c) => Money.of(c.shortage).greaterThan(0)).length,
+    };
+  });
+}
+
+/**
+ * List pending builds (newest first). Live shortage detail is computed for
+ * rows still in 'pending'; built/cancelled rows return empty availability.
+ * Pass `status` to filter ('pending' | 'built' | 'cancelled').
+ */
+export async function listPendingBuilds(
+  ctx: ServiceContext,
+  status?: string | null,
+): Promise<PendingBuildRow[]> {
+  const conditions = [eq(pendingBuilds.companyId, ctx.companyId)];
+  if (status) conditions.push(eq(pendingBuilds.status, status));
+
+  const rows = await ctx.db
+    .select({
+      id: pendingBuilds.id,
+      assemblyItemId: pendingBuilds.assemblyItemId,
+      quantity: pendingBuilds.quantity,
+      date: pendingBuilds.date,
+      memo: pendingBuilds.memo,
+      status: pendingBuilds.status,
+      createdAt: pendingBuilds.createdAt,
+      assemblyName: items.name,
+      assemblySku: items.sku,
+    })
+    .from(pendingBuilds)
+    .innerJoin(items, eq(pendingBuilds.assemblyItemId, items.id))
+    .where(and(...conditions))
+    .orderBy(desc(pendingBuilds.createdAt));
+
+  const result: PendingBuildRow[] = [];
+  for (const r of rows) {
+    let components: ComponentAvailabilityRow[] = [];
+    let canBuild = false;
+    if (r.status === 'pending') {
+      const availability = await componentAvailability(ctx, r.assemblyItemId, r.quantity);
+      components = availability.components;
+      canBuild = availability.canBuild;
+    }
+    result.push({
+      id: r.id,
+      assemblyItemId: r.assemblyItemId,
+      assemblyName: r.assemblyName,
+      assemblySku: r.assemblySku ?? null,
+      quantity: r.quantity,
+      date: r.date,
+      memo: r.memo,
+      status: r.status,
+      createdAt: r.createdAt,
+      components,
+      canBuild,
+      shortageCount: components.filter((c) => Money.of(c.shortage).greaterThan(0)).length,
+    });
+  }
+  return result;
+}
+
+async function loadPendingBuild(ctx: ServiceContext, id: string) {
+  const [row] = await ctx.db
+    .select()
+    .from(pendingBuilds)
+    .where(and(eq(pendingBuilds.companyId, ctx.companyId), eq(pendingBuilds.id, id)));
+  if (!row) throw notFound('Pending build');
+  return row;
+}
+
+/**
+ * Finalize a pending build: runs buildAssembly for the queued quantity and
+ * marks the row 'built'. Blocked with per-component shortage detail (VALIDATION,
+ * details.shortages) when components are insufficient.
+ */
+export async function finalizePendingBuild(
+  ctx: ServiceContext,
+  id: string,
+): Promise<{
+  pendingBuildId: string;
+  status: string;
+  build: Awaited<ReturnType<typeof buildAssembly>>;
+}> {
+  const row = await loadPendingBuild(ctx, id);
+  if (row.status !== 'pending') {
+    throw validation(`Only pending builds can be finalized (this build is "${row.status}").`);
+  }
+
+  const availability = await componentAvailability(ctx, row.assemblyItemId, row.quantity);
+  if (!availability.canBuild) {
+    const shortages = availability.components.filter((c) => Money.of(c.shortage).greaterThan(0));
+    throw validation(
+      `Cannot finalize: insufficient component stock for ${shortages.length} component(s).`,
+      { shortages },
+    );
+  }
+
+  return inTransaction(ctx, async (tx) => {
+    // buildAssembly re-validates stock inside the same transaction (and rejects
+    // FIFO-tracked items); any failure rolls the status update back too.
+    const build = await buildAssembly(tx, {
+      assemblyItemId: row.assemblyItemId,
+      quantity: row.quantity,
+    });
+
+    await tx.db
+      .update(pendingBuilds)
+      .set({ status: 'built' })
+      .where(eq(pendingBuilds.id, id));
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'pending_build',
+      entityId: id,
+      oldValues: { status: 'pending' },
+      newValues: { status: 'built', totalCost: build.totalCost },
+    });
+
+    return { pendingBuildId: id, status: 'built', build };
+  });
+}
+
+/** Cancel a pending build (status 'pending' -> 'cancelled'). No stock moves. */
+export async function cancelPendingBuild(
+  ctx: ServiceContext,
+  id: string,
+): Promise<{ pendingBuildId: string; status: string }> {
+  const row = await loadPendingBuild(ctx, id);
+  if (row.status !== 'pending') {
+    throw validation(`Only pending builds can be cancelled (this build is "${row.status}").`);
+  }
+
+  return inTransaction(ctx, async (tx) => {
+    await tx.db
+      .update(pendingBuilds)
+      .set({ status: 'cancelled' })
+      .where(eq(pendingBuilds.id, id));
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'pending_build',
+      entityId: id,
+      oldValues: { status: 'pending' },
+      newValues: { status: 'cancelled' },
+    });
+
+    return { pendingBuildId: id, status: 'cancelled' };
   });
 }

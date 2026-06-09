@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/client';
 import { paletteDestinations } from '@/lib/nav';
+import { filterNavActions } from '@/lib/nav-actions';
 
 interface Dest { label: string; href: string; group: string }
 interface SearchResult { type: string; label: string; href: string }
@@ -21,9 +22,11 @@ export default function CommandPalette() {
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+      // Ctrl/Cmd+K toggles; Ctrl/Cmd+F is a QB-style alias for the same palette.
+      const k = e.key.toLowerCase();
+      if ((e.metaKey || e.ctrlKey) && (k === 'k' || k === 'f')) {
         e.preventDefault();
-        setOpen((o) => !o);
+        setOpen((o) => (k === 'f' ? true : !o));
       } else if (e.key === 'Escape') {
         setOpen(false);
       }
@@ -62,7 +65,11 @@ export default function CommandPalette() {
   }, [q]);
 
   const navMatches = DESTINATIONS.filter((d) => d.label.toLowerCase().includes(q.toLowerCase())).slice(0, 8);
+  // Quick actions (lib/nav-actions.ts): all of them on an empty query so the palette
+  // doubles as a "what can I do" menu, filtered alongside destinations otherwise.
+  const actionMatches = filterNavActions(q).slice(0, 7);
   const combined = [
+    ...actionMatches.map((a) => ({ type: 'Actions', label: a.label, href: a.href })),
     ...navMatches.map((d) => ({ type: 'Go to', label: d.label, href: d.href })),
     ...results,
   ];

@@ -20,6 +20,7 @@ import {
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -183,12 +184,62 @@ export default function PLComparativePage() {
 
   const net = report ? parseFloat(report.totals.currentNetIncome) : 0;
 
+  const sectionRows = (rows: ComparativeRow[]) =>
+    rows.map(
+      (r) => [r.name, r.current, r.prior, r.variance, pctLabel(r.variancePct)] as (string | null)[],
+    );
+  const table: ExportTable | null = report
+    ? {
+        filename: 'pl-comparative',
+        title: 'Comparative Profit & Loss',
+        subtitle: `${report.from.slice(0, 10)} to ${report.to.slice(0, 10)} vs ${report.priorFrom.slice(0, 10)} to ${report.priorTo.slice(0, 10)}`,
+        columns: [
+          { header: 'Account' },
+          { header: 'Current', numeric: true },
+          { header: 'Prior', numeric: true },
+          { header: 'Variance $', numeric: true },
+          { header: 'Variance %', numeric: true },
+        ],
+        rows: [
+          ['INCOME', null, null, null, null],
+          ...sectionRows(report.income),
+          [
+            'Total Income',
+            report.totals.currentTotalIncome,
+            report.totals.priorTotalIncome,
+            report.totals.varianceTotalIncome,
+            pctLabel(report.totals.variancePctTotalIncome),
+          ],
+          ['EXPENSES', null, null, null, null],
+          ...sectionRows(report.expenses),
+          [
+            'Total Expenses',
+            report.totals.currentTotalExpenses,
+            report.totals.priorTotalExpenses,
+            report.totals.varianceTotalExpenses,
+            pctLabel(report.totals.variancePctTotalExpenses),
+          ],
+        ],
+        totals: [
+          [
+            'Net Income',
+            report.totals.currentNetIncome,
+            report.totals.priorNetIncome,
+            report.totals.varianceNetIncome,
+            pctLabel(report.totals.variancePctNetIncome),
+          ],
+        ],
+      }
+    : null;
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader title="Comparative P&amp;L" icon={TrendingUp} />
 
+      <ReportToolbar table={table} disabled={loading} />
+
       {/* Controls */}
-      <Card className="p-5 mb-6 max-w-4xl">
+      <Card className="p-5 mb-6 max-w-4xl print-hidden">
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
           {/* Current period */}
           <div>

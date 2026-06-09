@@ -6,6 +6,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { createPurchaseOrder, listPurchaseOrders } from '@/lib/services/purchaseOrders';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createPurchaseOrderSchema } from '@/lib/validation/purchaseOrders';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -44,40 +46,13 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    if (!body.vendorId) {
-      return NextResponse.json(
-        { error: 'vendorId is required', code: 'VALIDATION' },
-        { status: 400 },
-      );
-    }
-    if (!body.date) {
-      return NextResponse.json(
-        { error: 'date is required', code: 'VALIDATION' },
-        { status: 400 },
-      );
-    }
-    if (!Array.isArray(body.lines) || body.lines.length === 0) {
-      return NextResponse.json(
-        { error: 'lines must be a non-empty array', code: 'VALIDATION' },
-        { status: 400 },
-      );
+    const body = await req.json().catch(() => ({}));
+    const parsed = createPurchaseOrderSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const po = await createPurchaseOrder(ctx, {
-      vendorId: body.vendorId,
-      date: new Date(body.date),
-      expectedDate: body.expectedDate ? new Date(body.expectedDate) : null,
-      memo: body.memo ?? null,
-      lines: body.lines.map((l: Record<string, unknown>) => ({
-        itemId: (l.itemId as string | undefined) ?? null,
-        accountId: l.accountId as string,
-        description: (l.description as string | undefined) ?? null,
-        quantity: l.quantity as string | number,
-        rate: l.rate as string | number,
-      })),
-    });
+    const po = await createPurchaseOrder(ctx, parsed.data);
 
     return NextResponse.json(po, { status: 201 });
   } catch (err) {

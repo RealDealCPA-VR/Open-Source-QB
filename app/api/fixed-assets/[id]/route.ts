@@ -7,6 +7,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getAsset, depreciationSchedule, postDepreciation } from '@/lib/services/fixedAssets';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { fixedAssetActionSchema } from '@/lib/validation/fixedAssets';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -49,21 +51,15 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
-    const { action, date } = body;
-
-    if (action === 'depreciate') {
-      if (!date) {
-        return NextResponse.json({ error: 'Missing required field: date' }, { status: 400 });
-      }
-      const result = await postDepreciation(ctx, {
-        assetId: id,
-        date: new Date(date),
-      });
-      return NextResponse.json(result, { status: 201 });
+    const body = await req.json().catch(() => ({}));
+    const parsed = fixedAssetActionSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    return NextResponse.json({ error: `Unknown action: "${action}"` }, { status: 400 });
+    // action === 'depreciate'
+    const result = await postDepreciation(ctx, { assetId: id, date: parsed.data.date });
+    return NextResponse.json(result, { status: 201 });
   } catch (err) {
     return errorResponse(err);
   }

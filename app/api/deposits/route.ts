@@ -15,6 +15,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { createDeposit, listDeposits } from '@/lib/services/deposits';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createDepositSchema } from '@/lib/validation/deposits';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -47,45 +49,13 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    if (!body.depositAccountId) {
-      return NextResponse.json(
-        { error: 'depositAccountId is required', code: 'VALIDATION' },
-        { status: 400 },
-      );
-    }
-    if (!body.date) {
-      return NextResponse.json(
-        { error: 'date is required', code: 'VALIDATION' },
-        { status: 400 },
-      );
-    }
-    const paymentIds = Array.isArray(body.paymentIds) ? (body.paymentIds as string[]) : [];
-    const salesReceiptIds = Array.isArray(body.salesReceiptIds)
-      ? (body.salesReceiptIds as string[])
-      : [];
-    const extraLines = Array.isArray(body.extraLines) ? body.extraLines : [];
-
-    if (paymentIds.length === 0 && salesReceiptIds.length === 0 && extraLines.length === 0) {
-      return NextResponse.json(
-        {
-          error: 'Provide at least one of paymentIds, salesReceiptIds, or extraLines.',
-          code: 'VALIDATION',
-        },
-        { status: 400 },
-      );
+    const body = await req.json().catch(() => ({}));
+    const parsed = createDepositSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const deposit = await createDeposit(ctx, {
-      depositAccountId: body.depositAccountId as string,
-      date: new Date(body.date as string),
-      paymentIds,
-      salesReceiptIds,
-      extraLines,
-      cashBack: body.cashBack ?? null,
-      memo: (body.memo as string | undefined) ?? null,
-    });
+    const deposit = await createDeposit(ctx, parsed.data);
 
     return NextResponse.json(deposit, { status: 201 });
   } catch (err) {

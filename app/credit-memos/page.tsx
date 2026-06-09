@@ -3,9 +3,11 @@
 import { useEffect, useState, useCallback } from 'react';
 import { RotateCcw, Plus, PlusCircle, MinusCircle } from 'lucide-react';
 import {
+  AmountInput,
   Button,
   Card,
   ConfirmDialog,
+  DateInput,
   EmptyState,
   Input,
   Select,
@@ -19,6 +21,7 @@ import {
   PageHeader,
   Spinner,
   toast,
+  useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
@@ -189,6 +192,18 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
   const liveTax = selectedRate ? computeTax(lines, parseFloat(selectedRate.rate) || 0) : 0;
   const liveTotal = liveSubtotal + liveTax;
 
+  function addLine() {
+    setLines((prev) => [...prev, { ...EMPTY_LINE }]);
+  }
+
+  function removeLine(idx: number) {
+    // Keep at least one line (mirrors the per-row remove button being disabled).
+    setLines((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== idx) : prev));
+  }
+
+  // Line-grid keyboard ergonomics: Ctrl+Insert add / Ctrl+Delete remove / Enter down.
+  const grid = useGridKeys({ addRow: addLine, removeRow: removeLine, disabled: saving });
+
   async function handleSubmit() {
     if (!customerId) { toast('Please select a customer.', 'danger'); return; }
     if (!date) { toast('Please enter a date.', 'danger'); return; }
@@ -266,9 +281,8 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
         {/* Date */}
         <div>
           <Label htmlFor="cm-date">Date *</Label>
-          <Input
+          <DateInput
             id="cm-date"
-            type="date"
             value={date}
             onChange={(e) => setDate(e.target.value)}
           />
@@ -280,14 +294,14 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
             <Label className="mb-0">Line Items</Label>
             <button
               type="button"
-              onClick={() => setLines((prev) => [...prev, { ...EMPTY_LINE }])}
+              onClick={addLine}
               className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
             >
               <PlusCircle className="h-4 w-4" /> Add line
             </button>
           </div>
 
-          <div className="rounded-lg border border-slate-200 overflow-hidden">
+          <div className="rounded-lg border border-slate-200 overflow-hidden" onKeyDown={grid.onKeyDown}>
             <div className="grid grid-cols-[minmax(110px,1fr)_minmax(110px,1fr)_64px_80px_40px_56px_32px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
               <span>Item</span>
               <span>Description</span>
@@ -303,6 +317,7 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
               return (
                 <div
                   key={idx}
+                  data-grid-row
                   className="grid grid-cols-[minmax(110px,1fr)_minmax(110px,1fr)_64px_80px_40px_56px_32px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
                 >
                   <Select
@@ -320,19 +335,13 @@ function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: 
                     value={line.description}
                     onChange={(e) => updateLine(idx, { description: e.target.value })}
                   />
-                  <Input
+                  <AmountInput
                     placeholder="1"
-                    type="number"
-                    min="0"
-                    step="any"
                     value={line.quantity}
                     onChange={(e) => updateLine(idx, { quantity: e.target.value })}
                   />
-                  <Input
+                  <AmountInput
                     placeholder="0.00"
-                    type="number"
-                    min="0"
-                    step="any"
                     value={line.rate}
                     onChange={(e) => updateLine(idx, { rate: e.target.value })}
                   />
@@ -533,11 +542,8 @@ function ApplyModal({ open, memo, onClose, onApplied }: ApplyModalProps) {
 
         <div>
           <Label htmlFor="apply-amt">Amount to Apply *</Label>
-          <Input
+          <AmountInput
             id="apply-amt"
-            type="number"
-            min="0.01"
-            step="0.01"
             placeholder="0.00"
             value={amount}
             onChange={(e) => setAmount(e.target.value)}
@@ -637,12 +643,9 @@ function RefundModal({ open, memo, accounts, onClose, onRefunded }: RefundModalP
 
         <div>
           <Label htmlFor="refund-amt">Refund Amount *</Label>
-          <Input
+          <AmountInput
             id="refund-amt"
-            type="number"
-            min="0.01"
-            step="0.01"
-            max={memo?.unapplied}
+            placeholder="0.00"
             value={amount}
             onChange={(e) => setAmount(e.target.value)}
           />

@@ -12,12 +12,14 @@
  * account (flipped for CC credits) through the central posting engine.
  */
 
-import { useEffect, useState, useCallback } from 'react';
+import { Suspense, useEffect, useState, useCallback } from 'react';
 import { Banknote, Plus, Trash2 } from 'lucide-react';
 import {
+  AmountInput,
   Button,
   Card,
   ConfirmDialog,
+  DateInput,
   EmptyState,
   Input,
   Select,
@@ -30,10 +32,12 @@ import {
   Tr,
   PageHeader,
   toast,
+  useGridKeys,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
+import { useNewParam } from '@/lib/useFocusParam';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -117,7 +121,7 @@ function isCreditCard(a: Account): boolean {
 // Page
 // ---------------------------------------------------------------------------
 
-export default function ExpensesPage() {
+function ExpensesPageContent() {
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -220,8 +224,18 @@ export default function ExpensesPage() {
     setLines((prev) => [...prev, emptyLine()]);
   }
   function removeLine(index: number) {
-    setLines((prev) => prev.filter((_, i) => i !== index));
+    // Keep at least one line (mirrors the per-row remove button being disabled).
+    setLines((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== index) : prev));
   }
+
+  // Line-grid keyboard ergonomics: Ctrl+Insert add / Ctrl+Delete remove / Enter down.
+  const grid = useGridKeys({ addRow: addLine, removeRow: removeLine, disabled: submitting });
+
+  // Ctrl+E / Quick Actions navigate here with ?new=1 — the entry form is always
+  // visible, so jump focus to the start of it (the payee field).
+  useNewParam(() => {
+    document.getElementById('exp-payee')?.focus();
+  });
 
   const runningTotal = lines.reduce((sum, l) => sum + (Number(l.amount) || 0), 0);
 
@@ -410,7 +424,7 @@ export default function ExpensesPage() {
 
           <div>
             <Label htmlFor="exp-date">Date *</Label>
-            <Input id="exp-date" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+            <DateInput id="exp-date" value={date} onChange={(e) => setDate(e.target.value)} />
           </div>
         </div>
 
@@ -484,10 +498,11 @@ export default function ExpensesPage() {
             <span />
           </div>
 
-          <div className="space-y-2">
+          <div className="space-y-2" onKeyDown={grid.onKeyDown}>
             {lines.map((line, idx) => (
               <div
                 key={idx}
+                data-grid-row
                 className="grid grid-cols-1 md:grid-cols-[2fr_2fr_1fr_1.5fr_1.5fr_24px] gap-2 items-start"
               >
                 <Select
@@ -508,10 +523,7 @@ export default function ExpensesPage() {
                   onChange={(e) => updateLine(idx, 'description', e.target.value)}
                 />
 
-                <Input
-                  type="number"
-                  min="0.01"
-                  step="0.01"
+                <AmountInput
                   placeholder="0.00"
                   value={line.amount}
                   onChange={(e) => updateLine(idx, 'amount', e.target.value)}
@@ -656,5 +668,13 @@ export default function ExpensesPage() {
         onClose={() => setPendingVoid(null)}
       />
     </main>
+  );
+}
+
+export default function ExpensesPage() {
+  return (
+    <Suspense fallback={null}>
+      <ExpensesPageContent />
+    </Suspense>
   );
 }

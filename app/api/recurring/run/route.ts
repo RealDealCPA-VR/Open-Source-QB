@@ -12,6 +12,8 @@ import { getDb } from '@/lib/db';
 import { companies } from '@/lib/db/schema';
 import { runDue, runTemplateNow } from '@/lib/services/recurring';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { runRecurringSchema } from '@/lib/validation/recurring';
 
 /**
  * Trusted local-system path. The Electron main process has no session cookie, so it
@@ -61,16 +63,20 @@ export async function POST(req: NextRequest) {
   try {
     const ctx = (await internalContext(req)) ?? (await getServerContext());
     const body = await req.json().catch(() => ({}));
-
-    // If an explicit template id is provided, run just that one immediately.
-    if (body.id) {
-      const doc = await runTemplateNow(ctx, body.id);
-      return NextResponse.json({ generated: [doc] });
+    const parsed = runRecurringSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    // Otherwise run all due templates up to asOf.
-    const asOf = body.asOf ? new Date(body.asOf) : new Date();
-    const result = await runDue(ctx, asOf);
+    // If an explicit template id is provided, run just that one immediately.
+    if (parsed.data.id) {
+      const doc = await runTemplateNow(ctx, parsed.data.id);
+      return NextResponse.json({ generated: [doc], reminders: [] });
+    }
+
+    // Otherwise run all due templates up to asOf. Auto-enter templates post;
+    // remind-only templates come back in `reminders` without posting.
+    const result = await runDue(ctx, parsed.data.asOf ?? new Date());
     return NextResponse.json(result);
   } catch (err) {
     return errorResponse(err);

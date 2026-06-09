@@ -1,11 +1,13 @@
 import Link from 'next/link';
 import { BarChart2 } from 'lucide-react';
-import { Button, Card, Input, Label, PageHeader } from '@/components/ui';
+import { Button, Card, Input, Label, PageHeader, Select } from '@/components/ui';
 import { getServerContext } from '@/lib/context';
 import { profitAndLoss } from '@/lib/services/reports';
+import { listClasses } from '@/lib/services/dimensions';
 import { getCompany } from '@/lib/services/company';
 import { ytdRange } from '@/lib/ytd';
 import { formatCurrency } from '@/lib/money';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
 
 export const dynamic = 'force-dynamic';
 
@@ -73,7 +75,7 @@ function Section({
 export default async function ProfitLossPage({
   searchParams,
 }: {
-  searchParams: Promise<{ from?: string; to?: string }>;
+  searchParams: Promise<{ from?: string; to?: string; classId?: string }>;
 }) {
   const ctx = await getServerContext();
   const params = await searchParams;
@@ -87,8 +89,35 @@ export default async function ProfitLossPage({
   const toStr = toInputDate(to);
   const rangeQs = `?from=${fromStr}&to=${toStr}`;
 
-  const pl = await profitAndLoss(ctx, { from, to });
+  // Optional class-dimension filter (report customization).
+  const classes = await listClasses(ctx);
+  const classId = params.classId && classes.some((c) => c.id === params.classId)
+    ? params.classId
+    : undefined;
+  const className = classId ? classes.find((c) => c.id === classId)?.name : undefined;
+
+  const pl = await profitAndLoss(ctx, { from, to }, { classId });
   const net = Number(pl.netIncome);
+
+  const subtitle =
+    `${from.toLocaleDateString('en-US')} - ${to.toLocaleDateString('en-US')}` +
+    (className ? ` | Class: ${className}` : '');
+  const exportTable: ExportTable = {
+    filename: 'profit-loss',
+    title: 'Profit & Loss',
+    subtitle,
+    columns: [{ header: 'Account' }, { header: 'Amount', numeric: true }],
+    rows: [
+      ['INCOME', null],
+      ...pl.income.map((l) => [l.name, l.amount] as (string | null)[]),
+      ['Total Income', pl.totalIncome],
+      ['', null],
+      ['EXPENSES', null],
+      ...pl.expenses.map((l) => [l.name, l.amount] as (string | null)[]),
+      ['Total Expenses', pl.totalExpenses],
+    ],
+    totals: [['Net Income', pl.netIncome]],
+  };
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
@@ -104,8 +133,19 @@ export default async function ProfitLossPage({
         />
       </div>
 
-      {/* Date-range picker (plain GET form — server-rendered page) */}
-      <Card className="mb-6 max-w-3xl">
+      <div className="max-w-3xl">
+        <ReportToolbar
+          table={exportTable}
+          basisNav={{
+            value: 'accrual',
+            accrualHref: `/reports/profit-loss${rangeQs}`,
+            cashHref: '/reports/profit-loss-cash',
+          }}
+        />
+      </div>
+
+      {/* Date-range + class picker (plain GET form — server-rendered page) */}
+      <Card className="mb-6 max-w-3xl print-hidden">
         <form method="get" className="flex items-end gap-3 flex-wrap p-4">
           <div>
             <Label htmlFor="pl-from">From</Label>
@@ -115,11 +155,28 @@ export default async function ProfitLossPage({
             <Label htmlFor="pl-to">To</Label>
             <Input id="pl-to" type="date" name="to" defaultValue={toStr} />
           </div>
+          {classes.length > 0 && (
+            <div>
+              <Label htmlFor="pl-class">Class</Label>
+              <Select id="pl-class" name="classId" defaultValue={classId ?? ''}>
+                <option value="">All classes</option>
+                {classes.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </Select>
+            </div>
+          )}
           <Button type="submit" variant="secondary" size="sm" className="mb-0.5">
             Run Report
           </Button>
         </form>
       </Card>
+
+      {className && (
+        <p className="text-sm text-navy/60 mb-3">Filtered to class: {className}</p>
+      )}
 
       <Card className="p-6 max-w-3xl">
         <table className="w-full border-collapse">

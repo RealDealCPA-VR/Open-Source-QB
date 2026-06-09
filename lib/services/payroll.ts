@@ -12,10 +12,26 @@
  * Because grossPay = netPay + totalTaxes + totalDeductions (and employer taxes appear
  * on BOTH sides) the entry always balances. Employer taxes never reduce net pay.
  * postedEntryId is stamped on the paycheck row after posting.
+ *
+ * Payroll items (payroll-suite): any line may carry a payrollItemId; the item's
+ * mapped expense/liability accounts then replace the hardcoded 6500/2300 for that
+ * line (1000 Checking still pays the net). Pre-tax deduction items reduce the wage
+ * base before computeWithholding; garnishment items are post-tax deductions with
+ * their own liability account. Batch payroll lives in createPayRun/listPayRuns,
+ * and unpaidTimeForPayroll + the [payroll:<id>] description tag link time entries
+ * to paychecks (time_entries has no paycheck FK — see timeTracking.ts).
  */
-import { and, desc, eq, gte, inArray, isNull, lt, lte } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
-import { accounts, employees, journalEntries, paychecks, paycheckLines } from '@/lib/db/schema';
+import {
+  accounts,
+  employees,
+  journalEntries,
+  paychecks,
+  paycheckLines,
+  payRuns,
+  timeEntries,
+} from '@/lib/db/schema';
 import {
   type ServiceContext,
   inTransaction,
@@ -29,6 +45,9 @@ import {
   computeWithholding,
   type FilingStatus,
 } from '@/lib/services/payrollTax';
+import { getPayrollItemsByIds, type PayrollItem } from './payrollItems';
+import { sickVacationBalances } from './payrollReports';
+import { PAYROLL_PAID_TAG, markTimeEntriesPaidInPayroll } from './timeTracking';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -65,6 +84,14 @@ export interface PaycheckLineInput {
   kind: 'earning' | 'tax' | 'deduction' | 'employer_contribution';
   name: string;
   amount: string | number;
+  /**
+   * Optional payroll item (payrollItems service). When set, GL posting uses the
+   * item's mapped expense/liability accounts instead of the hardcoded 6500/2300,
+   * and PRE-TAX deduction items reduce the wage base before auto-withholding.
+   * A deduction line pointing at a `garnishment` item is a post-tax deduction
+   * credited to the garnishment's own liability account.
+   */
+  payrollItemId?: string | null;
 }
 
 export type EarningKind = 'regular' | 'overtime' | 'bonus' | 'commission';
@@ -79,6 +106,8 @@ export interface EarningLineInput {
   hours?: string | number | null;
   rate?: string | number | null;
   amount?: string | number | null;
+  /** Optional earning payroll item — wages debit its mapped expense account. */
+  payrollItemId?: string | null;
 }
 
 const EARNING_LABELS: Record<EarningKind, string> = {
@@ -127,6 +156,8 @@ export interface RunPaycheckInput {
    * Ignored when taxes are explicitly supplied.
    */
   periodsPerYear?: number;
+  /** Batch pay run this check belongs to (stamped on paychecks.pay_run_id). */
+  payRunId?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +439,11 @@ export interface PayStubData {
   employee: typeof employees.$inferSelect;
   lines: PayStubLineWithYtd[];
   ytd: { gross: string; taxes: string; deductions: string; net: string };
+  /**
+   * Current sick/vacation balances in hours (employees.accruals policy, derived by
+   * payrollReports.sickVacationBalances). Null when the employee has no accrual policy.
+   */
+  accruals: { sickBalance: string; vacationBalance: string } | null;
 }
 
 /**
@@ -470,6 +506,20 @@ export async function payStubData(ctx: ServiceContext, paycheckId: string): Prom
   const sumCol = (col: 'grossPay' | 'totalTaxes' | 'totalDeductions' | 'netPay') =>
     toAmountString(ytdChecks.reduce((s, c) => s.plus(Money.of(c[col])), Money.zero()));
 
+  // Sick/vacation balances (hours) — informational only; never block stub rendering.
+  let accruals: PayStubData['accruals'] = null;
+  try {
+    const [balanceRow] = await sickVacationBalances(ctx, { employeeId: pc.employeeId });
+    if (balanceRow?.hasPolicy) {
+      accruals = {
+        sickBalance: balanceRow.sick.balance,
+        vacationBalance: balanceRow.vacation.balance,
+      };
+    }
+  } catch {
+    /* balances are an additive extra on the stub */
+  }
+
   return {
     paycheck: pc,
     employee,
@@ -486,6 +536,7 @@ export async function payStubData(ctx: ServiceContext, paycheckId: string): Prom
       deductions: sumCol('totalDeductions'),
       net: sumCol('netPay'),
     },
+    accruals,
   };
 }
 
@@ -527,7 +578,12 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
 
   // --- Compute gross from itemized earnings (or the legacy single amount) ---
   const earningsInput = input.earnings ?? [];
-  const earningLines: Array<{ kind: 'earning'; name: string; amount: string }> = [];
+  const earningLines: Array<{
+    kind: 'earning';
+    name: string;
+    amount: string;
+    payrollItemId: string | null;
+  }> = [];
   let gross: ReturnType<typeof Money.zero>;
 
   if (earningsInput.length > 0) {
@@ -554,7 +610,12 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
       // hours x rate ride along in the name — paycheck_lines has only kind/name/amount.
       const name =
         hours && rate ? `${label} (${hours.toFixed(2)} hrs @ ${rate.toFixed(2)})` : label;
-      earningLines.push({ kind: 'earning', name, amount: toAmountString(amount) });
+      earningLines.push({
+        kind: 'earning',
+        name,
+        amount: toAmountString(amount),
+        payrollItemId: e.payrollItemId ?? null,
+      });
     }
     gross = Money.round2(total);
   } else {
@@ -562,10 +623,66 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
       throw validation('Provide grossPay or at least one earnings line.');
     }
     gross = Money.round2(input.grossPay);
-    earningLines.push({ kind: 'earning', name: 'Gross Pay', amount: toAmountString(gross) });
+    earningLines.push({
+      kind: 'earning',
+      name: 'Gross Pay',
+      amount: toAmountString(gross),
+      payrollItemId: null,
+    });
   }
 
   if (gross.lessThanOrEqualTo(0)) throw validation('Gross pay must be greater than zero.');
+
+  // --- Resolve payroll items referenced by any line (GL mapping + pre-tax flags) ---
+  const deductionLines: PaycheckLineInput[] = input.deductions ?? [];
+  const referencedItemIds = [
+    ...earningLines.map((l) => l.payrollItemId),
+    ...deductionLines.map((l) => l.payrollItemId),
+    ...(input.taxes ?? []).map((l) => l.payrollItemId),
+    ...(input.employerTaxes ?? []).map((l) => l.payrollItemId),
+  ].filter((id): id is string => !!id);
+  const itemMap = await getPayrollItemsByIds(ctx, referencedItemIds);
+
+  const itemFor = (id: string | null | undefined): PayrollItem | null =>
+    id ? itemMap.get(id) ?? null : null;
+
+  // Kind sanity: a line may only reference an item of a compatible kind.
+  for (const l of earningLines) {
+    const item = itemFor(l.payrollItemId);
+    if (item && item.kind !== 'earning') {
+      throw validation(`Earning line "${l.name}" references a ${item.kind} payroll item.`);
+    }
+  }
+  for (const t of input.taxes ?? []) {
+    const item = itemFor(t.payrollItemId);
+    if (item && item.kind !== 'tax') {
+      throw validation(`Tax line "${t.name}" references a ${item.kind} payroll item.`);
+    }
+  }
+  for (const d of deductionLines) {
+    const item = itemFor(d.payrollItemId);
+    if (item && item.kind !== 'deduction' && item.kind !== 'garnishment') {
+      throw validation(`Deduction line "${d.name}" references a ${item.kind} payroll item.`);
+    }
+  }
+  for (const t of input.employerTaxes ?? []) {
+    const item = itemFor(t.payrollItemId);
+    if (item && item.kind !== 'employer_contribution') {
+      throw validation(`Employer tax line "${t.name}" references a ${item.kind} payroll item.`);
+    }
+  }
+
+  // PRE-TAX deductions (item.pretax) reduce the wage base used for auto-withholding.
+  // Garnishment items are always post-tax. Simplified model: pre-tax reduces both the
+  // income-tax and FICA bases (Section 125-style).
+  let pretaxTotal = Money.zero();
+  for (const d of deductionLines) {
+    const item = itemFor(d.payrollItemId);
+    if (item?.pretax) pretaxTotal = pretaxTotal.plus(Money.of(d.amount));
+  }
+  const taxableGross = Money.round2(
+    gross.minus(pretaxTotal).greaterThan(0) ? gross.minus(pretaxTotal) : Money.zero(),
+  );
 
   // --- Auto-compute taxes only when the caller did not pass a taxes array at all.
   // An explicit empty array means "no taxes" (contractor/reimbursement) and is respected. ---
@@ -578,13 +695,13 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
   if (callerSuppliedTaxes) {
     taxLines = input.taxes!;
   } else {
-    // Derive taxes automatically from the gross pay using 2024 IRS tables. The SS wage
-    // base and Additional Medicare threshold are applied against ACTUAL YTD wages (not
-    // an annualized projection of this period), so bonuses and wage-base crossovers
-    // withhold correctly.
+    // Derive taxes automatically from the TAXABLE gross (gross minus pre-tax deductions)
+    // using 2024 IRS tables. The SS wage base and Additional Medicare threshold are
+    // applied against ACTUAL YTD wages (not an annualized projection of this period),
+    // so bonuses and wage-base crossovers withhold correctly.
     const ytdGrossBefore = await ytdGrossPaid(ctx, input.employeeId, input.payDate);
     const withholding = computeWithholding({
-      grossPerPeriod: gross.toNumber(),
+      grossPerPeriod: taxableGross.toNumber(),
       periodsPerYear: input.periodsPerYear ?? 26,
       filingStatus: input.filingStatus ?? 'single',
       ytdGrossBefore,
@@ -599,7 +716,7 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
     // the employee withholdings unless the caller supplied them explicitly below.
     if (!callerSuppliedEmployerTaxes) {
       const employer = computeEmployerTaxes({
-        grossPerPeriod: gross.toNumber(),
+        grossPerPeriod: taxableGross.toNumber(),
         ytdGrossBefore,
       });
       employerTaxLines = [
@@ -614,8 +731,6 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
   // When employee taxes were supplied explicitly and employerTaxes was omitted, no
   // employer taxes are auto-derived (the caller has taken over the tax math).
   employerTaxLines ??= callerSuppliedEmployerTaxes ? input.employerTaxes! : [];
-
-  const deductionLines: PaycheckLineInput[] = input.deductions ?? [];
 
   let totalEmployerTaxes = Money.zero();
   for (const t of employerTaxLines) {
@@ -674,16 +789,20 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
         totalTaxes: toAmountString(totalTaxes),
         totalDeductions: toAmountString(totalDeductions),
         netPay: toAmountString(netPay),
+        payRunId: input.payRunId ?? null,
         // postedEntryId set below
       })
       .returning();
 
     // 2) Insert paycheck lines (itemized earnings + taxes + deductions).
+    //    Garnishment-item lines persist as kind 'deduction' (the ITEM's kind carries
+    //    the garnishment semantics) so stubs / W-2 / YTD groupings keep working.
     const lineValues: Array<{
       paycheckId: string;
       kind: string;
       name: string;
       amount: string;
+      payrollItemId: string | null;
     }> = [
       ...earningLines.map((e) => ({ paycheckId: paycheck.id, ...e })),
       ...taxLines.map((t) => ({
@@ -691,18 +810,21 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
         kind: 'tax' as const,
         name: t.name,
         amount: toAmountString(Money.of(t.amount)),
+        payrollItemId: t.payrollItemId ?? null,
       })),
       ...deductionLines.map((d) => ({
         paycheckId: paycheck.id,
         kind: 'deduction' as const,
         name: d.name,
         amount: toAmountString(Money.of(d.amount)),
+        payrollItemId: d.payrollItemId ?? null,
       })),
       ...employerTaxLines.map((t) => ({
         paycheckId: paycheck.id,
         kind: 'employer_contribution' as const,
         name: t.name,
         amount: toAmountString(Money.of(t.amount)),
+        payrollItemId: t.payrollItemId ?? null,
       })),
     ];
 
@@ -710,47 +832,88 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
       await tx.db.insert(paycheckLines).values(lineValues);
     }
 
-    // 3) Build and post the balanced journal entry.
+    // 3) Build and post the balanced journal entry. Each line posts to its payroll
+    //    item's mapped account when set, otherwise to the legacy defaults:
     //
-    //   Dr 6500 Payroll Expense       = grossPay
-    //   Dr 6510/6500 Payroll Tax Exp. = employer taxes               (only if > 0)
-    //   Cr 2300 Payroll Liab.         = totalTaxes + totalDeductions (only if > 0)
-    //   Cr 2300 Payroll Liab.         = employer taxes               (only if > 0)
+    //   Dr item.expense ?? 6500       = earning amounts (sum = grossPay)
+    //   Dr item.expense ?? 6510/6500  = employer taxes               (only if > 0)
+    //   Cr item.liability ?? 2300     = taxes + deductions           (only if > 0)
+    //   Cr item.liability ?? 2300     = employer taxes               (only if > 0)
     //   Cr 1000 Checking              = netPay
     //
     // Proof: grossPay = netPay + totalTaxes + totalDeductions, and employer taxes
     // appear once as a debit and once as a credit  ✓
-    const liabAmount = Money.round2(totalTaxes.plus(totalDeductions));
     const fullName = `${employee.firstName} ${employee.lastName}`;
     const payDateStr = input.payDate.toISOString().slice(0, 10);
 
-    const postingLines: Array<{ accountId: string; debit?: string; credit?: string; memo?: string }> = [
-      {
-        accountId: payrollExpenseId,
-        debit: toAmountString(gross),
-        memo: `Payroll — ${fullName} (${payDateStr})`,
-      },
-    ];
+    // Aggregate amounts per account (insertion-ordered) so multi-line checks stay compact.
+    const sumInto = (map: Map<string, ReturnType<typeof Money.zero>>, key: string, amt: ReturnType<typeof Money.zero>) =>
+      map.set(key, (map.get(key) ?? Money.zero()).plus(amt));
 
-    if (liabAmount.greaterThan(0)) {
-      postingLines.push({
-        accountId: payrollLiabId,
-        credit: toAmountString(liabAmount),
-        memo: `Taxes & deductions — ${fullName}`,
-      });
+    const wageDebits = new Map<string, ReturnType<typeof Money.zero>>();
+    for (const e of earningLines) {
+      const item = itemFor(e.payrollItemId);
+      sumInto(wageDebits, item?.expenseAccountId ?? payrollExpenseId, Money.of(e.amount));
     }
 
-    if (totalEmployerTaxes.greaterThan(0)) {
-      postingLines.push({
-        accountId: payrollTaxExpenseId,
-        debit: toAmountString(totalEmployerTaxes),
-        memo: `Employer payroll taxes — ${fullName}`,
-      });
-      postingLines.push({
-        accountId: payrollLiabId,
-        credit: toAmountString(totalEmployerTaxes),
-        memo: `Employer payroll taxes payable — ${fullName}`,
-      });
+    const withholdingCredits = new Map<string, ReturnType<typeof Money.zero>>();
+    for (const t of taxLines) {
+      const item = itemFor(t.payrollItemId);
+      sumInto(withholdingCredits, item?.liabilityAccountId ?? payrollLiabId, Money.of(t.amount));
+    }
+    for (const d of deductionLines) {
+      const item = itemFor(d.payrollItemId);
+      sumInto(withholdingCredits, item?.liabilityAccountId ?? payrollLiabId, Money.of(d.amount));
+    }
+
+    const employerDebits = new Map<string, ReturnType<typeof Money.zero>>();
+    const employerCredits = new Map<string, ReturnType<typeof Money.zero>>();
+    for (const t of employerTaxLines) {
+      const item = itemFor(t.payrollItemId);
+      const amt = Money.of(t.amount);
+      sumInto(employerDebits, item?.expenseAccountId ?? payrollTaxExpenseId, amt);
+      sumInto(employerCredits, item?.liabilityAccountId ?? payrollLiabId, amt);
+    }
+
+    const postingLines: Array<{ accountId: string; debit?: string; credit?: string; memo?: string }> = [];
+
+    for (const [accountId, amt] of wageDebits) {
+      if (amt.greaterThan(0)) {
+        postingLines.push({
+          accountId,
+          debit: toAmountString(amt),
+          memo: `Payroll — ${fullName} (${payDateStr})`,
+        });
+      }
+    }
+
+    for (const [accountId, amt] of withholdingCredits) {
+      if (amt.greaterThan(0)) {
+        postingLines.push({
+          accountId,
+          credit: toAmountString(amt),
+          memo: `Taxes & deductions — ${fullName}`,
+        });
+      }
+    }
+
+    for (const [accountId, amt] of employerDebits) {
+      if (amt.greaterThan(0)) {
+        postingLines.push({
+          accountId,
+          debit: toAmountString(amt),
+          memo: `Employer payroll taxes — ${fullName}`,
+        });
+      }
+    }
+    for (const [accountId, amt] of employerCredits) {
+      if (amt.greaterThan(0)) {
+        postingLines.push({
+          accountId,
+          credit: toAmountString(amt),
+          memo: `Employer payroll taxes payable — ${fullName}`,
+        });
+      }
     }
 
     postingLines.push({
@@ -789,5 +952,314 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
     });
 
     return { ...updated, lines: lineValues };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Time -> payroll link
+// ---------------------------------------------------------------------------
+
+/**
+ * Unbilled-to-payroll time entries for an employee within a pay period.
+ *
+ * NOTE on "approved": the app has no time-approval workflow column, so every
+ * entry of the employee in the window that has NOT already been consumed by a
+ * paycheck counts. Consumption is tracked via the `[payroll:<paycheckId>]` tag
+ * in the entry description (time_entries has no paycheck FK — see
+ * markTimeEntriesPaidInPayroll in timeTracking.ts). Billable-to-customer status
+ * is independent: time can be both billed to a customer and paid to the employee.
+ */
+export async function unpaidTimeForPayroll(
+  ctx: ServiceContext,
+  opts: { employeeId: string; periodStart: Date; periodEnd: Date },
+) {
+  const rows = await ctx.db
+    .select()
+    .from(timeEntries)
+    .where(
+      and(
+        eq(timeEntries.companyId, ctx.companyId),
+        eq(timeEntries.employeeId, opts.employeeId),
+        gte(timeEntries.date, opts.periodStart),
+        lte(timeEntries.date, opts.periodEnd),
+      ),
+    )
+    .orderBy(timeEntries.date);
+
+  const entries = rows.filter((r) => !(r.description ?? '').includes(PAYROLL_PAID_TAG));
+  const totalHours = entries.reduce((s, e) => s.plus(Money.of(e.hours)), Money.zero());
+  return { entries, totalHours: totalHours.toFixed(2) };
+}
+
+// ---------------------------------------------------------------------------
+// Pay runs (batch payroll)
+// ---------------------------------------------------------------------------
+
+export interface PayRunEmployeeInput {
+  employeeId: string;
+  /** Hours for hourly employees (default 80 ≈ biweekly full-time). Ignored when `amount` is set. */
+  hours?: string | number | null;
+  /** Override gross for this check (wins over hours x rate and the salary default). */
+  amount?: string | number | null;
+  /** Itemized deductions; lines may carry payrollItemId (pre-tax / garnishment / GL mapping). */
+  deductions?: PaycheckLineInput[];
+  /**
+   * Time entries pulled into this check. Hours = sum of entry hours, paid at the
+   * employee's pay rate (the hourly earning line). Entries are tagged
+   * `[payroll:<paycheckId>]` after the check posts so they cannot be paid twice.
+   */
+  timeEntryIds?: string[];
+}
+
+export interface CreatePayRunInput {
+  payDate: Date;
+  periodStart?: Date | null;
+  periodEnd?: Date | null;
+  memo?: string | null;
+  /** Pay periods per year used for salary defaults and withholding (default 26). */
+  periodsPerYear?: number;
+  employees: PayRunEmployeeInput[];
+}
+
+export interface PayRunEmployeeResult {
+  employeeId: string;
+  employeeName: string;
+  ok: boolean;
+  paycheckId?: string;
+  grossPay?: string;
+  netPay?: string;
+  error?: string;
+  /** Non-fatal issue (e.g. paycheck posted but time entries could not be marked). */
+  warning?: string;
+}
+
+/**
+ * Batch payroll: one pay_runs row + runPaycheck per selected employee.
+ * Deliberately NOT all-or-nothing — each employee posts independently; failures
+ * are recorded per employee and reported in `results` (QB-style "Create Paychecks"
+ * behavior, so one bad record doesn't block the whole run).
+ *
+ * Defaults per employee when no override is given:
+ *   hourly:     hours (input.hours, or pulled time, or 80) x payRate
+ *   salary:     payRate / periodsPerYear (annual salary spread per period)
+ *   commission: requires an explicit amount
+ * Withholding uses the employee's W-4 filing status and is auto-computed.
+ */
+export async function createPayRun(ctx: ServiceContext, input: CreatePayRunInput) {
+  if (!(input.payDate instanceof Date) || isNaN(input.payDate.getTime())) {
+    throw validation('A valid pay date is required.');
+  }
+  if (!input.employees || input.employees.length === 0) {
+    throw validation('Select at least one employee for the pay run.');
+  }
+  const seen = new Set<string>();
+  for (const e of input.employees) {
+    if (seen.has(e.employeeId)) {
+      throw validation('Each employee may appear only once per pay run.');
+    }
+    seen.add(e.employeeId);
+  }
+  const periodsPerYear = input.periodsPerYear ?? 26;
+
+  // Header row first; per-employee checks attach via paychecks.pay_run_id.
+  const [run] = await ctx.db
+    .insert(payRuns)
+    .values({
+      companyId: ctx.companyId,
+      payDate: input.payDate,
+      periodStart: input.periodStart ?? null,
+      periodEnd: input.periodEnd ?? null,
+      memo: input.memo?.trim() || null,
+    })
+    .returning();
+
+  await writeAudit(ctx, {
+    action: 'create',
+    entityType: 'pay_run',
+    entityId: run.id,
+    newValues: { payDate: input.payDate, employees: input.employees.length },
+  });
+
+  const results: PayRunEmployeeResult[] = [];
+
+  for (const empInput of input.employees) {
+    let employeeName = empInput.employeeId;
+    try {
+      const employee = await getEmployee(ctx, empInput.employeeId);
+      employeeName = `${employee.firstName} ${employee.lastName}`;
+
+      // --- Pulled time entries: validate ownership + unpaid, sum hours ---
+      let timeHours: ReturnType<typeof Money.zero> | null = null;
+      const timeEntryIds = [...new Set(empInput.timeEntryIds ?? [])];
+      if (timeEntryIds.length > 0) {
+        const rows = await ctx.db
+          .select()
+          .from(timeEntries)
+          .where(
+            and(
+              eq(timeEntries.companyId, ctx.companyId),
+              inArray(timeEntries.id, timeEntryIds),
+            ),
+          );
+        if (rows.length !== timeEntryIds.length) throw notFound('Time entry');
+        for (const r of rows) {
+          if (r.employeeId !== employee.id) {
+            throw validation('Time entry belongs to a different employee.');
+          }
+          if ((r.description ?? '').includes(PAYROLL_PAID_TAG)) {
+            throw validation('Time entry was already paid on a previous paycheck.');
+          }
+        }
+        timeHours = rows.reduce((s, r) => s.plus(Money.of(r.hours)), Money.zero());
+      }
+
+      // --- Default earnings ---
+      const earnings: EarningLineInput[] = [];
+      if (empInput.amount != null && empInput.amount !== '') {
+        earnings.push({ kind: 'regular', amount: empInput.amount });
+      } else if (employee.payType === 'hourly' || timeHours !== null) {
+        const hours =
+          timeHours ??
+          (empInput.hours != null && empInput.hours !== ''
+            ? Money.of(empInput.hours)
+            : Money.of(80));
+        earnings.push({
+          kind: 'regular',
+          hours: hours.toFixed(2),
+          rate: employee.payRate,
+        });
+      } else if (employee.payType === 'salary') {
+        const perPeriod = Money.round2(Money.div(employee.payRate, periodsPerYear));
+        earnings.push({ kind: 'regular', amount: toAmountString(perPeriod) });
+      } else {
+        throw validation('Commission employees need an explicit amount.');
+      }
+
+      const w4 = (employee.w4 ?? {}) as { filingStatus?: string };
+      const filingStatus: FilingStatus = w4.filingStatus === 'married' ? 'married' : 'single';
+
+      const paycheck = await runPaycheck(ctx, {
+        employeeId: employee.id,
+        payDate: input.payDate,
+        periodStart: input.periodStart ?? null,
+        periodEnd: input.periodEnd ?? null,
+        earnings,
+        deductions: empInput.deductions ?? [],
+        filingStatus,
+        periodsPerYear,
+        payRunId: run.id,
+      });
+
+      const result: PayRunEmployeeResult = {
+        employeeId: employee.id,
+        employeeName,
+        ok: true,
+        paycheckId: paycheck.id,
+        grossPay: paycheck.grossPay,
+        netPay: paycheck.netPay,
+      };
+
+      // Tag pulled time entries AFTER the check posts. The paycheck is already
+      // committed, so a marking failure is surfaced as a warning, not a rollback.
+      if (timeEntryIds.length > 0) {
+        try {
+          await markTimeEntriesPaidInPayroll(ctx, timeEntryIds, paycheck.id);
+        } catch (err) {
+          result.warning = `Paycheck posted, but time entries could not be marked: ${
+            err instanceof Error ? err.message : 'unknown error'
+          }`;
+        }
+      }
+
+      results.push(result);
+    } catch (err) {
+      results.push({
+        employeeId: empInput.employeeId,
+        employeeName,
+        ok: false,
+        error: err instanceof Error ? err.message : 'Unknown error',
+      });
+    }
+  }
+
+  return { payRun: run, results };
+}
+
+export interface PayRunPaycheckSummary {
+  id: string;
+  employeeId: string;
+  employeeName: string;
+  grossPay: string;
+  netPay: string;
+  isVoid: boolean;
+}
+
+export interface PayRunSummary {
+  id: string;
+  payDate: Date;
+  periodStart: Date | null;
+  periodEnd: Date | null;
+  memo: string | null;
+  createdAt: Date;
+  paychecks: PayRunPaycheckSummary[];
+  /** Totals over NON-VOID paychecks in the run. */
+  totalGross: string;
+  totalNet: string;
+}
+
+/** Past pay runs, newest first, each with its paychecks (voided ones flagged). */
+export async function listPayRuns(ctx: ServiceContext): Promise<PayRunSummary[]> {
+  const runs = await ctx.db
+    .select()
+    .from(payRuns)
+    .where(eq(payRuns.companyId, ctx.companyId))
+    .orderBy(desc(payRuns.payDate), desc(payRuns.createdAt));
+
+  const checks = await ctx.db
+    .select({
+      paycheck: paychecks,
+      jeStatus: journalEntries.status,
+      firstName: employees.firstName,
+      lastName: employees.lastName,
+    })
+    .from(paychecks)
+    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+    .innerJoin(employees, eq(paychecks.employeeId, employees.id))
+    .where(and(eq(paychecks.companyId, ctx.companyId), isNotNull(paychecks.payRunId)))
+    .orderBy(employees.lastName, employees.firstName);
+
+  const byRun = new Map<string, PayRunPaycheckSummary[]>();
+  for (const c of checks) {
+    const runId = c.paycheck.payRunId!;
+    const list = byRun.get(runId) ?? [];
+    list.push({
+      id: c.paycheck.id,
+      employeeId: c.paycheck.employeeId,
+      employeeName: `${c.firstName} ${c.lastName}`,
+      grossPay: c.paycheck.grossPay,
+      netPay: c.paycheck.netPay,
+      isVoid:
+        c.paycheck.voidedAt != null ||
+        (c.paycheck.postedEntryId != null && c.jeStatus !== 'posted'),
+    });
+    byRun.set(runId, list);
+  }
+
+  return runs.map((r) => {
+    const pcs = byRun.get(r.id) ?? [];
+    const live = pcs.filter((p) => !p.isVoid);
+    return {
+      id: r.id,
+      payDate: r.payDate,
+      periodStart: r.periodStart,
+      periodEnd: r.periodEnd,
+      memo: r.memo,
+      createdAt: r.createdAt,
+      paychecks: pcs,
+      totalGross: toAmountString(
+        live.reduce((s, p) => s.plus(Money.of(p.grossPay)), Money.zero()),
+      ),
+      totalNet: toAmountString(live.reduce((s, p) => s.plus(Money.of(p.netPay)), Money.zero())),
+    };
   });
 }

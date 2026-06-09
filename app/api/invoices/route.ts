@@ -8,9 +8,11 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { createInvoice, listInvoices, type CreateInvoiceInput } from '@/lib/services/invoices';
+import { createInvoice, listInvoices } from '@/lib/services/invoices';
 import { createInvoiceWithBillables, type BillableSelection } from '@/lib/services/billables';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createInvoiceBodySchema, hasBillableSelection } from '@/lib/validation/invoices';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -46,66 +48,23 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await req.json().catch(() => ({}));
+    const parsed = createInvoiceBodySchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
 
-    // Basic shape check — detailed validation happens inside the service.
-    if (!body.customerId) {
-      return NextResponse.json({ error: 'customerId is required', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (!body.date) {
-      return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
-    }
     // Billable time & costs selection (optional). When present, manual lines may
     // be empty — the billables become the lines.
-    const billables: BillableSelection | null =
-      body.billables &&
-      ((body.billables.billLineIds?.length ?? 0) +
-        (body.billables.expenseLineIds?.length ?? 0) +
-        (body.billables.timeEntryIds?.length ?? 0) >
-        0)
-        ? {
-            billLineIds: body.billables.billLineIds ?? [],
-            expenseLineIds: body.billables.expenseLineIds ?? [],
-            timeEntryIds: body.billables.timeEntryIds ?? [],
-            markupPercent: body.billables.markupPercent ?? null,
-          }
-        : null;
-
-    if (!Array.isArray(body.lines) || (body.lines.length === 0 && !billables)) {
-      return NextResponse.json({ error: 'lines must be a non-empty array', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (body.discountType != null && body.discountType !== 'amount' && body.discountType !== 'percent') {
-      return NextResponse.json(
-        { error: "discountType must be 'amount' or 'percent'", code: 'VALIDATION' },
-        { status: 400 },
-      );
-    }
-
-    const input: CreateInvoiceInput = {
-      customerId: body.customerId,
-      date: new Date(body.date),
-      dueDate: body.dueDate ? new Date(body.dueDate) : null,
-      taxRateId: body.taxRateId ?? null,
-      classId: body.classId ?? null,
-      jobId: body.jobId ?? null,
-      discount: body.discount ?? null,
-      discountType: body.discountType ?? null,
-      currency: body.currency ?? null,
-      exchangeRate: body.exchangeRate ?? null,
-      retainagePercent: body.retainagePercent ?? null,
-      memo: body.memo ?? null,
-      lines: body.lines.map((l: Record<string, unknown>) => ({
-        itemId: (l.itemId as string | undefined) ?? null,
-        accountId: (l.accountId as string | undefined) ?? null,
-        description: (l.description as string | undefined) ?? null,
-        quantity: l.quantity as string | number,
-        rate: l.rate as string | number,
-        taxable: l.taxable !== undefined ? Boolean(l.taxable) : true,
-        taxRateId: (l.taxRateId as string | undefined) ?? null,
-        classId: (l.classId as string | undefined) ?? null,
-        jobId: (l.jobId as string | undefined) ?? null,
-      })),
-    };
+    const { billables: rawBillables, ...input } = parsed.data;
+    const billables: BillableSelection | null = hasBillableSelection(rawBillables)
+      ? {
+          billLineIds: rawBillables!.billLineIds ?? [],
+          expenseLineIds: rawBillables!.expenseLineIds ?? [],
+          timeEntryIds: rawBillables!.timeEntryIds ?? [],
+          markupPercent: rawBillables!.markupPercent ?? null,
+        }
+      : null;
 
     const invoice = billables
       ? await createInvoiceWithBillables(ctx, input, billables)

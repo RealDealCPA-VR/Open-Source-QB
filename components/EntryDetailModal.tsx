@@ -10,10 +10,16 @@
  * Also exports `sourceRefLink`, the shared sourceRef → route mapping used by
  * register/report rows to decide between "open source document" and "open this
  * modal".
+ *
+ * History section (txn-history): fetches GET /api/journal-entries/<id>/history
+ * and renders the QB "Transaction History" linked-transactions tree — e.g. an
+ * invoice with its estimate source, payments applied (and the deposits that
+ * banked them), credit memos, and COGS entries; manual entries show
+ * reversal/replacement links.
  */
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
-import { ExternalLink } from 'lucide-react';
+import { CornerDownRight, ExternalLink, History } from 'lucide-react';
 import { Badge, Button, Modal, Table, Th, Td, Tr } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
@@ -84,6 +90,17 @@ interface EntryDetail {
   lines: EntryLine[];
 }
 
+/** Mirrors lib/services/linkedTransactions.ts LinkedTransaction. */
+interface LinkedTransaction {
+  kind: string;
+  id: string;
+  label: string;
+  date: string;
+  amount: string;
+  route: string;
+  children?: LinkedTransaction[];
+}
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -108,15 +125,46 @@ export interface EntryDetailModalProps {
   onClose: () => void;
 }
 
+/** One row in the History tree: indented label link + date + amount. */
+function HistoryRow({ node, depth }: { node: LinkedTransaction; depth: number }) {
+  return (
+    <>
+      <div
+        className="flex items-center gap-3 py-1.5 border-b border-navy/5 last:border-b-0 text-sm"
+        style={{ paddingLeft: `${depth * 20}px` }}
+      >
+        {depth > 0 && <CornerDownRight className="h-3.5 w-3.5 shrink-0 text-navy/30" />}
+        <Link
+          href={node.route}
+          className="text-electric font-medium hover:underline truncate"
+          title={node.label}
+        >
+          {node.label}
+        </Link>
+        <span className="text-xs text-navy/40 whitespace-nowrap">{formatDate(node.date)}</span>
+        <span className="ml-auto tabular-nums text-navy/70">{formatCurrency(node.amount)}</span>
+      </div>
+      {(node.children ?? []).map((c) => (
+        <HistoryRow key={`${c.kind}:${c.id}`} node={c} depth={depth + 1} />
+      ))}
+    </>
+  );
+}
+
 export default function EntryDetailModal({ entryId, onClose }: EntryDetailModalProps) {
   const [entry, setEntry] = useState<EntryDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [history, setHistory] = useState<LinkedTransaction | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!entryId) {
       setEntry(null);
       setError(null);
+      setHistory(null);
+      setHistoryError(null);
       return;
     }
     let cancelled = false;
@@ -135,6 +183,27 @@ export default function EntryDetailModal({ entryId, onClose }: EntryDetailModalP
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
+      });
+
+    // Linked-transactions history (independent of the entry fetch; failure here
+    // should not block the entry detail).
+    setHistoryLoading(true);
+    setHistoryError(null);
+    setHistory(null);
+    api
+      .get<{ history: LinkedTransaction }>(`/api/journal-entries/${entryId}/history`)
+      .then((data) => {
+        if (!cancelled) setHistory(data.history);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setHistoryError(
+            err instanceof ApiError ? err.message : 'Failed to load transaction history.',
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setHistoryLoading(false);
       });
     return () => {
       cancelled = true;
@@ -251,6 +320,30 @@ export default function EntryDetailModal({ entryId, onClose }: EntryDetailModalP
               </tr>
             </tfoot>
           </Table>
+
+          {/* History — QB linked-transactions tree */}
+          <div className="mt-6">
+            <div className="flex items-center gap-1.5 mb-2 text-xs font-semibold text-navy/50 uppercase tracking-wide">
+              <History className="h-3.5 w-3.5" />
+              History
+            </div>
+            {historyLoading && (
+              <div className="py-3 text-sm text-navy/40">Loading transaction history…</div>
+            )}
+            {historyError && !historyLoading && (
+              <div className="py-3 text-sm text-red-500">{historyError}</div>
+            )}
+            {history && !historyLoading && !historyError && (
+              <div className="rounded-lg border border-navy/10 px-3 py-1">
+                <HistoryRow node={history} depth={0} />
+                {(history.children ?? []).length === 0 && (
+                  <div className="py-1.5 text-sm text-navy/40">
+                    No linked transactions.
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </>
       )}
     </Modal>

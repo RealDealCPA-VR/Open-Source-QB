@@ -8,7 +8,7 @@ import { accounts, companies, users, userCompanies } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { notFound, validation, writeAudit } from './_base';
 import { hashPassword, verifyPassword } from '@/lib/auth';
-import { requireRole } from './rbac';
+import { assertWrite, requireRole } from './rbac';
 import type { DB } from '@/lib/db';
 
 type AccountSeed = { code: string; name: string; type: string; subtype: string };
@@ -49,14 +49,23 @@ export async function listCompanies(db: DB) {
 /**
  * Companies the given user is a member of (via user_companies). Used by the API layer so an
  * authenticated caller only ever sees their own company files — never other tenants' rows.
+ * Pass excludeArchived to hide soft-deleted files (settings.archived === true).
  */
-export async function listCompaniesForUser(db: DB, userId: string) {
+export async function listCompaniesForUser(
+  db: DB,
+  userId: string,
+  opts?: { excludeArchived?: boolean },
+) {
   const rows = await db
     .select({ company: companies })
     .from(companies)
     .innerJoin(userCompanies, eq(userCompanies.companyId, companies.id))
     .where(eq(userCompanies.userId, userId));
-  return rows.map((r) => r.company);
+  const list = rows.map((r) => r.company);
+  if (!opts?.excludeArchived) return list;
+  return list.filter(
+    (c) => (c.settings as Record<string, unknown> | null)?.archived !== true,
+  );
 }
 
 export async function createCompany(
@@ -109,27 +118,128 @@ export async function getCompany(ctx: ServiceContext) {
   return row ?? null;
 }
 
-export interface UpdateCompanyInput {
-  name?: string;
-  settings?: {
-    fiscalYearEnd?: string;
-    currency?: string;
-    timezone?: string;
-    [key: string]: unknown;
+/** One custom-field definition (settings.customFields.<entity>[]). */
+export interface CustomFieldDef {
+  name: string;
+}
+
+/**
+ * Typed view of companies.settings — every key the Preferences dialog persists.
+ * Keys actually read by services today: fiscalYearEnd (fiscalClose, dashboard),
+ * currency/timezone (display), closingDate + closingDatePasswordHash (managed
+ * ONLY via setClosingDate, never updateCompany), financeCharges (managed by the
+ * finance-charges service). The remaining keys are Preferences defaults that
+ * apply to NEW documents (advisory until their consumers land).
+ */
+export interface CompanySettings {
+  // Company info
+  legalName?: string;
+  ein?: string;
+  /**
+   * Single-line employer address — read TODAY by payrollReports (W-2/940
+   * employer block). The Preferences dialog composes it from the structured
+   * addressLine1/city/state/zip fields on save.
+   */
+  address?: string;
+  addressLine1?: string;
+  addressLine2?: string;
+  city?: string;
+  state?: string;
+  zip?: string;
+  country?: string;
+  phone?: string;
+  email?: string;
+  industry?: string;
+  // Accounting
+  fiscalYearEnd?: string;
+  currency?: string;
+  timezone?: string;
+  accountNumbersEnabled?: boolean;
+  reportBasis?: 'accrual' | 'cash';
+  // Sales & Customers
+  defaultCustomerTerms?: string;
+  defaultInvoiceMemo?: string;
+  // Purchases & Vendors
+  defaultVendorTerms?: string;
+  defaultExpenseAccountId?: string | null;
+  // Payroll
+  payrollPayPeriod?: string;
+  payrollStandardHours?: number;
+  payrollExpenseAccountId?: string | null;
+  payrollLiabilityAccountId?: string | null;
+  // Inventory
+  negativeStockWarning?: boolean;
+  // Custom field definitions per entity list
+  customFields?: {
+    customer?: CustomFieldDef[];
+    vendor?: CustomFieldDef[];
+    item?: CustomFieldDef[];
+    invoice?: CustomFieldDef[];
   };
 }
 
 /**
- * Update the active company's name and/or settings JSONB (deep-merged).
- * Scoped to ctx.companyId. Writes an audit log row and returns the updated row.
+ * Whitelist of settings keys updateCompany will merge. Anything else in the
+ * patch is silently dropped — in particular closingDate/closingDatePasswordHash
+ * (only setClosingDate may touch those) and financeCharges (finance-charges
+ * service owns that subtree).
+ */
+export const COMPANY_SETTINGS_KEYS = [
+  'legalName',
+  'ein',
+  'address',
+  'addressLine1',
+  'addressLine2',
+  'city',
+  'state',
+  'zip',
+  'country',
+  'phone',
+  'email',
+  'industry',
+  'fiscalYearEnd',
+  'currency',
+  'timezone',
+  'accountNumbersEnabled',
+  'reportBasis',
+  'defaultCustomerTerms',
+  'defaultInvoiceMemo',
+  'defaultVendorTerms',
+  'defaultExpenseAccountId',
+  'payrollPayPeriod',
+  'payrollStandardHours',
+  'payrollExpenseAccountId',
+  'payrollLiabilityAccountId',
+  'negativeStockWarning',
+  'customFields',
+] as const satisfies readonly (keyof CompanySettings)[];
+
+const SETTINGS_KEY_SET = new Set<string>(COMPANY_SETTINGS_KEYS);
+
+export interface UpdateCompanyInput {
+  name?: string;
+  settings?: CompanySettings & { [key: string]: unknown };
+}
+
+/**
+ * Update the active company's name and/or settings JSONB (shallow-merged).
+ * Settings keys outside COMPANY_SETTINGS_KEYS are dropped (closing-date and
+ * finance-charge keys have dedicated services). Scoped to ctx.companyId.
+ * Writes an audit log row and returns the updated row.
  */
 export async function updateCompany(ctx: ServiceContext, input: UpdateCompanyInput) {
+  assertWrite(ctx); // early viewer block (writeAudit re-checks centrally)
   const existing = await getCompany(ctx);
   if (!existing) throw notFound('company');
 
+  const settingsPatch: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input.settings ?? {})) {
+    if (SETTINGS_KEY_SET.has(key) && value !== undefined) settingsPatch[key] = value;
+  }
+
   const mergedSettings = {
     ...(existing.settings ?? {}),
-    ...(input.settings ?? {}),
+    ...settingsPatch,
   };
 
   const [updated] = await ctx.db

@@ -71,7 +71,7 @@ function mutateHeaders(opts?: MutateOpts, hasBody?: boolean): Record<string, str
  * password and retry exactly once. Explicitly supplied passwords are never re-prompted.
  */
 async function mutate<T>(
-  method: 'POST' | 'PATCH' | 'DELETE',
+  method: 'POST' | 'PATCH' | 'PUT' | 'DELETE',
   url: string,
   body: unknown,
   opts?: MutateOpts,
@@ -110,5 +110,7 @@ export const api = {
     mutate<T>('POST', url, body, opts),
   patch: <T = unknown>(url: string, body?: unknown, opts?: MutateOpts) =>
     mutate<T>('PATCH', url, body, opts),
+  put: <T = unknown>(url: string, body?: unknown, opts?: MutateOpts) =>
+    mutate<T>('PUT', url, body, opts),
   del: <T = unknown>(url: string, opts?: MutateOpts) => mutate<T>('DELETE', url, undefined, opts),
 };

@@ -10,6 +10,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listJobs, createJob, jobsSummary } from '@/lib/services/jobs';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createJobSchema } from '@/lib/validation/jobs';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -46,14 +48,12 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-    const job = await createJob(ctx, {
-      name: body.name,
-      customerId: body.customerId ?? null,
-      budget: body.budget ?? null,
-      startDate: body.startDate ? new Date(body.startDate) : null,
-      endDate: body.endDate ? new Date(body.endDate) : null,
-    });
+    const body = await req.json().catch(() => ({}));
+    const parsed = createJobSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
+    const job = await createJob(ctx, parsed.data);
     return NextResponse.json(job, { status: 201 });
   } catch (err) {
     return errorResponse(err);

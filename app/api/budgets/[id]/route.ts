@@ -8,6 +8,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getBudget, setBudgetLine } from '@/lib/services/budgets';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { setBudgetLineSchema } from '@/lib/validation/budgets';
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -42,13 +44,12 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
-    const line = await setBudgetLine(ctx, {
-      budgetId: id,
-      accountId: body.accountId,
-      month: Number(body.month),
-      amount: String(body.amount),
-    });
+    const body = await req.json().catch(() => ({}));
+    const parsed = setBudgetLineSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
+    const line = await setBudgetLine(ctx, { budgetId: id, ...parsed.data });
     return NextResponse.json(line);
   } catch (err) {
     return errorResponse(err);

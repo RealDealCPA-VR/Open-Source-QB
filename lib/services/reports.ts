@@ -105,12 +105,19 @@ export interface ProfitAndLoss {
   netIncome: string;
   from?: string;
   to?: string;
+  /** Echoed back when the report was filtered to a single class. */
+  classId?: string;
 }
 
-/** Profit & Loss for a date range (revenue - expenses). */
+/**
+ * Profit & Loss for a date range (revenue - expenses).
+ * Optionally filtered to a single class dimension (opts.classId) — only
+ * journal lines tagged with that class are included.
+ */
 export async function profitAndLoss(
   ctx: ServiceContext,
   range?: { from?: Date; to?: Date },
+  opts?: { classId?: string },
 ): Promise<ProfitAndLoss> {
   const conds = [
     eq(journalEntries.companyId, ctx.companyId),
@@ -120,6 +127,7 @@ export async function profitAndLoss(
   ];
   if (range?.from) conds.push(sql`${journalEntries.date} >= ${range.from}`);
   if (range?.to) conds.push(lte(journalEntries.date, range.to));
+  if (opts?.classId) conds.push(eq(journalEntryLines.classId, opts.classId));
 
   const rows = await ctx.db
     .select({
@@ -163,6 +171,7 @@ export async function profitAndLoss(
     netIncome: toAmountString(Money.sub(totalIncome, totalExpenses)),
     from: range?.from?.toISOString(),
     to: range?.to?.toISOString(),
+    classId: opts?.classId,
   };
 }
 

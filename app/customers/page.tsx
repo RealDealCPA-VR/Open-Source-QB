@@ -1,7 +1,7 @@
 'use client';
 
 import { Suspense, useEffect, useState } from 'react';
-import { Users, Pencil, UserX, Plus, Download } from 'lucide-react';
+import { Users, Pencil, UserX, Plus, Download, ListPlus, PlusCircle, MinusCircle } from 'lucide-react';
 import {
   Button,
   Card,
@@ -38,7 +38,18 @@ interface Customer {
   isActive: boolean;
   terms: string | null;
   notes: string | null;
+  customFields?: Record<string, string> | null;
 }
+
+/** Custom-field definitions map from GET /api/custom-fields. */
+interface CustomFieldDefs {
+  customer: Array<{ name: string }>;
+  vendor: Array<{ name: string }>;
+  item: Array<{ name: string }>;
+  invoice: Array<{ name: string }>;
+}
+
+const MAX_CUSTOM_FIELDS = 7;
 
 interface CustomerFormState {
   displayName: string;
@@ -73,9 +84,16 @@ const TERMS_OPTIONS = [
 function CustomerForm({
   form,
   onChange,
+  customFieldNames,
+  customValues,
+  onCustomChange,
 }: {
   form: CustomerFormState;
   onChange: (field: keyof CustomerFormState, value: string) => void;
+  /** Company-defined custom field names for customers (may be empty). */
+  customFieldNames: string[];
+  customValues: Record<string, string>;
+  onCustomChange: (name: string, value: string) => void;
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -146,7 +164,125 @@ function CustomerForm({
           className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy outline-none focus:border-electric focus:ring-2 focus:ring-electric/30 placeholder:text-navy/30 resize-none"
         />
       </div>
+
+      {customFieldNames.length > 0 && (
+        <div className="border-t border-slate-100 pt-4">
+          <p className="text-xs font-semibold uppercase tracking-wide text-navy/50 mb-3">
+            Custom Fields
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            {customFieldNames.map((name) => (
+              <div key={name}>
+                <Label htmlFor={`cf-${name}`}>{name}</Label>
+                <Input
+                  id={`cf-${name}`}
+                  value={customValues[name] ?? ''}
+                  onChange={(e) => onCustomChange(name, e.target.value)}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Define Custom Fields modal (QB "Define Fields" — customer list)
+// ---------------------------------------------------------------------------
+
+function DefineFieldsModal({
+  open,
+  onClose,
+  initialNames,
+  onSaved,
+}: {
+  open: boolean;
+  onClose: () => void;
+  initialNames: string[];
+  onSaved: (names: string[]) => void;
+}) {
+  const [names, setNames] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (open) setNames(initialNames.length > 0 ? [...initialNames] : ['']);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  async function handleSave() {
+    const cleaned = names.map((n) => n.trim()).filter(Boolean);
+    const lower = cleaned.map((n) => n.toLowerCase());
+    if (new Set(lower).size !== lower.length) {
+      toast('Custom field names must be unique.', 'danger');
+      return;
+    }
+    setSaving(true);
+    try {
+      const defs = await api.patch<CustomFieldDefs>('/api/custom-fields', {
+        customer: cleaned.map((name) => ({ name })),
+      });
+      toast('Custom fields updated.', 'success');
+      onSaved(defs.customer.map((d) => d.name));
+      onClose();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to save custom fields', 'danger');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Define Custom Fields (Customers)"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
+          <Button onClick={handleSave} loading={saving}>Save Fields</Button>
+        </>
+      }
+    >
+      <div className="space-y-3">
+        <p className="text-sm text-navy/70">
+          Define up to {MAX_CUSTOM_FIELDS} custom fields for customers (e.g. Account Rep,
+          Region, Referral Source). They appear on the customer form and as optional list
+          columns. Removing a name hides the field; stored values are kept.
+        </p>
+        {names.map((name, idx) => (
+          <div key={idx} className="flex items-center gap-2">
+            <Input
+              placeholder={`Field ${idx + 1} name`}
+              value={name}
+              maxLength={31}
+              onChange={(e) =>
+                setNames((prev) => prev.map((n, i) => (i === idx ? e.target.value : n)))
+              }
+            />
+            <button
+              type="button"
+              onClick={() => setNames((prev) => prev.filter((_, i) => i !== idx))}
+              disabled={names.length === 1}
+              className="text-navy/30 hover:text-red-500 disabled:opacity-20 transition-colors"
+              aria-label="Remove field"
+            >
+              <MinusCircle className="h-4 w-4" />
+            </button>
+          </div>
+        ))}
+        {names.length < MAX_CUSTOM_FIELDS && (
+          <button
+            type="button"
+            onClick={() => setNames((prev) => [...prev, ''])}
+            className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
+          >
+            <PlusCircle className="h-4 w-4" /> Add field
+          </button>
+        )}
+      </div>
+    </Modal>
   );
 }
 
@@ -159,15 +295,22 @@ function CustomersPageContent() {
   const [loading, setLoading] = useState(true);
   const [includeInactive, setIncludeInactive] = useState(false);
 
+  // Custom fields (definitions + per-modal values)
+  const [customFieldNames, setCustomFieldNames] = useState<string[]>([]);
+  const [showCustomCols, setShowCustomCols] = useState(false);
+  const [defineOpen, setDefineOpen] = useState(false);
+
   // Add modal
   const [addOpen, setAddOpen] = useState(false);
   const [addForm, setAddForm] = useState<CustomerFormState>(EMPTY_FORM);
+  const [addCustom, setAddCustom] = useState<Record<string, string>>({});
   const [addSaving, setAddSaving] = useState(false);
 
   // Edit modal
   const [editOpen, setEditOpen] = useState(false);
   const [editTarget, setEditTarget] = useState<Customer | null>(null);
   const [editForm, setEditForm] = useState<CustomerFormState>(EMPTY_FORM);
+  const [editCustom, setEditCustom] = useState<Record<string, string>>({});
   const [editSaving, setEditSaving] = useState(false);
 
   // Deactivate confirm modal
@@ -198,12 +341,43 @@ function CustomersPageContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [includeInactive]);
 
+  // Load company-defined custom fields for customers (once).
+  useEffect(() => {
+    api
+      .get<CustomFieldDefs>('/api/custom-fields')
+      .then((defs) => setCustomFieldNames(defs.customer.map((d) => d.name)))
+      .catch(() => {
+        /* non-fatal — page works without custom fields */
+      });
+  }, []);
+
+  /** Persist custom-field values for a customer (no-op when none defined). */
+  async function saveCustomValues(
+    customerId: string,
+    values: Record<string, string>,
+    opts?: { includeEmpty?: boolean },
+  ) {
+    if (customFieldNames.length === 0) return;
+    const payload: Record<string, string> = {};
+    for (const name of customFieldNames) {
+      const v = (values[name] ?? '').trim();
+      if (v !== '' || opts?.includeEmpty) payload[name] = v;
+    }
+    if (Object.keys(payload).length === 0) return;
+    await api.post('/api/custom-fields/values', {
+      entity: 'customer',
+      id: customerId,
+      values: payload,
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // Add customer
   // ---------------------------------------------------------------------------
 
   function openAddModal() {
     setAddForm(EMPTY_FORM);
+    setAddCustom({});
     setAddOpen(true);
   }
 
@@ -218,7 +392,7 @@ function CustomersPageContent() {
     }
     setAddSaving(true);
     try {
-      await api.post('/api/customers', {
+      const created = await api.post<Customer>('/api/customers', {
         displayName: addForm.displayName.trim(),
         companyName: addForm.companyName.trim() || undefined,
         email: addForm.email.trim() || undefined,
@@ -226,6 +400,16 @@ function CustomersPageContent() {
         terms: addForm.terms || undefined,
         notes: addForm.notes.trim() || undefined,
       });
+      try {
+        await saveCustomValues(created.id, addCustom);
+      } catch (cfErr) {
+        toast(
+          cfErr instanceof ApiError
+            ? `Customer created, but custom fields failed: ${cfErr.message}`
+            : 'Customer created, but custom fields failed to save',
+          'danger',
+        );
+      }
       toast('Customer created', 'success');
       setAddOpen(false);
       await fetchCustomers();
@@ -250,6 +434,7 @@ function CustomersPageContent() {
       terms: customer.terms ?? 'net_30',
       notes: customer.notes ?? '',
     });
+    setEditCustom({ ...(customer.customFields ?? {}) });
     setEditOpen(true);
   }
 
@@ -276,6 +461,17 @@ function CustomersPageContent() {
         terms: editForm.terms || null,
         notes: editForm.notes.trim() || null,
       });
+      try {
+        // includeEmpty so cleared fields are removed from the stored map.
+        await saveCustomValues(editTarget.id, editCustom, { includeEmpty: true });
+      } catch (cfErr) {
+        toast(
+          cfErr instanceof ApiError
+            ? `Customer updated, but custom fields failed: ${cfErr.message}`
+            : 'Customer updated, but custom fields failed to save',
+          'danger',
+        );
+      }
       toast('Customer updated', 'success');
       setEditOpen(false);
       setEditTarget(null);
@@ -329,6 +525,25 @@ function CustomersPageContent() {
               />
               Show inactive
             </label>
+            {customFieldNames.length > 0 && (
+              <label className="flex items-center gap-2 text-sm text-navy/60 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={showCustomCols}
+                  onChange={(e) => setShowCustomCols(e.target.checked)}
+                  className="rounded border-slate-300 text-electric focus:ring-electric/40"
+                />
+                Show custom fields
+              </label>
+            )}
+            <Button
+              variant="secondary"
+              onClick={() => setDefineOpen(true)}
+              title="Define up to 7 custom fields for customers"
+            >
+              <ListPlus className="h-4 w-4" />
+              Custom Fields
+            </Button>
             <Button
               variant="secondary"
               onClick={() => window.open('/api/export/customers.csv', '_blank')}
@@ -374,6 +589,8 @@ function CustomersPageContent() {
                 <Th>Email</Th>
                 <Th>Phone</Th>
                 <Th>Terms</Th>
+                {showCustomCols &&
+                  customFieldNames.map((name) => <Th key={name}>{name}</Th>)}
                 <Th numeric>Balance</Th>
                 <Th>Status</Th>
                 <Th className="text-right">Actions</Th>
@@ -398,6 +615,12 @@ function CustomersPageContent() {
                   </Td>
                   <Td className="text-navy/70">{c.phone ?? '-'}</Td>
                   <Td className="text-navy/70">{termsLabel(c.terms)}</Td>
+                  {showCustomCols &&
+                    customFieldNames.map((name) => (
+                      <Td key={name} className="text-navy/70">
+                        {c.customFields?.[name] || '-'}
+                      </Td>
+                    ))}
                   <Td numeric className="font-semibold text-navy">
                     {formatCurrency(c.balance)}
                   </Td>
@@ -456,7 +679,13 @@ function CustomersPageContent() {
           </>
         }
       >
-        <CustomerForm form={addForm} onChange={updateAddForm} />
+        <CustomerForm
+          form={addForm}
+          onChange={updateAddForm}
+          customFieldNames={customFieldNames}
+          customValues={addCustom}
+          onCustomChange={(name, value) => setAddCustom((prev) => ({ ...prev, [name]: value }))}
+        />
       </Modal>
 
       {/* ---- Edit customer modal ---- */}
@@ -479,8 +708,25 @@ function CustomersPageContent() {
           </>
         }
       >
-        <CustomerForm form={editForm} onChange={updateEditForm} />
+        <CustomerForm
+          form={editForm}
+          onChange={updateEditForm}
+          customFieldNames={customFieldNames}
+          customValues={editCustom}
+          onCustomChange={(name, value) => setEditCustom((prev) => ({ ...prev, [name]: value }))}
+        />
       </Modal>
+
+      {/* ---- Define custom fields modal ---- */}
+      <DefineFieldsModal
+        open={defineOpen}
+        onClose={() => setDefineOpen(false)}
+        initialNames={customFieldNames}
+        onSaved={(names) => {
+          setCustomFieldNames(names);
+          fetchCustomers();
+        }}
+      />
 
       {/* ---- Deactivate confirm modal ---- */}
       <ConfirmDialog

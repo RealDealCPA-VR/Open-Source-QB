@@ -6,6 +6,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listTimeEntries, createTimeEntry } from '@/lib/services/timeTracking';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createTimeEntrySchema } from '@/lib/validation/timeEntries';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -48,25 +50,15 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    if (!body.date) {
-      return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (body.hours === undefined || body.hours === null) {
-      return NextResponse.json({ error: 'hours is required', code: 'VALIDATION' }, { status: 400 });
+    const body = await req.json().catch(() => ({}));
+    const parsed = createTimeEntrySchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
     const entry = await createTimeEntry(ctx, {
-      employeeId: body.employeeId ?? null,
-      customerId: body.customerId ?? null,
-      jobId: body.jobId ?? null,
-      serviceItemId: body.serviceItemId ?? null,
-      date: new Date(body.date),
-      hours: body.hours,
-      billable: body.billable !== undefined ? Boolean(body.billable) : true,
-      rate: body.rate ?? null,
-      description: body.description ?? null,
+      ...parsed.data,
+      billable: parsed.data.billable ?? true,
     });
 
     return NextResponse.json(entry, { status: 201 });

@@ -11,6 +11,7 @@ import { Badge, Button, Card, Input, Label, PageHeader } from '@/components/ui';
 import { getServerContext } from '@/lib/context';
 import { balanceSheetCashBasis, type BalanceSheetCashBasis } from '@/lib/services/balanceSheetCashBasis';
 import { formatCurrency, Money } from '@/lib/money';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
 
 export const dynamic = 'force-dynamic';
 
@@ -137,6 +138,27 @@ export default async function BalanceSheetCashPage({
 
   const totalLiabAndEquity = Money.add(bs.totals.totalLiabilities, bs.totals.totalEquity);
 
+  const exportTable: ExportTable = {
+    filename: 'balance-sheet-cash',
+    title: 'Balance Sheet (Cash Basis)',
+    subtitle: `As of ${asOf.toLocaleDateString('en-US')}`,
+    columns: [{ header: 'Account' }, { header: 'Amount', numeric: true }],
+    rows: [
+      ['ASSETS', null],
+      ...bs.assets.map((l) => [l.name, l.amount] as (string | null)[]),
+      ['Total Assets', bs.totals.totalAssets],
+      ['', null],
+      ['LIABILITIES', null],
+      ...bs.liabilities.map((l) => [l.name, l.amount] as (string | null)[]),
+      ['Total Liabilities', bs.totals.totalLiabilities],
+      ['', null],
+      ['EQUITY', null],
+      ...equityLines.map((l) => [l.name, l.amount] as (string | null)[]),
+      ['Total Equity', bs.totals.totalEquity],
+    ],
+    totals: [['Total Liabilities + Equity', totalLiabAndEquity.toFixed(2)]],
+  };
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       {/* Header */}
@@ -166,8 +188,19 @@ export default async function BalanceSheetCashPage({
         </span>
       </div>
 
+      <div className="max-w-3xl">
+        <ReportToolbar
+          table={exportTable}
+          basisNav={{
+            value: 'cash',
+            accrualHref: `/reports/balance-sheet?asOf=${asOfStr}`,
+            cashHref: `/reports/balance-sheet-cash?asOf=${asOfStr}`,
+          }}
+        />
+      </div>
+
       {/* As-of date picker (plain GET form — server-rendered page) */}
-      <Card className="mb-6 max-w-3xl">
+      <Card className="mb-6 max-w-3xl print-hidden">
         <form method="get" className="flex items-end gap-3 flex-wrap p-4">
           <div>
             <Label htmlFor="bsc-asof">As of</Label>

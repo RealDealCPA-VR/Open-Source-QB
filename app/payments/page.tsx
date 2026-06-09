@@ -1,11 +1,13 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { Suspense, useEffect, useState, useCallback } from 'react';
 import { HandCoins, Plus } from 'lucide-react';
 import {
+  AmountInput,
   Button,
   Card,
   ConfirmDialog,
+  DateInput,
   EmptyState,
   Input,
   Select,
@@ -23,6 +25,7 @@ import {
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
+import { useNewParam } from '@/lib/useFocusParam';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -242,9 +245,8 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
         <div className="grid grid-cols-2 gap-3">
           <div>
             <Label htmlFor="pm-date">Payment Date</Label>
-            <Input
+            <DateInput
               id="pm-date"
-              type="date"
               value={date}
               onChange={(e) => setDate(e.target.value)}
             />
@@ -270,11 +272,8 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
         <div className="grid grid-cols-2 gap-3">
           <div>
             <Label htmlFor="pm-amount">Total Amount Received</Label>
-            <Input
+            <AmountInput
               id="pm-amount"
-              type="number"
-              min="0.01"
-              step="0.01"
               placeholder="0.00"
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
@@ -324,11 +323,7 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
                           {formatCurrency(inv.balanceDue)}
                         </Td>
                         <Td numeric>
-                          <Input
-                            type="number"
-                            min="0"
-                            step="0.01"
-                            max={inv.balanceDue}
+                          <AmountInput
                             placeholder="0.00"
                             value={applicationAmounts[inv.id] ?? ''}
                             onChange={(e) => setAppAmount(inv.id, e.target.value)}
@@ -478,11 +473,7 @@ function ApplyUnappliedModal({ open, payment, onClose, onApplied }: ApplyUnappli
                       {formatCurrency(inv.balanceDue)}
                     </Td>
                     <Td numeric>
-                      <Input
-                        type="number"
-                        min="0"
-                        step="0.01"
-                        max={inv.balanceDue}
+                      <AmountInput
                         placeholder="0.00"
                         value={amounts[inv.id] ?? ''}
                         onChange={(e) =>
@@ -605,12 +596,9 @@ function RefundPaymentModal({ open, payment, accounts, onClose, onRefunded }: Re
 
         <div>
           <Label htmlFor="rf-amount">Refund Amount *</Label>
-          <Input
+          <AmountInput
             id="rf-amount"
-            type="number"
-            min="0.01"
-            step="0.01"
-            max={payment?.unapplied}
+            placeholder="0.00"
             value={amount}
             onChange={(e) => setAmount(e.target.value)}
           />
@@ -624,7 +612,7 @@ function RefundPaymentModal({ open, payment, accounts, onClose, onRefunded }: Re
 // Main Page
 // ---------------------------------------------------------------------------
 
-export default function PaymentsPage() {
+function PaymentsPageContent() {
   const [payments, setPayments] = useState<Payment[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -678,6 +666,9 @@ export default function PaymentsPage() {
     fetchCustomers();
     fetchAccounts();
   }, [fetchPayments, fetchCustomers, fetchAccounts]);
+
+  // Quick Actions navigate here with ?new=1 — open the Receive Payment modal.
+  useNewParam(() => setModalOpen(true));
 
   async function handleVoid() {
     if (!voidTarget) return;
@@ -857,5 +848,13 @@ export default function PaymentsPage() {
         onClose={() => setVoidTarget(null)}
       />
     </main>
+  );
+}
+
+export default function PaymentsPage() {
+  return (
+    <Suspense fallback={null}>
+      <PaymentsPageContent />
+    </Suspense>
   );
 }

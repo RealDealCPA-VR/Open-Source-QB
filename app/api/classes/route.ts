@@ -8,6 +8,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listClasses, createClass } from '@/lib/services/dimensions';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createClassSchema } from '@/lib/validation/dimensions';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -37,11 +39,12 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-    const cls = await createClass(ctx, {
-      name: body.name,
-      parentId: body.parentId ?? null,
-    });
+    const body = await req.json().catch(() => ({}));
+    const parsed = createClassSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
+    const cls = await createClass(ctx, parsed.data);
     return NextResponse.json(cls, { status: 201 });
   } catch (err) {
     return errorResponse(err);

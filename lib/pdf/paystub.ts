@@ -44,6 +44,11 @@ export interface PaystubPdfData {
     ytdNet?: string | number | null;
   };
   lines: PaystubLine[];
+  /**
+   * Sick/vacation balances in hours. Optional and additive — a small balances
+   * line is rendered beneath the net-pay box only when present.
+   */
+  accruals?: { sickBalance: string | number; vacationBalance: string | number } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +344,17 @@ export async function renderPaystubPdf(data: PaystubPdfData): Promise<Uint8Array
       color: COLOR_GRAY,
       rightAlign: true,
     });
+    cursor -= 14;
+  }
+
+  // Sick/vacation balances (hours) — only when provided.
+  if (data.accruals) {
+    drawText(
+      `Sick balance: ${data.accruals.sickBalance} hrs   •   Vacation balance: ${data.accruals.vacationBalance} hrs`,
+      MARGIN_L,
+      cursor + 6,
+      { size: 9, color: COLOR_GRAY },
+    );
     cursor -= 14;
   }
 

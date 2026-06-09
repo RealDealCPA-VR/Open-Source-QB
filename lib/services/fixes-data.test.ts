@@ -32,8 +32,12 @@ vi.mock('@/lib/auth', async (importOriginal) => {
   return { ...actual, getSessionUserId: async () => session.userId };
 });
 
+import { NextRequest } from 'next/server';
 import { GET as companiesGET, POST as companiesPOST } from '@/app/api/companies/route';
 import { GET as backupGET, POST as backupPOST } from '@/app/api/backup/route';
+
+/** GET /api/companies now takes the request (for ?includeArchived=1). */
+const companiesGetRequest = () => new NextRequest('http://localhost/api/companies');
 
 const jsonRequest = (url: string, body: unknown) =>
   new Request(url, {
@@ -235,7 +239,7 @@ describe('route auth — /api/companies and /api/backup', () => {
 
   it('first-run GET /api/companies without a session is allowed (onboarding boot)', async () => {
     session.userId = null;
-    const res = await companiesGET();
+    const res = await companiesGET(companiesGetRequest());
     expect(res.status).toBe(200);
     const list = await res.json();
     expect(Array.isArray(list)).toBe(true);
@@ -244,7 +248,7 @@ describe('route auth — /api/companies and /api/backup', () => {
 
   it('unauthenticated GET/POST /api/companies fail closed once a user exists', async () => {
     session.userId = null; // a user now exists (seeded by first-run above)
-    const get = await companiesGET();
+    const get = await companiesGET(companiesGetRequest());
     expect(get.status).toBe(401);
 
     const post = await companiesPOST(
@@ -270,7 +274,7 @@ describe('route auth — /api/companies and /api/backup', () => {
 
     // B only sees B's companies — not A's, not the seeded demo company.
     session.userId = userBId;
-    const res = await companiesGET();
+    const res = await companiesGET(companiesGetRequest());
     expect(res.status).toBe(200);
     const names = ((await res.json()) as Array<{ name: string }>).map((c) => c.name);
     expect(names).toContain('B Co');

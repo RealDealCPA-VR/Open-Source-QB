@@ -6,11 +6,12 @@
  * Balances of 2200 / 2300 are derived from posted journal entries, not cached
  * columns, so they remain accurate even after void/adjustment entries.
  */
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, gte, lte, sql } from 'drizzle-orm';
 import { accounts, journalEntries, journalEntryLines, taxAgencies } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, notFound, validation } from './_base';
 import { postJournalEntry } from './posting';
+import { salesTaxByAgency } from './combinedTax';
 
 // ── COA codes fixed by the project spec ─────────────────────────────────────
 const CODE_SALES_TAX_PAYABLE = '2200';
@@ -75,10 +76,13 @@ export interface PaySalesTaxInput {
 
 /**
  * Pay sales tax:
- *   Dr 2200 Sales Tax Payable  <amount>
- *   Cr <paymentAccountId>      <amount>
+ *   Dr <agency liability account, else 2200 Sales Tax Payable>  <amount>
+ *   Cr <paymentAccountId>                                       <amount>
  *
- * Reduces the Sales Tax Payable liability and drains the bank account.
+ * Reduces the Sales Tax Payable liability and drains the bank account. When an
+ * agencyId is passed and that agency has its own liabilityAccountId, the debit
+ * posts against the agency's account (per-agency liability tracking); otherwise
+ * it falls back to the company-wide 2200.
  */
 export async function paySalesTax(ctx: ServiceContext, input: PaySalesTaxInput) {
   const amt = Money.of(input.amount);
@@ -86,20 +90,27 @@ export async function paySalesTax(ctx: ServiceContext, input: PaySalesTaxInput) 
     throw validation('Payment amount must be greater than zero.');
   }
 
-  const salesTaxAccountId = await accountIdByCode(ctx, CODE_SALES_TAX_PAYABLE);
-  const amtStr = toAmountString(amt);
-
-  // Human-readable description: use the agency's display name, never its UUID
-  // (the id stays machine-readable in sourceRef below). Skip the lookup for
-  // non-UUID refs — comparing them against a uuid column would error.
+  // Agency lookup: drives both the debit account and the description. Skip for
+  // non-UUID refs — comparing them against a uuid column would error (the ref
+  // still lands in sourceRef below for traceability).
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  let description = input.memo?.trim() || 'Pay Sales Tax';
-  if (!input.memo?.trim() && input.agencyId && UUID_RE.test(input.agencyId)) {
-    const [agency] = await ctx.db
-      .select({ name: taxAgencies.name })
+  let agency: { name: string; liabilityAccountId: string | null } | null = null;
+  if (input.agencyId && UUID_RE.test(input.agencyId)) {
+    const [row] = await ctx.db
+      .select({ name: taxAgencies.name, liabilityAccountId: taxAgencies.liabilityAccountId })
       .from(taxAgencies)
       .where(and(eq(taxAgencies.companyId, ctx.companyId), eq(taxAgencies.id, input.agencyId)));
-    if (agency) description = `Pay Sales Tax — ${agency.name}`;
+    agency = row ?? null;
+  }
+
+  const salesTaxAccountId =
+    agency?.liabilityAccountId ?? (await accountIdByCode(ctx, CODE_SALES_TAX_PAYABLE));
+  const amtStr = toAmountString(amt);
+
+  // Human-readable description: use the agency's display name, never its UUID.
+  let description = input.memo?.trim() || 'Pay Sales Tax';
+  if (!input.memo?.trim() && agency) {
+    description = `Pay Sales Tax — ${agency.name}`;
   }
 
   return postJournalEntry(ctx, {
@@ -329,4 +340,138 @@ export async function salesTaxDue(ctx: ServiceContext): Promise<string> {
 export async function payrollLiabilitiesDue(ctx: ServiceContext): Promise<string> {
   const accountId = await accountIdByCode(ctx, CODE_PAYROLL_LIABILITIES);
   return creditBalance(ctx, accountId);
+}
+
+// ── Sales tax by agency (QB Pay Sales Tax grid) ──────────────────────────────
+
+export interface AgencyLiabilityRow {
+  /** null = tax collected with no agency link (single-rate, uncomponentized). */
+  agencyId: string | null;
+  agencyName: string | null;
+  /** The agency's dedicated liability account (payments post here when set; else 2200). */
+  liabilityAccountId: string | null;
+  /** Tax collected on invoices in the range, allocated to this agency via rate components. */
+  collected: string;
+  /** Payments remitted to this agency in the range (entries sourceRef "tax_agency:<id>"). */
+  paid: string;
+  /** collected - paid. */
+  balance: string;
+}
+
+export interface SalesTaxLiabilityByAgencyResult {
+  rows: AgencyLiabilityRow[];
+  totalCollected: string;
+  totalPaid: string;
+  totalBalance: string;
+}
+
+/**
+ * Per-agency sales-tax liability for the QB "Pay Sales Tax" screen.
+ *
+ * Collected: invoice tax allocated across tax-rate components → agencies
+ * (delegates to combinedTax.salesTaxByAgency). Rates without components or
+ * components without an agency land in the null-agency bucket.
+ *
+ * Paid: posted journal entries stamped sourceRef "tax_agency:<id>" (what
+ * paySalesTax writes), summed by their liability-side debits. Voided payments
+ * are excluded by status. Agency-less payments are not attributable and are
+ * not netted against any bucket.
+ */
+export async function salesTaxLiabilityByAgency(
+  ctx: ServiceContext,
+  range?: { from?: Date; to?: Date },
+): Promise<SalesTaxLiabilityByAgencyResult> {
+  // 1) Collected per agency (component allocation).
+  const collectedReport = await salesTaxByAgency(ctx, range);
+  const collectedByAgency = new Map<string | null, ReturnType<typeof Money.zero>>();
+  for (const row of collectedReport.rows) {
+    const key = row.agencyId ?? null;
+    collectedByAgency.set(
+      key,
+      (collectedByAgency.get(key) ?? Money.zero()).plus(Money.of(row.taxCollected)),
+    );
+  }
+
+  // 2) All agencies for this company (so zero-collected agencies still list).
+  const agencies = await ctx.db
+    .select({
+      id: taxAgencies.id,
+      name: taxAgencies.name,
+      liabilityAccountId: taxAgencies.liabilityAccountId,
+    })
+    .from(taxAgencies)
+    .where(eq(taxAgencies.companyId, ctx.companyId));
+
+  // 3) Payments per agency: liability-side debits of posted "tax_agency:<id>" entries.
+  const paidConds = [
+    eq(journalEntries.companyId, ctx.companyId),
+    eq(journalEntries.status, 'posted'),
+    sql`${journalEntries.sourceRef} LIKE 'tax_agency:%'`,
+    sql`${journalEntryLines.debit} > 0`,
+  ];
+  if (range?.from) paidConds.push(gte(journalEntries.date, range.from));
+  if (range?.to) paidConds.push(lte(journalEntries.date, range.to));
+
+  const paidRows = await ctx.db
+    .select({
+      sourceRef: journalEntries.sourceRef,
+      paid: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(and(...paidConds))
+    .groupBy(journalEntries.sourceRef);
+
+  const paidByAgency = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const row of paidRows) {
+    const agencyId = row.sourceRef?.slice('tax_agency:'.length);
+    if (!agencyId) continue;
+    paidByAgency.set(
+      agencyId,
+      (paidByAgency.get(agencyId) ?? Money.zero()).plus(Money.of(row.paid)),
+    );
+  }
+
+  // 4) Merge: every agency + the null bucket when it carries collected tax.
+  const rows: AgencyLiabilityRow[] = [];
+  let totalCollected = Money.zero();
+  let totalPaid = Money.zero();
+
+  for (const agency of agencies) {
+    const collected = collectedByAgency.get(agency.id) ?? Money.zero();
+    const paid = paidByAgency.get(agency.id) ?? Money.zero();
+    totalCollected = totalCollected.plus(collected);
+    totalPaid = totalPaid.plus(paid);
+    rows.push({
+      agencyId: agency.id,
+      agencyName: agency.name,
+      liabilityAccountId: agency.liabilityAccountId,
+      collected: toAmountString(collected),
+      paid: toAmountString(paid),
+      balance: toAmountString(collected.minus(paid)),
+    });
+  }
+
+  const unassigned = collectedByAgency.get(null) ?? Money.zero();
+  if (unassigned.greaterThan(0)) {
+    totalCollected = totalCollected.plus(unassigned);
+    rows.push({
+      agencyId: null,
+      agencyName: null,
+      liabilityAccountId: null,
+      collected: toAmountString(unassigned),
+      paid: '0.00',
+      balance: toAmountString(unassigned),
+    });
+  }
+
+  // Largest balances first; null bucket naturally sorts by its balance too.
+  rows.sort((a, b) => Money.of(b.balance).comparedTo(Money.of(a.balance)));
+
+  return {
+    rows,
+    totalCollected: toAmountString(totalCollected),
+    totalPaid: toAmountString(totalPaid),
+    totalBalance: toAmountString(totalCollected.minus(totalPaid)),
+  };
 }

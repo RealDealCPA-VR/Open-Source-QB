@@ -7,7 +7,7 @@
  * Request body:
  *   {
  *     bankAccountId: string;       // UUID of the bankAccounts row
- *     fileType: "ofx" | "qbo" | "csv";
+ *     fileType: "ofx" | "qfx" | "qbo" | "csv";
  *     content: string;             // raw file text (base64 is NOT required; send as-is)
  *     csvMapping?: {               // required when fileType === "csv"
  *       dateCol: string | number;
@@ -59,9 +59,9 @@ export async function POST(req: NextRequest) {
         { status: 400 },
       );
     }
-    if (!body.fileType || !['ofx', 'qbo', 'csv'].includes(body.fileType)) {
+    if (!body.fileType || !['ofx', 'qfx', 'qbo', 'csv'].includes(body.fileType)) {
       return NextResponse.json(
-        { error: 'fileType must be one of: ofx, qbo, csv', code: 'VALIDATION' },
+        { error: 'fileType must be one of: ofx, qfx, qbo, csv', code: 'VALIDATION' },
         { status: 400 },
       );
     }

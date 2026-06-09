@@ -20,6 +20,8 @@ import {
   convertToBill,
 } from '@/lib/services/purchaseOrders';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { purchaseOrderActionSchema } from '@/lib/validation/purchaseOrders';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -59,57 +61,29 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
-    const action = body?.action as string | undefined;
+    const body = await req.json().catch(() => ({}));
+    const parsed = purchaseOrderActionSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
 
-    if (action === 'convert') {
-      let lines: { lineId: string; quantity: string | number }[] | undefined;
-      if (body.lines !== undefined) {
-        if (!Array.isArray(body.lines) || body.lines.length === 0) {
-          return NextResponse.json(
-            { error: 'lines must be a non-empty array of { lineId, quantity }', code: 'VALIDATION' },
-            { status: 400 },
-          );
-        }
-        for (const l of body.lines) {
-          if (!l || typeof l.lineId !== 'string' || l.quantity == null) {
-            return NextResponse.json(
-              { error: 'Each billing line requires lineId and quantity', code: 'VALIDATION' },
-              { status: 400 },
-            );
-          }
-        }
-        lines = body.lines.map((l: { lineId: string; quantity: string | number }) => ({
-          lineId: l.lineId,
-          quantity: l.quantity,
-        }));
-      }
-
+    if (parsed.data.action === 'convert') {
       const bill = await convertToBill(ctx, id, {
-        lines,
-        date: body.date ? new Date(body.date) : undefined,
-        billNumber: body.billNumber ?? null,
+        lines: parsed.data.lines,
+        date: parsed.data.date,
+        billNumber: parsed.data.billNumber ?? null,
       });
       return NextResponse.json(bill);
     }
 
-    if (action === 'void') {
+    if (parsed.data.action === 'void') {
       const po = await updateStatus(ctx, id, 'void');
       return NextResponse.json(po);
     }
 
-    if (action === 'close') {
-      const po = await updateStatus(ctx, id, 'closed');
-      return NextResponse.json(po);
-    }
-
-    return NextResponse.json(
-      {
-        error: `Unknown action: ${action}. Expected 'convert', 'void', or 'close'.`,
-        code: 'VALIDATION',
-      },
-      { status: 400 },
-    );
+    // action === 'close'
+    const po = await updateStatus(ctx, id, 'closed');
+    return NextResponse.json(po);
   } catch (err) {
     return errorResponse(err);
   }

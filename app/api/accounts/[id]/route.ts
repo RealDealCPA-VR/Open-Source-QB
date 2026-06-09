@@ -7,6 +7,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getAccount, updateAccount, deactivateAccount } from '@/lib/services/accounts';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { updateAccountSchema } from '@/lib/validation/accounts';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -40,8 +42,12 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
-    return NextResponse.json(await updateAccount(ctx, id, body));
+    const body = await req.json().catch(() => ({}));
+    const parsed = updateAccountSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
+    return NextResponse.json(await updateAccount(ctx, id, parsed.data));
   } catch (err) {
     return errorResponse(err);
   }

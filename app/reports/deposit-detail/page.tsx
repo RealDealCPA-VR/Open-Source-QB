@@ -10,7 +10,8 @@ import { Landmark } from 'lucide-react';
 import { Button, Card, PageHeader, Table, Th, Td, Tr, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
-import { RangeControls, downloadCsv, fmtDate, todayStr, yearStartStr, type CsvCell } from '../_components/shared';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
+import { RangeControls, fmtDate, todayStr, yearStartStr, type CsvCell } from '../_components/shared';
 
 interface DepositDetailLine {
   description: string | null;
@@ -62,8 +63,8 @@ export default function DepositDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const exportCsv = () => {
-    if (!data) return;
+  const buildTable = (): ExportTable | null => {
+    if (!data) return null;
     const rows: CsvCell[][] = [];
     for (const r of data.rows) {
       rows.push([fmtDate(r.date), r.accountName, r.memo ?? '', r.voided ? 'VOID' : '', r.total]);
@@ -71,28 +72,29 @@ export default function DepositDetailPage() {
         rows.push(['', `  ${l.customerName ?? l.description ?? 'Deposit line'}`, l.description ?? '', '', l.amount]);
       }
     }
-    rows.push(['TOTAL (non-void)', '', '', '', data.total]);
-    downloadCsv(
-      'deposit-detail.csv',
-      `Deposit Detail — ${fmtDate(data.from)} to ${fmtDate(data.to)}`,
-      ['Date', 'Account / Received From', 'Memo', 'Void', 'Amount'],
+    return {
+      filename: 'deposit-detail',
+      title: 'Deposit Detail',
+      subtitle: `${fmtDate(data.from)} to ${fmtDate(data.to)}`,
+      columns: [
+        { header: 'Date' },
+        { header: 'Account / Received From' },
+        { header: 'Memo' },
+        { header: 'Void' },
+        { header: 'Amount', numeric: true },
+      ],
       rows,
-    );
+      totals: [['TOTAL (non-void)', '', '', '', data.total]],
+    };
   };
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader
-        title="Deposit Detail"
-        icon={Landmark}
-        action={
-          <Button variant="secondary" size="sm" disabled={!data || loading} onClick={exportCsv}>
-            Download CSV
-          </Button>
-        }
-      />
+      <PageHeader title="Deposit Detail" icon={Landmark} />
 
-      <Card className="p-4 mb-4">
+      <ReportToolbar table={buildTable()} disabled={loading} />
+
+      <Card className="p-4 mb-4 print-hidden">
         <RangeControls from={from} to={to} onFrom={setFrom} onTo={setTo} onRun={load} />
       </Card>
 

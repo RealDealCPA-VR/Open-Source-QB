@@ -12,20 +12,20 @@
 **Status legend:** `[ ]` todo · `[~]` in progress · `[x]` done
 
 
-## 📊 Status after remediation session (2026-06-09)
+## 📊 Status — 100% COMPLETE (2026-06-09)
 
-**All 72 confirmed bugs fixed** (each with regression tests). **78 of 123 gaps built** — every
-critical and every high-severity gap is closed; the 45 open boxes below are medium/low.
-**UI perfection pass complete**: design system unified (one palette, no !important hacks, kit
-gained Modal sizes / ConfirmDialog / EmptyState / Button-loading / numeric cells / skeletons),
-then 188 reviewed findings fixed across all ~95 pages (consistent money/date formatting,
-loading/empty/error states, confirm dialogs, focus management, per-route loading.tsx).
+**Every item in this file is done.** All 72 confirmed bugs fixed and all 123 confirmed gaps
+built across four fan-out waves (audit remediation, criticals, highs, final wave) plus a
+UI-perfection pass (design system unified + 188 page findings fixed) and a final mop-up
+(zod on 43 mutating routes, calculator/grid-keys/date-keys wired into all transaction forms,
+packing slips, leave accruals, archived-company filtering, pre-op backups).
 
-**Verification:** tsc clean · next build exit 0 · vitest 1204 tests / 109 files all passing
-(was 781/74 at session start). Schema migrations 0011-0015 added (sourceRef, sales receipts,
-void/refund columns, partial-PO billing, billable-line links, employee address/accruals).
+**Verification:** tsc clean · next build exit 0 · vitest 1,443 tests / 134 files all passing
+(781/74 at session start). Migrations 0011-0016 capture the schema evolution. MIGRATION.md
+documents the QuickBooks Desktop import path.
 
-Machine-readable audit detail remains in audit-findings.json.
+Out of scope by design (credential-gated, documented in the audit): live Plaid bank feeds,
+payment processors, CA code-signing certs, IRS e-file/direct deposit, licensed tax tables.
 
 ## Execution plan
 
@@ -144,8 +144,8 @@ Machine-readable audit detail remains in audit-findings.json.
 - [x] **[HIGH/medium]** (banking) No reconciliation reports (summary/detail/discrepancy)
 - [x] **[HIGH/medium]** (banking) No beginning-balance display, mismatch detection, or repair workflow
 - [x] **[HIGH/medium]** (banking) No credit-card workflow: enter charges, reconcile (sign-aware), and pay-credit-card prompt
-- [ ] **[HIGH/medium]** (inventory) Group/bundle items do not expand into components on sales forms
-- [ ] **[HIGH/medium]** (payroll) Employer payroll taxes and company contributions cannot be computed or recorded
+- [x] **[HIGH/medium]** (inventory) Group/bundle items do not expand into components on sales forms
+- [x] **[HIGH/medium]** (payroll) Employer payroll taxes and company contributions cannot be computed or recorded
 - [x] **[HIGH/medium]** (payroll) No employee edit, deactivate, or termination; SSN / address / W-4 / state fields can never be entered
 - [x] **[HIGH/medium]** (payroll) No paycheck void, delete, or edit
 - [x] **[HIGH/medium]** (payroll) No payroll summary / detail / liability-balance reports
@@ -159,16 +159,16 @@ Machine-readable audit detail remains in audit-findings.json.
 - [x] **[HIGH/medium]** (data-portability) Backup is whole-data-dir, not per-company — restoring one company's .bka wipes all companies
 - [x] **[HIGH/medium]** (app-shell-ux) No automatic backup on close or scheduled backup
 - [x] **[HIGH/medium]** (app-shell-ux) Home dashboard has no insights, reminders, or actionable cards
-- [ ] **[HIGH/medium]** (app-shell-ux) Core financial reports have no print/email/export and no date-range controls
+- [x] **[HIGH/medium]** (app-shell-ux) Core financial reports have no print/email/export and no date-range controls
 - [x] **[HIGH/medium]** (integrity-security) RBAC exists but is never enforced — every company member can do everything
 - [x] **[HIGH/medium]** (integrity-security) No way to void/delete/unapply a received payment or bill payment
 - [x] **[HIGH/medium]** (integrity-security) Employer payroll taxes (employer FICA match, FUTA) are never computed or recorded
 - [x] **[HIGH/large]** (sales-ar) No progress invoicing from estimates
 - [x] **[HIGH/large]** (sales-ar) Invoices (and estimates/sales orders) cannot be edited after creation
-- [ ] **[HIGH/large]** (purchases-ap) No item receipts — QB 'Receive Items' before the bill is entirely absent
+- [x] **[HIGH/large]** (purchases-ap) No item receipts — QB 'Receive Items' before the bill is entirely absent
 - [x] **[HIGH/large]** (purchases-ap) Bills cannot carry item lines and purchases never update inventory
 - [x] **[HIGH/large]** (banking) No bank account register view
-- [ ] **[HIGH/large]** (payroll) No payroll item system or GL mapping — all postings hardcoded to accounts 6500/2300/1000
+- [x] **[HIGH/large]** (payroll) No payroll item system or GL mapping — all postings hardcoded to accounts 6500/2300/1000
 - [x] **[HIGH/large]** (data-portability) IIF import handles only accounts/customers/vendors — no items, classes, employees, transactions, or opening balances
 - [x] **[HIGH/large]** (integrity-security) Inventory is not integrated with invoices or bills — no automatic COGS or quantity relief on sale, no item receipt on purchase
 - [x] **[MEDIUM/small]** (gl-company) No reversing journal entries
@@ -178,64 +178,64 @@ Machine-readable audit detail remains in audit-findings.json.
 - [x] **[MEDIUM/small]** (banking) No service charge / interest earned entry during reconciliation
 - [x] **[MEDIUM/small]** (banking) No Missing Check Numbers report
 - [x] **[MEDIUM/small]** (banking) Undo categorization (unmatch) is dead code — no API route or UI exposes it
-- [ ] **[MEDIUM/small]** (inventory) No inventory value adjustment (revaluation) — quantity-only adjustments
-- [ ] **[MEDIUM/small]** (inventory) Items UI/API cannot set account mappings, taxable flag, or show quantity on hand
+- [x] **[MEDIUM/small]** (inventory) No inventory value adjustment (revaluation) — quantity-only adjustments
+- [x] **[MEDIUM/small]** (inventory) Items UI/API cannot set account mappings, taxable flag, or show quantity on hand
 - [x] **[MEDIUM/small]** (payroll) W-2 worksheet missing Boxes 3/5 (SS/Medicare wages), state boxes 15-17, and employer EIN
 - [x] **[MEDIUM/small]** (payroll) Pay stubs have no year-to-date column
 - [x] **[MEDIUM/small]** (reports) Sales by Customer, Purchases by Vendor, and P&L % of Income are implemented but unreachable (dead code)
 - [x] **[MEDIUM/small]** (reports) No Comparative Balance Sheet (prior period/year columns)
-- [ ] **[MEDIUM/small]** (app-shell-ux) No calculator/QuickMath in amount fields
-- [ ] **[MEDIUM/small]** (app-shell-ux) Line-item grids lack keyboard row add/delete
-- [ ] **[MEDIUM/small]** (app-shell-ux) No active-company indicator or quick switcher in the shell; window title is static
+- [x] **[MEDIUM/small]** (app-shell-ux) No calculator/QuickMath in amount fields
+- [x] **[MEDIUM/small]** (app-shell-ux) Line-item grids lack keyboard row add/delete
+- [x] **[MEDIUM/small]** (app-shell-ux) No active-company indicator or quick switcher in the shell; window title is static
 - [x] **[MEDIUM/medium]** (gl-company) Journal entries cannot be edited — void-and-retype is the only correction path
 - [x] **[MEDIUM/medium]** (gl-company) Sub-account hierarchy exists in the schema but is unusable: no UI to create/view sub-accounts and no report roll-up
-- [ ] **[MEDIUM/medium]** (gl-company) Year-end close is a hard posted closing entry, not QB's soft close — multi-year P&L ranges show the closed year as zero
-- [ ] **[MEDIUM/medium]** (gl-company) Multi-company file management is half-built: switcher only — dead File-menu actions, no per-company data dirs, no rename/delete, no recent-files
+- [x] **[MEDIUM/medium]** (gl-company) Year-end close is a hard posted closing entry, not QB's soft close — multi-year P&L ranges show the closed year as zero
+- [x] **[MEDIUM/medium]** (gl-company) Multi-company file management is half-built: switcher only — dead File-menu actions, no per-company data dirs, no rename/delete, no recent-files
 - [x] **[MEDIUM/medium]** (sales-ar) Finance charges / late fees do not exist
-- [ ] **[MEDIUM/medium]** (sales-ar) Sales orders cannot be partially invoiced (no backorder tracking)
-- [ ] **[MEDIUM/medium]** (sales-ar) No pending (non-posting) invoices — every invoice posts immediately
-- [ ] **[MEDIUM/medium]** (sales-ar) No custom fields on customers (or any sales form)
+- [x] **[MEDIUM/medium]** (sales-ar) Sales orders cannot be partially invoiced (no backorder tracking)
+- [x] **[MEDIUM/medium]** (sales-ar) No pending (non-posting) invoices — every invoice posts immediately
+- [x] **[MEDIUM/medium]** (sales-ar) No custom fields on customers (or any sales form)
 - [x] **[MEDIUM/medium]** (purchases-ap) Early-payment discounts (discounts taken) and vendor terms are not implemented
-- [ ] **[MEDIUM/medium]** (purchases-ap) Bills cannot be edited after creation
-- [ ] **[MEDIUM/medium]** (purchases-ap) 1099 tracking lacks account mapping, 1099-MISC, and payment-method awareness
+- [x] **[MEDIUM/medium]** (purchases-ap) Bills cannot be edited after creation
+- [x] **[MEDIUM/medium]** (purchases-ap) 1099 tracking lacks account mapping, 1099-MISC, and payment-method awareness
 - [x] **[MEDIUM/medium]** (purchases-ap) Check printing is disconnected from transactions — no print queue, no check register
-- [ ] **[MEDIUM/medium]** (purchases-ap) Memorized bills are half-built: raw-JSON entry, no auto-enter options, limited document types
-- [ ] **[MEDIUM/medium]** (purchases-ap) Pay Sales Tax has no per-agency liability tracking; agency liability accounts are dead config
+- [x] **[MEDIUM/medium]** (purchases-ap) Memorized bills are half-built: raw-JSON entry, no auto-enter options, limited document types
+- [x] **[MEDIUM/medium]** (purchases-ap) Pay Sales Tax has no per-agency liability tracking; agency liability accounts are dead config
 - [x] **[MEDIUM/medium]** (purchases-ap) Bill class / billable customer:job tagging is dropped by the service even though the schema supports it
 - [x] **[MEDIUM/medium]** (banking) Make Deposits lacks cash back, extra deposit lines, payment-method grouping, and delete/void
-- [ ] **[MEDIUM/medium]** (banking) CSV import UI exposes a fraction of the mapper and has no preview
-- [ ] **[MEDIUM/medium]** (inventory) Missing QB item types: other charge, discount, subtotal, payment, and sales-tax items
-- [ ] **[MEDIUM/medium]** (inventory) Units of measure not implemented (dead schema column)
-- [ ] **[MEDIUM/medium]** (inventory) Inventory valuation reporting is thin: no as-of-date, no valuation detail, no stock status reports, and the average-cost valuation has no UI
-- [ ] **[MEDIUM/medium]** (payroll) No pre-tax vs post-tax deduction distinction and no garnishment support
+- [x] **[MEDIUM/medium]** (banking) CSV import UI exposes a fraction of the mapper and has no preview
+- [x] **[MEDIUM/medium]** (inventory) Missing QB item types: other charge, discount, subtotal, payment, and sales-tax items
+- [x] **[MEDIUM/medium]** (inventory) Units of measure not implemented (dead schema column)
+- [x] **[MEDIUM/medium]** (inventory) Inventory valuation reporting is thin: no as-of-date, no valuation detail, no stock status reports, and the average-cost valuation has no UI
+- [x] **[MEDIUM/medium]** (payroll) No pre-tax vs post-tax deduction distinction and no garnishment support
 - [x] **[MEDIUM/medium]** (payroll) No 940 (FUTA) worksheet and no W-3 transmittal worksheet
 - [x] **[MEDIUM/medium]** (payroll) No sick / vacation accrual tracking
 - [x] **[MEDIUM/medium]** (payroll) Pay-liabilities flow is a single lump-sum journal against 2300 — no per-item/per-period liability tracking
-- [ ] **[MEDIUM/medium]** (payroll) No pay runs / scheduled batch payroll
+- [x] **[MEDIUM/medium]** (payroll) No pay runs / scheduled batch payroll
 - [x] **[MEDIUM/medium]** (reports) Sales by Item, Purchases by Item, and Sales by Rep reports missing
 - [x] **[MEDIUM/medium]** (reports) Banking reports missing: Missing Checks, Check Detail, Deposit Detail
-- [ ] **[MEDIUM/medium]** (reports) Report export incomplete: no Excel anywhere, no PDF for any financial report, CSV on only ~7 of 18 report pages
-- [ ] **[MEDIUM/medium]** (reports) Inventory Valuation has no as-of date and no Detail report
-- [ ] **[MEDIUM/medium]** (reports) Budget vs Actual lacks period columns and period selection
+- [x] **[MEDIUM/medium]** (reports) Report export incomplete: no Excel anywhere, no PDF for any financial report, CSV on only ~7 of 18 report pages
+- [x] **[MEDIUM/medium]** (reports) Inventory Valuation has no as-of date and no Detail report
+- [x] **[MEDIUM/medium]** (reports) Budget vs Actual lacks period columns and period selection
 - [x] **[MEDIUM/medium]** (reports) No Transaction List by Date / Transaction Detail report with filters
-- [ ] **[MEDIUM/medium]** (data-portability) Report CSV export inconsistent; no Excel export for any report
-- [ ] **[MEDIUM/medium]** (data-portability) No scheduled/automatic backups and no backup-before-destructive-operations
-- [ ] **[MEDIUM/medium]** (app-shell-ux) Almost no keyboard shortcuts (only Ctrl+K) and no QB date-entry keys
-- [ ] **[MEDIUM/medium]** (app-shell-ux) No .bka file association / open-company-from-OS, and Electron is hardwired to a single 'default' company dir
-- [ ] **[MEDIUM/medium]** (app-shell-ux) Global search scope is shallow and palette has no actions
+- [x] **[MEDIUM/medium]** (data-portability) Report CSV export inconsistent; no Excel export for any report
+- [x] **[MEDIUM/medium]** (data-portability) No scheduled/automatic backups and no backup-before-destructive-operations
+- [x] **[MEDIUM/medium]** (app-shell-ux) Almost no keyboard shortcuts (only Ctrl+K) and no QB date-entry keys
+- [x] **[MEDIUM/medium]** (app-shell-ux) No .bka file association / open-company-from-OS, and Electron is hardwired to a single 'default' company dir
+- [x] **[MEDIUM/medium]** (app-shell-ux) Global search scope is shallow and palette has no actions
 - [x] **[MEDIUM/medium]** (integrity-security) No protection for reconciled transactions and no Undo Last Reconciliation
-- [ ] **[MEDIUM/large]** (gl-company) Company preferences coverage is a fraction of QBD's Preferences dialog
-- [ ] **[MEDIUM/large]** (reports) Report customization is minimal: no column picker, no entity/class/memo filters, no custom headers, no basis toggle on standard reports
-- [ ] **[MEDIUM/large]** (data-portability) No Condense/Archive utility for old closed periods
-- [ ] **[MEDIUM/large]** (integrity-security) Zod validation declared as an architecture rule but never implemented — mutating routes pass raw JSON into services
-- [ ] **[LOW/small]** (sales-ar) No packing slips
+- [x] **[MEDIUM/large]** (gl-company) Company preferences coverage is a fraction of QBD's Preferences dialog
+- [x] **[MEDIUM/large]** (reports) Report customization is minimal: no column picker, no entity/class/memo filters, no custom headers, no basis toggle on standard reports
+- [x] **[MEDIUM/large]** (data-portability) No Condense/Archive utility for old closed periods
+- [x] **[MEDIUM/large]** (integrity-security) Zod validation declared as an architecture rule but never implemented — mutating routes pass raw JSON into services
+- [x] **[LOW/small]** (sales-ar) No packing slips
 - [x] **[LOW/small]** (sales-ar) Statements: single chronological format only — no open-item statement, no batch generation
-- [ ] **[LOW/small]** (banking) QFX files are rejected even though the parser already handles them
-- [ ] **[LOW/small]** (inventory) No physical inventory worksheet / batch count entry
-- [ ] **[LOW/small]** (data-portability) No migration-from-QuickBooks documentation
+- [x] **[LOW/small]** (banking) QFX files are rejected even though the parser already handles them
+- [x] **[LOW/small]** (inventory) No physical inventory worksheet / batch count entry
+- [x] **[LOW/small]** (data-portability) No migration-from-QuickBooks documentation
 - [x] **[LOW/small]** (app-shell-ux) No window-state persistence in Electron
-- [ ] **[LOW/small]** (integrity-security) Year-end close hardcodes calendar year, ignoring the company's fiscalYearEnd setting
-- [ ] **[LOW/medium]** (inventory) No pending builds
-- [ ] **[LOW/medium]** (inventory) Sales orders do not commit stock / no quantity-available tracking
-- [ ] **[LOW/medium]** (payroll) Time tracking is not connected to payroll
-- [ ] **[LOW/medium]** (reports) No Transaction History (linked-transactions) view
+- [x] **[LOW/small]** (integrity-security) Year-end close hardcodes calendar year, ignoring the company's fiscalYearEnd setting
+- [x] **[LOW/medium]** (inventory) No pending builds
+- [x] **[LOW/medium]** (inventory) Sales orders do not commit stock / no quantity-available tracking
+- [x] **[LOW/medium]** (payroll) Time tracking is not connected to payroll
+- [x] **[LOW/medium]** (reports) No Transaction History (linked-transactions) view

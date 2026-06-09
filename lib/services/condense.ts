@@ -1,0 +1,565 @@
+/**
+ * Condense / Archive utility (QB Desktop "Condense Data" parity).
+ *
+ * `condensePeriod(ctx, { beforeDate })` replaces detailed journal entries dated
+ * BEFORE the cutoff with ONE summary journal entry per month, whose lines carry
+ * the exact gross debit/credit totals per (account, class). This preserves:
+ *   - every account's balance trajectory (monthly trial balances are identical),
+ *   - gross debit/credit column totals,
+ *   - class (department) totals,
+ *   - the cached `accounts.balance` values (net GL change is exactly zero).
+ *
+ * What is removed (IRREVERSIBLY, except via the archive backup written first):
+ *   - the detailed journal entries + lines before the cutoff,
+ *   - voided entries before the cutoff,
+ *   - reconciliation detail items of COMPLETED reconciliations that pointed at
+ *     removed lines (the reconciliation summary rows + last-reconciled balance stay),
+ *   - matched bank-feed staging rows linked to removed entries,
+ *   - GL drill-down links (postedEntryId) on old CLOSED documents — the document
+ *     rows themselves are always kept.
+ *
+ * What is kept intact:
+ *   - entries backing documents that still carry an open balance (open/partial
+ *     invoices & bills, unapplied credits/payments, un-billed item receipts),
+ *   - entries with lines referenced by an in-progress ("current session")
+ *     reconciliation,
+ *   - draft entries (never posted — nothing to summarize),
+ *   - every list (customers, vendors, items, …) and every document row.
+ *
+ * Safety: requires the condensed range to be CLOSED (closed fiscal periods or
+ * the company closing date), and writes BOTH a rotating pre-op backup and a
+ * permanent archive .bka snapshot before touching a single row.
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { and, eq, inArray, lt, ne, or, sql } from 'drizzle-orm';
+import {
+  bankTransactions,
+  billPayments,
+  bills,
+  companies,
+  creditMemos,
+  deposits,
+  depreciationEntries,
+  errorDetections,
+  expenseReports,
+  expenses,
+  fiscalPeriods,
+  invoices,
+  itemReceipts,
+  journalEntries,
+  journalEntryLines,
+  paychecks,
+  paymentsReceived,
+  reconciliationItems,
+  reconciliations,
+  salesReceipts,
+  transfers,
+  vendorCredits,
+} from '@/lib/db/schema';
+import { resolveDataDir } from '@/lib/db';
+import { Money, toAmountString } from '@/lib/money';
+import {
+  type ServiceContext,
+  ServiceError,
+  inTransaction,
+  validation,
+  writeAudit,
+} from './_base';
+import { assertWrite } from './rbac';
+import { createBackup, ensurePreOpBackup } from './backup';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface CondenseInput {
+  /** Entries strictly BEFORE this date are condensed. */
+  beforeDate: Date;
+  /** When true, only compute and return the preview — nothing is modified. */
+  dryRun?: boolean;
+  /**
+   * Data-dir override for the archive/pre-op snapshots (tests / multi-dir
+   * setups). Defaults to the active company data dir.
+   */
+  dataDir?: string;
+}
+
+export interface CondensePreview {
+  /** ISO date (yyyy-mm-dd) of the cutoff. */
+  beforeDate: string;
+  /** Months ('YYYY-MM') that will receive a summary entry. */
+  months: string[];
+  /** Posted detail entries that will be deleted and rolled into summaries. */
+  entriesToCondense: number;
+  /** Their journal lines (deleted). */
+  linesToCondense: number;
+  /** Voided entries before the cutoff that will simply be deleted. */
+  voidEntriesToDelete: number;
+  /** Summary entries/lines that will be created (one entry per month). */
+  summaryEntriesToCreate: number;
+  summaryLinesToCreate: number;
+  /** Entries kept because their source document still has an open balance. */
+  keptOpenDocumentEntries: number;
+  /** Entries kept because an in-progress reconciliation references their lines. */
+  keptInProgressReconciliationEntries: number;
+  /** Completed-reconciliation detail rows that will be deleted. */
+  reconciliationItemsToDelete: number;
+  /** Matched bank-feed staging rows that will be deleted. */
+  bankFeedRowsToDelete: number;
+  /** Draft entries before the cutoff (left untouched). */
+  draftEntriesSkipped: number;
+}
+
+export interface CondenseResult extends CondensePreview {
+  dryRun: boolean;
+  /** Path of the permanent archive .bka written before condensing (null on dry run). */
+  archivePath: string | null;
+  /** Id of the condense run (also the audit-log entityId). Null on dry run. */
+  runId: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Internal plan
+// ---------------------------------------------------------------------------
+
+interface SummaryLine {
+  accountId: string;
+  classId: string | null;
+  debit: string | null;
+  credit: string | null;
+}
+
+interface MonthGroup {
+  key: string; // YYYY-MM
+  /** Summary entry date: the latest condensed entry date within the month. */
+  date: Date;
+  lines: SummaryLine[];
+}
+
+interface CondensePlan {
+  postedIds: string[];
+  voidIds: string[];
+  lineIds: string[];
+  months: MonthGroup[];
+  keptOpenDoc: number;
+  keptInProgressRecon: number;
+  reconItemsToDelete: number;
+  bankFeedRowsToDelete: number;
+  draftsSkipped: number;
+}
+
+const CHUNK = 300;
+
+function chunks<T>(arr: T[], size = CHUNK): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+function monthKey(d: Date): string {
+  return d.toISOString().slice(0, 7);
+}
+
+/**
+ * Tables that link documents to their posted GL entry. After the detail entries
+ * are deleted, these links are set to NULL on the (closed) documents that
+ * pointed at them. All of these tables carry both companyId and postedEntryId.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const POSTED_REF_TABLES: Array<{ table: any; companyCol: any; refCol: any }> = [
+  { table: invoices, companyCol: invoices.companyId, refCol: invoices.postedEntryId },
+  { table: paymentsReceived, companyCol: paymentsReceived.companyId, refCol: paymentsReceived.postedEntryId },
+  { table: salesReceipts, companyCol: salesReceipts.companyId, refCol: salesReceipts.postedEntryId },
+  { table: bills, companyCol: bills.companyId, refCol: bills.postedEntryId },
+  { table: billPayments, companyCol: billPayments.companyId, refCol: billPayments.postedEntryId },
+  { table: expenses, companyCol: expenses.companyId, refCol: expenses.postedEntryId },
+  { table: transfers, companyCol: transfers.companyId, refCol: transfers.postedEntryId },
+  { table: paychecks, companyCol: paychecks.companyId, refCol: paychecks.postedEntryId },
+  { table: creditMemos, companyCol: creditMemos.companyId, refCol: creditMemos.postedEntryId },
+  { table: vendorCredits, companyCol: vendorCredits.companyId, refCol: vendorCredits.postedEntryId },
+  { table: expenseReports, companyCol: expenseReports.companyId, refCol: expenseReports.postedEntryId },
+  { table: itemReceipts, companyCol: itemReceipts.companyId, refCol: itemReceipts.postedEntryId },
+  { table: deposits, companyCol: deposits.companyId, refCol: deposits.postedEntryId },
+  { table: depreciationEntries, companyCol: depreciationEntries.companyId, refCol: depreciationEntries.postedEntryId },
+];
+
+// ---------------------------------------------------------------------------
+// Plan computation (shared by dry-run preview and execution)
+// ---------------------------------------------------------------------------
+
+async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondensePlan> {
+  // 1. Candidate entries: everything dated strictly before the cutoff.
+  const candidates = await ctx.db
+    .select({
+      id: journalEntries.id,
+      date: journalEntries.date,
+      status: journalEntries.status,
+    })
+    .from(journalEntries)
+    .where(and(eq(journalEntries.companyId, ctx.companyId), lt(journalEntries.date, cutoff)));
+
+  const draftsSkipped = candidates.filter((e) => e.status === 'draft').length;
+
+  // 2. Protected entries — documents with an OPEN balance keep their detail.
+  const protectedIds = new Set<string>();
+  const openStatuses = ['open', 'partial', 'overdue'] as const;
+  const protectorQueries = [
+    ctx.db.select({ id: invoices.postedEntryId }).from(invoices)
+      .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.status, [...openStatuses]))),
+    ctx.db.select({ id: bills.postedEntryId }).from(bills)
+      .where(and(eq(bills.companyId, ctx.companyId), inArray(bills.status, [...openStatuses]))),
+    ctx.db.select({ id: creditMemos.postedEntryId }).from(creditMemos)
+      .where(and(
+        eq(creditMemos.companyId, ctx.companyId),
+        or(inArray(creditMemos.status, [...openStatuses]), sql`${creditMemos.unapplied} <> 0`),
+      )),
+    ctx.db.select({ id: vendorCredits.postedEntryId }).from(vendorCredits)
+      .where(and(
+        eq(vendorCredits.companyId, ctx.companyId),
+        or(inArray(vendorCredits.status, [...openStatuses]), sql`${vendorCredits.unapplied} <> 0`),
+      )),
+    ctx.db.select({ id: paymentsReceived.postedEntryId }).from(paymentsReceived)
+      .where(and(eq(paymentsReceived.companyId, ctx.companyId), sql`${paymentsReceived.unapplied} <> 0`)),
+    ctx.db.select({ id: itemReceipts.postedEntryId }).from(itemReceipts)
+      .where(and(eq(itemReceipts.companyId, ctx.companyId), eq(itemReceipts.status, 'open'))),
+  ];
+  for (const q of protectorQueries) {
+    for (const row of await q) {
+      if (row.id) protectedIds.add(row.id);
+    }
+  }
+  const openDocProtected = new Set(protectedIds);
+
+  // 3. Protected entries — lines referenced by an IN-PROGRESS reconciliation
+  //    ("reconciled-current-session data stays intact").
+  const reconProtected = new Set<string>();
+  const inProgressLines = await ctx.db
+    .select({ entryId: journalEntryLines.journalEntryId })
+    .from(reconciliationItems)
+    .innerJoin(reconciliations, eq(reconciliationItems.reconciliationId, reconciliations.id))
+    .innerJoin(journalEntryLines, eq(reconciliationItems.journalEntryLineId, journalEntryLines.id))
+    .where(ne(reconciliations.status, 'completed'));
+  for (const row of inProgressLines) {
+    reconProtected.add(row.entryId);
+    protectedIds.add(row.entryId);
+  }
+
+  const posted = candidates.filter((e) => e.status === 'posted' && !protectedIds.has(e.id));
+  const voids = candidates.filter((e) => e.status === 'void' && !protectedIds.has(e.id));
+  const keptOpenDoc = candidates.filter(
+    (e) => e.status !== 'draft' && openDocProtected.has(e.id),
+  ).length;
+  const keptInProgressRecon = candidates.filter(
+    (e) => e.status !== 'draft' && reconProtected.has(e.id) && !openDocProtected.has(e.id),
+  ).length;
+
+  // 4. The condensed range must be CLOSED. Every entry being removed must fall
+  //    inside a closed fiscal period or on/before the company closing date.
+  const closedPeriods = await ctx.db
+    .select({ start: fiscalPeriods.periodStart, end: fiscalPeriods.periodEnd })
+    .from(fiscalPeriods)
+    .where(and(eq(fiscalPeriods.companyId, ctx.companyId), eq(fiscalPeriods.isClosed, true)));
+  const [co] = await ctx.db
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId));
+  const closingDate = (co?.settings as Record<string, unknown> | null)?.closingDate;
+  const isLocked = (d: Date): boolean => {
+    if (typeof closingDate === 'string' && closingDate && d.toISOString().slice(0, 10) <= closingDate) {
+      return true;
+    }
+    return closedPeriods.some((p) => p.start <= d && d <= p.end);
+  };
+  const unlocked = [...posted, ...voids].filter((e) => !isLocked(e.date));
+  if (unlocked.length > 0) {
+    const earliest = unlocked.reduce((a, b) => (a.date < b.date ? a : b)).date;
+    throw new ServiceError(
+      'PERIOD_CLOSED',
+      `Condense requires the affected period to be closed first. ${unlocked.length} ` +
+        `entr${unlocked.length === 1 ? 'y is' : 'ies are'} not in a closed period ` +
+        `(earliest: ${earliest.toISOString().slice(0, 10)}). Close the period or set the ` +
+        `closing date through ${new Date(cutoff.getTime() - 86_400_000).toISOString().slice(0, 10)} first.`,
+    );
+  }
+
+  // 5. Load the posted lines and build per-month, per-(account,class) totals.
+  const postedIds = posted.map((e) => e.id);
+  const entryById = new Map(posted.map((e) => [e.id, e]));
+  const lineIds: string[] = [];
+  // monthKey -> groupKey(account|class) -> running totals
+  const monthTotals = new Map<string, Map<string, { accountId: string; classId: string | null; debit: ReturnType<typeof Money.zero>; credit: ReturnType<typeof Money.zero> }>>();
+  const monthDates = new Map<string, Date>();
+
+  for (const idChunk of chunks(postedIds)) {
+    const lines = await ctx.db
+      .select({
+        id: journalEntryLines.id,
+        journalEntryId: journalEntryLines.journalEntryId,
+        accountId: journalEntryLines.accountId,
+        classId: journalEntryLines.classId,
+        debit: journalEntryLines.debit,
+        credit: journalEntryLines.credit,
+      })
+      .from(journalEntryLines)
+      .where(inArray(journalEntryLines.journalEntryId, idChunk));
+    for (const line of lines) {
+      lineIds.push(line.id);
+      const entry = entryById.get(line.journalEntryId)!;
+      const mk = monthKey(entry.date);
+      const prevDate = monthDates.get(mk);
+      if (!prevDate || entry.date > prevDate) monthDates.set(mk, entry.date);
+
+      let groups = monthTotals.get(mk);
+      if (!groups) {
+        groups = new Map();
+        monthTotals.set(mk, groups);
+      }
+      const gk = `${line.accountId}|${line.classId ?? ''}`;
+      let g = groups.get(gk);
+      if (!g) {
+        g = { accountId: line.accountId, classId: line.classId ?? null, debit: Money.zero(), credit: Money.zero() };
+        groups.set(gk, g);
+      }
+      g.debit = g.debit.plus(Money.of(line.debit));
+      g.credit = g.credit.plus(Money.of(line.credit));
+    }
+  }
+
+  // Also collect void entries' line ids so they are deleted with their entries.
+  const voidIds = voids.map((e) => e.id);
+  for (const idChunk of chunks(voidIds)) {
+    const rows = await ctx.db
+      .select({ id: journalEntryLines.id })
+      .from(journalEntryLines)
+      .where(inArray(journalEntryLines.journalEntryId, idChunk));
+    for (const r of rows) lineIds.push(r.id);
+  }
+
+  // 6. Materialize summary line lists (gross debit + credit per account/class,
+  //    emitted as up-to-two one-sided lines so debit/credit column totals survive).
+  const months: MonthGroup[] = [...monthTotals.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : 1))
+    .map(([key, groups]) => {
+      const lines: SummaryLine[] = [];
+      for (const g of groups.values()) {
+        if (g.debit.greaterThan(0)) {
+          lines.push({ accountId: g.accountId, classId: g.classId, debit: toAmountString(g.debit), credit: null });
+        }
+        if (g.credit.greaterThan(0)) {
+          lines.push({ accountId: g.accountId, classId: g.classId, debit: null, credit: toAmountString(g.credit) });
+        }
+      }
+      return { key, date: monthDates.get(key)!, lines };
+    })
+    .filter((m) => m.lines.length > 0);
+
+  // 7. Counts of linked non-essential rows that will be removed.
+  const deletedIds = [...postedIds, ...voidIds];
+  let reconItemsToDelete = 0;
+  for (const idChunk of chunks(lineIds)) {
+    const [row] = await ctx.db
+      .select({ n: sql<number>`COUNT(*)::int` })
+      .from(reconciliationItems)
+      .where(inArray(reconciliationItems.journalEntryLineId, idChunk));
+    reconItemsToDelete += row?.n ?? 0;
+  }
+  let bankFeedRowsToDelete = 0;
+  for (const idChunk of chunks(deletedIds)) {
+    const [row] = await ctx.db
+      .select({ n: sql<number>`COUNT(*)::int` })
+      .from(bankTransactions)
+      .where(and(
+        eq(bankTransactions.companyId, ctx.companyId),
+        inArray(bankTransactions.matchedEntryId, idChunk),
+      ));
+    bankFeedRowsToDelete += row?.n ?? 0;
+  }
+
+  return {
+    postedIds,
+    voidIds,
+    lineIds,
+    months,
+    keptOpenDoc,
+    keptInProgressRecon,
+    reconItemsToDelete,
+    bankFeedRowsToDelete,
+    draftsSkipped,
+  };
+}
+
+function toPreview(cutoff: Date, plan: CondensePlan): CondensePreview {
+  return {
+    beforeDate: cutoff.toISOString().slice(0, 10),
+    months: plan.months.map((m) => m.key),
+    entriesToCondense: plan.postedIds.length,
+    linesToCondense: plan.lineIds.length,
+    voidEntriesToDelete: plan.voidIds.length,
+    summaryEntriesToCreate: plan.months.length,
+    summaryLinesToCreate: plan.months.reduce((n, m) => n + m.lines.length, 0),
+    keptOpenDocumentEntries: plan.keptOpenDoc,
+    keptInProgressReconciliationEntries: plan.keptInProgressRecon,
+    reconciliationItemsToDelete: plan.reconItemsToDelete,
+    bankFeedRowsToDelete: plan.bankFeedRowsToDelete,
+    draftEntriesSkipped: plan.draftsSkipped,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// condensePeriod
+// ---------------------------------------------------------------------------
+
+/**
+ * Condense all journal detail dated before `beforeDate` into monthly summary
+ * entries. IRREVERSIBLE except by restoring the archive .bka snapshot this
+ * function writes first. Pass `dryRun: true` for a read-only preview.
+ */
+export async function condensePeriod(
+  ctx: ServiceContext,
+  input: CondenseInput,
+): Promise<CondenseResult> {
+  const cutoff = input.beforeDate;
+  if (!(cutoff instanceof Date) || isNaN(cutoff.getTime())) {
+    throw validation('beforeDate must be a valid date.');
+  }
+
+  const plan = await computePlan(ctx, cutoff);
+  const preview = toPreview(cutoff, plan);
+
+  if (input.dryRun) {
+    return { ...preview, dryRun: true, archivePath: null, runId: null };
+  }
+
+  assertWrite(ctx); // destructive from here on — viewers blocked
+  if (plan.postedIds.length === 0 && plan.voidIds.length === 0) {
+    throw validation('Nothing to condense before that date.');
+  }
+  if (!ctx.userId) {
+    throw new ServiceError('FORBIDDEN', 'Condense requires an authenticated user.');
+  }
+
+  // --- Snapshots FIRST: rotating pre-op backup + permanent archive copy. ---
+  ensurePreOpBackup(ctx, 'condense', input.dataDir);
+  const [co] = await ctx.db
+    .select({ name: companies.name })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId));
+  const archivePath = writeCondenseArchive(co?.name, input.dataDir);
+
+  const runId = randomUUID();
+  const deletedIds = [...plan.postedIds, ...plan.voidIds];
+
+  await inTransaction(ctx, async (tx) => {
+    // a) Completed-reconciliation detail rows pointing at removed lines.
+    //    (In-progress reconciliations protected their entries in computePlan.)
+    for (const idChunk of chunks(plan.lineIds)) {
+      await tx.db
+        .delete(reconciliationItems)
+        .where(inArray(reconciliationItems.journalEntryLineId, idChunk));
+    }
+
+    // b) Matched bank-feed staging rows linked to removed entries.
+    for (const idChunk of chunks(deletedIds)) {
+      await tx.db
+        .delete(bankTransactions)
+        .where(and(
+          eq(bankTransactions.companyId, tx.companyId),
+          inArray(bankTransactions.matchedEntryId, idChunk),
+        ));
+    }
+
+    // c) Detach soft references so FKs allow the entry deletes. Document rows
+    //    are KEPT — only their GL drill-down link is cleared.
+    for (const idChunk of chunks(deletedIds)) {
+      await tx.db
+        .update(errorDetections)
+        .set({ journalEntryId: null })
+        .where(and(
+          eq(errorDetections.companyId, tx.companyId),
+          inArray(errorDetections.journalEntryId, idChunk),
+        ));
+      for (const t of POSTED_REF_TABLES) {
+        await tx.db
+          .update(t.table)
+          .set({ postedEntryId: null })
+          .where(and(eq(t.companyCol, tx.companyId), inArray(t.refCol, idChunk)));
+      }
+    }
+
+    // d) Delete the detail lines, then the entries.
+    for (const idChunk of chunks(deletedIds)) {
+      await tx.db
+        .delete(journalEntryLines)
+        .where(inArray(journalEntryLines.journalEntryId, idChunk));
+      await tx.db
+        .delete(journalEntries)
+        .where(and(
+          eq(journalEntries.companyId, tx.companyId),
+          inArray(journalEntries.id, idChunk),
+        ));
+    }
+
+    // e) Insert the monthly summary entries DIRECTLY (not via postJournalEntry):
+    //    the period is closed by design, and the cached account balances must
+    //    NOT be re-applied — the summaries replace exactly what was deleted, so
+    //    the net change to every account (and to accounts.balance) is zero.
+    const [maxRow] = await tx.db
+      .select({ max: sql<number>`COALESCE(MAX(${journalEntries.entryNumber}), 0)` })
+      .from(journalEntries)
+      .where(eq(journalEntries.companyId, tx.companyId));
+    let entryNumber = (maxRow?.max ?? 0) + 1;
+
+    for (const month of plan.months) {
+      const [entry] = await tx.db
+        .insert(journalEntries)
+        .values({
+          companyId: tx.companyId,
+          entryNumber: entryNumber++,
+          date: month.date,
+          description: `Condensed detail for ${month.key} (condensed through ${preview.beforeDate})`,
+          status: 'posted',
+          sourceRef: `condense:${runId}`,
+          createdBy: tx.userId!,
+        })
+        .returning();
+      for (const lineChunk of chunks(month.lines, 200)) {
+        await tx.db.insert(journalEntryLines).values(
+          lineChunk.map((l) => ({
+            journalEntryId: entry.id,
+            accountId: l.accountId,
+            classId: l.classId,
+            debit: l.debit,
+            credit: l.credit,
+            memo: 'Condensed activity',
+          })),
+        );
+      }
+    }
+
+    // f) Audit row — condense is itself auditable.
+    await writeAudit(tx, {
+      action: 'delete',
+      entityType: 'condense',
+      entityId: runId,
+      newValues: { ...preview, archivePath },
+    });
+  });
+
+  return { ...preview, dryRun: false, archivePath, runId };
+}
+
+/**
+ * Permanent (non-rotating) archive snapshot written into an `archives` folder
+ * next to the data dir. This is the ONLY way back after a condense.
+ */
+function writeCondenseArchive(companyName: string | undefined, dataDir?: string): string {
+  const dir = resolveDataDir(dataDir);
+  const { buffer, filename } = createBackup(companyName, dir);
+  const outDir = path.join(path.dirname(dir), 'archives');
+  fs.mkdirSync(outDir, { recursive: true });
+  const outPath = path.join(outDir, filename.replace(/^bookkeeper-backup/, 'condense-archive'));
+  fs.writeFileSync(outPath, buffer);
+  return outPath;
+}

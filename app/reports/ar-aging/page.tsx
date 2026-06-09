@@ -14,7 +14,8 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
-import { AsOfControl, downloadCsv, todayStr } from '../_components/shared';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
+import { AsOfControl, todayStr } from '../_components/shared';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -47,25 +48,34 @@ interface AgingReport {
 }
 
 // ---------------------------------------------------------------------------
-// CSV export (uses the shared downloadCsv helper)
+// Export table (CSV / Excel / PDF / Print via the shared ReportToolbar)
 // ---------------------------------------------------------------------------
 
-function exportCsv(report: AgingReport) {
+function buildTable(report: AgingReport): ExportTable {
   const asOfDate = new Date(report.asOf).toLocaleDateString('en-US');
-  downloadCsv(
-    'ar-aging.csv',
-    `A/R Aging Report — As Of ${asOfDate}`,
-    ['Customer', 'Current', '1-30 Days', '31-60 Days', '61-90 Days', '91+ Days', 'Total'],
-    [
-      ...report.rows.map((r) => [
-        r.name,
-        r.current,
-        r.days1_30,
-        r.days31_60,
-        r.days61_90,
-        r.days91plus,
-        r.total,
-      ]),
+  return {
+    filename: 'ar-aging',
+    title: 'A/R Aging Summary',
+    subtitle: `As of ${asOfDate}`,
+    columns: [
+      { header: 'Customer' },
+      { header: 'Current', numeric: true },
+      { header: '1-30 Days', numeric: true },
+      { header: '31-60 Days', numeric: true },
+      { header: '61-90 Days', numeric: true },
+      { header: '91+ Days', numeric: true },
+      { header: 'Total', numeric: true },
+    ],
+    rows: report.rows.map((r) => [
+      r.name,
+      r.current,
+      r.days1_30,
+      r.days31_60,
+      r.days61_90,
+      r.days91plus,
+      r.total,
+    ]),
+    totals: [
       [
         'TOTAL',
         report.totals.current,
@@ -76,7 +86,7 @@ function exportCsv(report: AgingReport) {
         report.totals.total,
       ],
     ],
-  );
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -121,25 +131,13 @@ export default function ArAgingPage() {
         title="A/R Aging"
         icon={Clock}
         action={
-          <div className="flex items-center gap-3">
-            {asOfLabel && (
-              <span className="text-sm text-navy/60">As of {asOfLabel}</span>
-            )}
-            <Button
-              variant="secondary"
-              size="sm"
-              disabled={!report || loading}
-              onClick={() => {
-                if (report) exportCsv(report);
-              }}
-            >
-              Download CSV
-            </Button>
-          </div>
+          asOfLabel ? <span className="text-sm text-navy/60">As of {asOfLabel}</span> : undefined
         }
       />
 
-      <Card className="p-4 mb-4">
+      <ReportToolbar table={report ? buildTable(report) : null} disabled={loading} />
+
+      <Card className="p-4 mb-4 print-hidden">
         <AsOfControl asOf={asOf} onChange={setAsOf} onRun={load} />
       </Card>
 

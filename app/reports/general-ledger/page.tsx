@@ -24,6 +24,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import EntryDetailModal from '@/components/EntryDetailModal';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
 import { fmtDate } from '../_components/shared';
 
 // ---------------------------------------------------------------------------
@@ -66,48 +67,43 @@ interface GLResponse {
 }
 
 // ---------------------------------------------------------------------------
-// CSV helpers
+// Export table (shared ReportToolbar: CSV / Excel / PDF / Print)
 // ---------------------------------------------------------------------------
 
-function toCsvCell(value: string | number | null | undefined): string {
-  const s = String(value ?? '');
-  return s.includes(',') || s.includes('"') || s.includes('\n')
-    ? `"${s.replace(/"/g, '""')}"`
-    : s;
-}
-
-function toCsvRow(...cells: (string | number | null | undefined)[]): string {
-  return cells.map(toCsvCell).join(',');
-}
-
-function buildCsv(result: GLResult, hasFromFilter: boolean): string {
-  const header = toCsvRow('Date', 'Entry #', 'Description', 'Reference', 'Debit', 'Credit', 'Running Balance');
-  const opening = hasFromFilter
-    ? [toCsvRow('', '', 'Beginning Balance', '', '', '', result.openingBalance)]
-    : [];
-  const dataRows = result.lines.map((l) =>
-    toCsvRow(
-      fmtDate(l.date),
-      l.entryNumber,
-      l.description,
-      l.reference ?? '',
-      l.debit ?? '',
-      l.credit ?? '',
-      l.runningBalance,
-    ),
-  );
-  const footer = toCsvRow('', '', '', 'Closing Balance', '', '', result.closingBalance);
-  return [header, ...opening, ...dataRows, footer].join('\n');
-}
-
-function downloadCsv(csv: string, filename: string) {
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
+function buildTable(result: GLResult, hasFromFilter: boolean): ExportTable {
+  const acctLabel = `${result.accountCode}-${result.accountName}`.replace(/\s+/g, '_');
+  return {
+    filename: `GL_${acctLabel}`,
+    title: 'General Ledger',
+    subtitle: `${result.accountCode} ${result.accountName}`,
+    columns: [
+      { header: 'Date' },
+      { header: 'Entry #', numeric: true },
+      { header: 'Description' },
+      { header: 'Reference' },
+      { header: 'Debit', numeric: true },
+      { header: 'Credit', numeric: true },
+      { header: 'Running Balance', numeric: true },
+    ],
+    rows: [
+      ...(hasFromFilter
+        ? [['', null, 'Beginning Balance', '', '', '', result.openingBalance] as (string | number | null)[]]
+        : []),
+      ...result.lines.map(
+        (l) =>
+          [
+            fmtDate(l.date),
+            l.entryNumber,
+            l.description,
+            l.reference ?? '',
+            l.debit ?? '',
+            l.credit ?? '',
+            l.runningBalance,
+          ] as (string | number | null)[],
+      ),
+    ],
+    totals: [['', null, '', 'Closing Balance', '', '', result.closingBalance]],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -173,34 +169,19 @@ export default function GeneralLedgerPage() {
     loadGL(accountId, from, to);
   }
 
-  function handleDownload() {
-    if (!result) return;
-    const acctLabel = `${result.accountCode}-${result.accountName}`.replace(/\s+/g, '_');
-    downloadCsv(buildCsv(result, Boolean(resultFrom)), `GL_${acctLabel}.csv`);
-    toast('CSV downloaded.', 'success');
-  }
-
   const selectedAccount = accounts.find((a) => a.id === accountId);
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader
-        title="General Ledger"
-        icon={List}
-        action={
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={handleDownload}
-            disabled={!result}
-          >
-            Download CSV
-          </Button>
-        }
+      <PageHeader title="General Ledger" icon={List} />
+
+      <ReportToolbar
+        table={result ? buildTable(result, Boolean(resultFrom)) : null}
+        disabled={loading}
       />
 
       {/* Filters */}
-      <Card className="p-5 mb-6 flex flex-wrap items-end gap-4">
+      <Card className="p-5 mb-6 flex flex-wrap items-end gap-4 print-hidden">
         {/* Account selector */}
         <div className="flex-[2] min-w-[220px]">
           <Label htmlFor="gl-account">Account</Label>

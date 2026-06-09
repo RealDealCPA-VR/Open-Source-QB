@@ -36,8 +36,8 @@ if (!app.requestSingleInstanceLock()) {
 // ---------------------------------------------------------------------------
 // .bka file association handling
 //
-// electron-builder fileAssociations config lives in package.json (frozen), so instead of
-// registry-level registration we handle the two OS entry points directly:
+// electron-builder registers the .bka extension at install time (package.json "build"
+// fileAssociations); the two OS entry points are handled here:
 //  - macOS: the 'open-file' app event (fires before 'ready' on cold start, so register early)
 //  - Windows/Linux: a .bka path in process.argv (first launch) or in the second instance's
 //    argv (forwarded to us via 'second-instance' thanks to the single-instance lock above)
@@ -69,6 +69,61 @@ app.on('open-file', (event, filePath) => {
   pendingBkaPath = filePath;
   deliverPendingBka();
 });
+
+// ---------------------------------------------------------------------------
+// App config (JSON in userData/config.json)
+//
+//   backupIntervalHours  scheduled auto-backup cadence while the app runs
+//                        (default 24; 0/negative disables the timer — the
+//                        on-quit backup still runs)
+//   dataDir              active company data directory (multi-company support);
+//                        the BKA_DATA_DIR env var overrides it for one launch
+//   recentCompanies      most-recently-opened company directories (File menu)
+// ---------------------------------------------------------------------------
+
+function configPath() {
+  return path.join(app.getPath('userData'), 'config.json');
+}
+
+function loadConfig() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch {
+    return {}; // missing/corrupt config: defaults
+  }
+}
+
+function saveConfig(patch) {
+  const next = { ...loadConfig(), ...patch };
+  try {
+    fs.mkdirSync(app.getPath('userData'), { recursive: true });
+    fs.writeFileSync(configPath(), JSON.stringify(next, null, 2));
+  } catch (err) {
+    console.error('[config] save failed:', err);
+  }
+  return next;
+}
+
+const RECENT_COMPANIES_KEEP = 8;
+
+/** Put `dir` at the front of the recent-companies list (deduped, capped). */
+function rememberRecentCompany(dir) {
+  const cfg = loadConfig();
+  const recents = [dir, ...(Array.isArray(cfg.recentCompanies) ? cfg.recentCompanies : [])]
+    .filter((d, i, arr) => typeof d === 'string' && arr.indexOf(d) === i)
+    .slice(0, RECENT_COMPANIES_KEEP);
+  saveConfig({ recentCompanies: recents });
+  return recents;
+}
+
+/** Persist `dir` as the active company folder and relaunch into it. */
+function openCompanyDir(dir) {
+  saveConfig({ dataDir: dir });
+  rememberRecentCompany(dir);
+  app.relaunch();
+  app.quit(); // before-quit still snapshots the current company on the way out
+}
 
 // ---------------------------------------------------------------------------
 // Window-state persistence (size/position/maximized) via JSON in userData
@@ -196,11 +251,44 @@ function companiesRoot() {
   return path.join(app.getPath('userData'), 'companies');
 }
 
+/**
+ * Active company data directory, in priority order:
+ *  1. BKA_DATA_DIR env var (one-shot override, e.g. scripted/portable launches)
+ *  2. config.json dataDir (set by File > Open Company Folder / Recent Companies)
+ *  3. userData/companies/default (first run)
+ */
 function activeCompanyDir() {
-  // For now a single "default" company file; the onboarding wizard / company switcher will manage many.
-  const dir = path.join(companiesRoot(), 'default');
+  const cfg = loadConfig();
+  const dir =
+    process.env.BKA_DATA_DIR ||
+    (typeof cfg.dataDir === 'string' && cfg.dataDir) ||
+    path.join(companiesRoot(), 'default');
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled auto-backups (same endpoint/rotation as the on-quit backup)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_BACKUP_INTERVAL_HOURS = 24;
+let backupTimer = null;
+
+function scheduleAutoBackups() {
+  const cfg = loadConfig();
+  const hours = Number.isFinite(cfg.backupIntervalHours)
+    ? cfg.backupIntervalHours
+    : DEFAULT_BACKUP_INTERVAL_HOURS;
+  if (!(hours > 0)) {
+    console.log('[auto-backup] scheduled backups disabled (backupIntervalHours <= 0)');
+    return;
+  }
+  backupTimer = setInterval(() => {
+    runAutoBackup().catch((err) =>
+      console.error('[auto-backup] scheduled run failed:', err?.message || err),
+    );
+  }, hours * 60 * 60 * 1000);
+  console.log(`[auto-backup] scheduled every ${hours}h of uptime`);
 }
 
 function findFreePort() {
@@ -262,13 +350,42 @@ function waitForServer(port, timeoutMs = 20000) {
   });
 }
 
+async function pickCompanyFolder() {
+  const res = await dialog.showOpenDialog(mainWindow, {
+    title: 'Open Company Folder',
+    message: 'Choose the data folder for the company file to open',
+    properties: ['openDirectory', 'createDirectory'],
+    defaultPath: companiesRoot(),
+  });
+  if (res.canceled || !res.filePaths[0]) return;
+  openCompanyDir(res.filePaths[0]);
+}
+
 function buildMenu() {
+  const cfg = loadConfig();
+  const current = activeCompanyDir();
+  const recents = (Array.isArray(cfg.recentCompanies) ? cfg.recentCompanies : []).filter(
+    (d) => typeof d === 'string',
+  );
+  const recentItems = recents.map((dir) => ({
+    label: dir === current ? `${path.basename(dir)} (current)` : path.basename(dir),
+    sublabel: dir,
+    enabled: dir !== current,
+    click: () => openCompanyDir(dir),
+  }));
   const template = [
     {
       label: 'File',
       submenu: [
         { label: 'New Company…', click: () => mainWindow?.webContents.send('menu', 'new-company') },
         { label: 'Open Company…', click: () => mainWindow?.webContents.send('menu', 'open-company') },
+        { label: 'Open Company Folder…', click: () => { pickCompanyFolder(); } },
+        {
+          label: 'Recent Companies',
+          submenu: recentItems.length
+            ? recentItems
+            : [{ label: 'No recent companies', enabled: false }],
+        },
         { type: 'separator' },
         { label: 'Import Bank File…', click: () => mainWindow?.webContents.send('menu', 'import') },
         { label: 'Backup Company…', click: () => mainWindow?.webContents.send('menu', 'backup') },
@@ -277,7 +394,8 @@ function buildMenu() {
       ],
     },
     { label: 'Edit', submenu: [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }] },
-    { label: 'View', submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' }, { role: 'togglefullscreen' }] },
+    // Reload on F5 (not the default Ctrl+R): Ctrl+R is the QB "Registers" shortcut in the app.
+    { label: 'View', submenu: [{ role: 'reload', accelerator: 'F5' }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' }, { role: 'togglefullscreen' }] },
     {
       label: 'Reports',
       submenu: [
@@ -329,8 +447,10 @@ async function createWindow() {
 
   await mainWindow.loadURL(url);
   if (isDev) mainWindow.webContents.openDevTools({ mode: 'detach' });
+  rememberRecentCompany(activeCompanyDir());
   buildMenu();
   runDueRecurring(url);
+  scheduleAutoBackups();
 
   // Deliver a double-clicked .bka after the renderer has had a moment to mount the
   // DesktopBridge listener (loadURL resolves at load, React hydrates just after).
@@ -429,6 +549,7 @@ app.on('before-quit', (event) => {
   if (!quittingAfterBackup) {
     quittingAfterBackup = true;
     event.preventDefault();
+    if (backupTimer) clearInterval(backupTimer);
     runAutoBackup()
       .catch((err) => console.error('[auto-backup] skipped:', err?.message || err))
       .finally(() => app.quit());

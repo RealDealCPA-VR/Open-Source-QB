@@ -1,11 +1,18 @@
 /**
- * GET  /api/company  — return the active company row
- * PATCH /api/company — update name and/or settings (fiscalYearEnd, currency, timezone)
+ * GET   /api/company — return the active company row
+ * PATCH /api/company — update name and/or Preferences settings.
+ *   Body (zod-validated, lib/validation/company.ts):
+ *     { name?, settings?: CompanySettings }            — Preferences dialog shape
+ *     { currency?, fiscalYearEnd?, timezone?, industry? } — legacy flat keys (onboarding)
+ *   Settings keys outside the COMPANY_SETTINGS_KEYS whitelist are dropped by the
+ *   service (closing date + finance charges have dedicated endpoints).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getCompany, updateCompany } from '@/lib/services/company';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { updateCompanyBodySchema } from '@/lib/validation/company';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -41,27 +48,26 @@ export async function GET() {
 export async function PATCH(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    const input: Parameters<typeof updateCompany>[1] = {};
-
-    if (body.name !== undefined) {
-      if (typeof body.name !== 'string' || !body.name.trim()) {
-        return NextResponse.json({ error: 'name must be a non-empty string', code: 'VALIDATION' }, { status: 400 });
-      }
-      input.name = body.name.trim();
+    const body = await req.json().catch(() => ({}));
+    const parsed = updateCompanyBodySchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
+    const { name, settings, currency, fiscalYearEnd, timezone, industry } = parsed.data;
 
-    const settingsPatch: Record<string, string | undefined> = {};
-    if (body.currency !== undefined) settingsPatch.currency = body.currency;
-    if (body.fiscalYearEnd !== undefined) settingsPatch.fiscalYearEnd = body.fiscalYearEnd;
-    if (body.timezone !== undefined) settingsPatch.timezone = body.timezone;
+    // Merge legacy flat keys (onboarding wizard) with the settings object.
+    const settingsPatch = {
+      ...(currency !== undefined ? { currency } : {}),
+      ...(fiscalYearEnd !== undefined ? { fiscalYearEnd } : {}),
+      ...(timezone !== undefined ? { timezone } : {}),
+      ...(industry !== undefined ? { industry } : {}),
+      ...(settings ?? {}),
+    };
 
-    if (Object.keys(settingsPatch).length > 0) {
-      input.settings = settingsPatch;
-    }
-
-    const updated = await updateCompany(ctx, input);
+    const updated = await updateCompany(ctx, {
+      ...(name !== undefined ? { name } : {}),
+      ...(Object.keys(settingsPatch).length > 0 ? { settings: settingsPatch } : {}),
+    });
     return NextResponse.json(updated);
   } catch (err) {
     return errorResponse(err);

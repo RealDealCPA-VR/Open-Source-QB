@@ -4,6 +4,7 @@ import { Badge, Button, Card, Input, Label, PageHeader, Table, Td, Th, Tr } from
 import { getServerContext } from '@/lib/context';
 import { trialBalance } from '@/lib/services/reports';
 import { formatCurrency } from '@/lib/money';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
 
 export const dynamic = 'force-dynamic';
 
@@ -33,6 +34,20 @@ export default async function TrialBalancePage({
 
   const tb = await trialBalance(ctx, asOf);
 
+  const exportTable: ExportTable = {
+    filename: 'trial-balance',
+    title: 'Trial Balance',
+    subtitle: `As of ${asOf.toLocaleDateString('en-US')}`,
+    columns: [
+      { header: 'Code' },
+      { header: 'Account' },
+      { header: 'Debit', numeric: true },
+      { header: 'Credit', numeric: true },
+    ],
+    rows: tb.rows.map((r) => [r.code, r.name, r.debit, r.credit]),
+    totals: [['', 'Total', tb.totalDebit, tb.totalCredit]],
+  };
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <div className="max-w-3xl">
@@ -52,8 +67,12 @@ export default async function TrialBalancePage({
         />
       </div>
 
+      <div className="max-w-3xl">
+        <ReportToolbar table={exportTable} />
+      </div>
+
       {/* As-of date picker (plain GET form — server-rendered page) */}
-      <Card className="mb-6 max-w-3xl">
+      <Card className="mb-6 max-w-3xl print-hidden">
         <form method="get" className="flex items-end gap-3 flex-wrap p-4">
           <div>
             <Label htmlFor="tb-asof">As of</Label>

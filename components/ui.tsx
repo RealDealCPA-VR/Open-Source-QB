@@ -5,6 +5,15 @@
  */
 import * as React from 'react';
 import { cn } from '@/lib/utils';
+import {
+  adjustDateForKey,
+  evaluateAmountExpression,
+  formatAmountResult,
+  isMathExpression,
+} from '@/lib/shortcuts';
+
+// Re-export the line-grid keyboard hook so pages can import it from the kit.
+export { useGridKeys, type GridKeysOptions } from '@/lib/shortcuts';
 
 // ---- Spinner ----
 export function Spinner({ className }: { className?: string }) {
@@ -76,16 +85,118 @@ export function Card({ className, ...props }: React.HTMLAttributes<HTMLDivElemen
 }
 
 // ---- Inputs ----
+
+/**
+ * Set an input's value through the native setter and fire a bubbling 'input' event so
+ * React's synthetic onChange fires even for controlled inputs. Used by the QB date keys
+ * and AmountInput so programmatic edits flow through the page's normal state updates.
+ */
+function setNativeInputValue(el: HTMLInputElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+  if (setter) setter.call(el, value);
+  else el.value = value;
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+/**
+ * Standard text input. Date inputs (type="date") additionally get the QuickBooks
+ * date-entry keys: + / - next/previous day, T today, M / H first/last of month,
+ * Y / R first/last of year. All other keys (and any key with a modifier held)
+ * behave exactly as before.
+ */
 export const Input = React.forwardRef<HTMLInputElement, React.InputHTMLAttributes<HTMLInputElement>>(
-  function Input({ className, ...props }, ref) {
+  function Input({ className, type, onKeyDown, ...props }, ref) {
+    const handleDateKeys = React.useCallback(
+      (e: React.KeyboardEvent<HTMLInputElement>) => {
+        onKeyDown?.(e);
+        if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+        const next = adjustDateForKey(e.key, e.currentTarget.value || undefined);
+        if (next !== null) {
+          e.preventDefault();
+          setNativeInputValue(e.currentTarget, next);
+        }
+      },
+      [onKeyDown],
+    );
     return (
       <input
         ref={ref}
+        type={type}
+        onKeyDown={type === 'date' ? handleDateKeys : onKeyDown}
         className={cn(
           'w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy outline-none focus:border-electric focus:ring-2 focus:ring-electric/30 placeholder:text-navy/30',
           className,
         )}
         {...props}
+      />
+    );
+  },
+);
+
+/** Alias for an Input pre-set to type="date" (QB date keys included). */
+export const DateInput = React.forwardRef<
+  HTMLInputElement,
+  Omit<React.InputHTMLAttributes<HTMLInputElement>, 'type'>
+>(function DateInput(props, ref) {
+  return <Input ref={ref} type="date" {...props} />;
+});
+
+// ---- AmountInput (QuickMath calculator in amount fields) ----
+
+export type AmountInputProps = Omit<React.InputHTMLAttributes<HTMLInputElement>, 'type'> & {
+  /**
+   * Called with the evaluated amount string after a math expression commits
+   * (blur or Enter). Plain numbers never trigger it — they pass through untouched.
+   * Regular onChange also fires (via a native input event), so controlled
+   * value/onChange usage works without this.
+   */
+  onValueCommit?: (value: string) => void;
+};
+
+/**
+ * Drop-in Input for money fields with a built-in calculator: type math
+ * (e.g. `12.5*3+10`, with + - * / and parentheses) and it evaluates on blur or
+ * Enter via a safe parser (no eval), rounded to cents. Plain numbers are passed
+ * through untouched; invalid expressions are left as typed for the page's own
+ * validation to flag.
+ */
+export const AmountInput = React.forwardRef<HTMLInputElement, AmountInputProps>(
+  function AmountInput({ onValueCommit, onBlur, onKeyDown, ...props }, ref) {
+    const innerRef = React.useRef<HTMLInputElement | null>(null);
+    React.useImperativeHandle(ref, () => innerRef.current as HTMLInputElement);
+
+    const commit = React.useCallback((): boolean => {
+      const el = innerRef.current;
+      if (!el) return false;
+      const raw = el.value;
+      if (!isMathExpression(raw)) return false; // plain numbers untouched
+      const result = evaluateAmountExpression(raw);
+      if (result === null) return false; // invalid: leave as typed
+      const next = formatAmountResult(result);
+      if (next !== raw) setNativeInputValue(el, next);
+      onValueCommit?.(next);
+      return true;
+    }, [onValueCommit]);
+
+    return (
+      <Input
+        {...props}
+        ref={innerRef}
+        type="text"
+        inputMode="decimal"
+        onBlur={(e) => {
+          commit();
+          onBlur?.(e);
+        }}
+        onKeyDown={(e) => {
+          onKeyDown?.(e);
+          if (e.defaultPrevented) return;
+          if (e.key === 'Enter') {
+            // Only swallow Enter when it actually calculated something, so plain
+            // values still submit forms / move down grids as usual.
+            if (commit()) e.preventDefault();
+          }
+        }}
       />
     );
   },

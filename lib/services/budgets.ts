@@ -11,6 +11,7 @@ import { and, eq } from 'drizzle-orm';
 import { accounts, budgetLines, budgets } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { profitAndLoss } from '@/lib/services/reports';
+import { profitAndLossByMonth, type ProfitAndLossByMonth } from '@/lib/services/reportsComparative';
 import type { ServiceContext } from './_base';
 import { notFound, validation, writeAudit } from './_base';
 
@@ -37,6 +38,17 @@ export interface BudgetWithLines extends Budget {
   lines: BudgetLine[];
 }
 
+/** One budget/actual/variance cell for a single period column. */
+export interface BudgetPeriodCell {
+  budget: string;
+  actual: string;
+  /** actual - budget. */
+  variance: string;
+}
+
+/** Period column mode for budgetVsActual (annual totals when omitted). */
+export type BudgetPeriodMode = 'monthly' | 'quarterly';
+
 export interface BudgetVsActualRow {
   accountId: string;
   code: string;
@@ -54,6 +66,8 @@ export interface BudgetVsActualRow {
    * expense is favorable when actual <= budget.
    */
   favorable: boolean;
+  /** Per-period cells (12 monthly or 4 quarterly) when a period mode is requested. */
+  periods?: BudgetPeriodCell[];
 }
 
 export interface BudgetSectionTotals {
@@ -83,6 +97,10 @@ export interface BudgetVsActualReport {
   totalBudget: string;
   totalActual: string;
   totalVariance: string;
+  /** Period column labels ('Jan'…'Dec' or 'Q1'…'Q4') when a period mode is requested. */
+  periodLabels?: string[];
+  /** Net (income - expense) budget/actual/variance per period column. */
+  periodNetTotals?: BudgetPeriodCell[];
 }
 
 // ---------------------------------------------------------------------------
@@ -233,14 +251,34 @@ export async function setBudgetLine(
 // budgetVsActual
 // ---------------------------------------------------------------------------
 
+/** Bucket 12 monthly Decimal amounts into period sums (12 monthly or 4 quarterly). */
+function bucketMonths(
+  months: ReturnType<typeof Money.zero>[],
+  mode: BudgetPeriodMode,
+): ReturnType<typeof Money.zero>[] {
+  if (mode === 'monthly') return months;
+  const quarters = Array.from({ length: 4 }, () => Money.zero());
+  months.forEach((amt, i) => {
+    quarters[Math.floor(i / 3)] = quarters[Math.floor(i / 3)].plus(amt);
+  });
+  return quarters;
+}
+
+const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
 /**
  * For each account that has at least one budget line, sum the budgeted amounts
  * (all months), then fetch actual P&L for the full fiscal year and match by accountId.
  * Returns rows sorted by account code.
+ *
+ * Period columns (additive): pass opts.periods = 'monthly' | 'quarterly' to get
+ * per-period budget/actual/variance cells on every row (reuses the monthly P&L
+ * bucketing from profitAndLossByMonth) plus net per-period totals.
  */
 export async function budgetVsActual(
   ctx: ServiceContext,
   budgetId: string,
+  opts?: { periods?: BudgetPeriodMode },
 ): Promise<BudgetVsActualReport> {
   const [budget] = await ctx.db
     .select()
@@ -254,17 +292,33 @@ export async function budgetVsActual(
     .from(budgetLines)
     .where(eq(budgetLines.budgetId, budgetId));
 
-  // Aggregate budget by accountId.
+  // Aggregate budget by accountId (annual total + per-month for period columns).
   const budgetByAccount = new Map<string, ReturnType<typeof Money.zero>>();
+  const budgetMonthsByAccount = new Map<string, ReturnType<typeof Money.zero>[]>();
   for (const line of lines) {
     const prev = budgetByAccount.get(line.accountId) ?? Money.zero();
     budgetByAccount.set(line.accountId, prev.plus(Money.of(line.amount)));
+    const months =
+      budgetMonthsByAccount.get(line.accountId) ??
+      Array.from({ length: 12 }, () => Money.zero());
+    months[line.month - 1] = months[line.month - 1].plus(Money.of(line.amount));
+    budgetMonthsByAccount.set(line.accountId, months);
   }
 
   // Fetch full-year P&L actuals (closing entries are already excluded there).
   const from = new Date(`${budget.fiscalYear}-01-01T00:00:00.000Z`);
   const to = new Date(`${budget.fiscalYear}-12-31T23:59:59.999Z`);
   const pl = await profitAndLoss(ctx, { from, to });
+
+  // Monthly actuals only when period columns were requested (12 extra queries).
+  const periodMode = opts?.periods;
+  let monthlyPl: ProfitAndLossByMonth | null = null;
+  if (periodMode) {
+    monthlyPl = await profitAndLossByMonth(ctx, budget.fiscalYear);
+  }
+  const periodCount = periodMode === 'monthly' ? 12 : periodMode === 'quarterly' ? 4 : 0;
+  const periodNetBudget = Array.from({ length: periodCount }, () => Money.zero());
+  const periodNetActual = Array.from({ length: periodCount }, () => Money.zero());
 
   // Build a map of accountId -> actual amount from P&L.
   const actualByAccount = new Map<string, string>();
@@ -311,6 +365,36 @@ export async function budgetVsActual(
       expenseActual = expenseActual.plus(actualAmt);
     }
 
+    // Per-period cells (monthly/quarterly column mode).
+    let periods: BudgetPeriodCell[] | undefined;
+    if (periodMode && monthlyPl) {
+      const monthlyRow = (isRevenue ? monthlyPl.income : monthlyPl.expenses).find(
+        (r) => r.accountId === accountId,
+      );
+      const actualMonths = (monthlyRow?.months ?? Array(12).fill('0.00')).map((m: string) =>
+        Money.of(m),
+      );
+      const budgetMonths =
+        budgetMonthsByAccount.get(accountId) ?? Array.from({ length: 12 }, () => Money.zero());
+      const actualPeriods = bucketMonths(actualMonths, periodMode);
+      const budgetPeriods = bucketMonths(budgetMonths, periodMode);
+      periods = actualPeriods.map((actualP, p) => {
+        const budgetP = budgetPeriods[p];
+        // Net per-period totals: income adds, expense subtracts.
+        periodNetBudget[p] = isRevenue
+          ? periodNetBudget[p].plus(budgetP)
+          : periodNetBudget[p].minus(budgetP);
+        periodNetActual[p] = isRevenue
+          ? periodNetActual[p].plus(actualP)
+          : periodNetActual[p].minus(actualP);
+        return {
+          budget: toAmountString(budgetP),
+          actual: toAmountString(actualP),
+          variance: toAmountString(actualP.minus(budgetP)),
+        };
+      });
+    }
+
     rows.push({
       accountId,
       code: meta.code,
@@ -323,6 +407,7 @@ export async function budgetVsActual(
       favorable: isRevenue
         ? actualAmt.greaterThanOrEqualTo(budgetAmt)
         : actualAmt.lessThanOrEqualTo(budgetAmt),
+      periods,
     });
   }
 
@@ -354,5 +439,17 @@ export async function budgetVsActual(
     totalBudget: toAmountString(netBudget),
     totalActual: toAmountString(netActual),
     totalVariance: toAmountString(netVariance),
+    periodLabels: periodMode
+      ? periodMode === 'monthly'
+        ? [...MONTH_LABELS]
+        : ['Q1', 'Q2', 'Q3', 'Q4']
+      : undefined,
+    periodNetTotals: periodMode
+      ? periodNetActual.map((actualP, p) => ({
+          budget: toAmountString(periodNetBudget[p]),
+          actual: toAmountString(actualP),
+          variance: toAmountString(actualP.minus(periodNetBudget[p])),
+        }))
+      : undefined,
   };
 }

@@ -8,6 +8,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listLocations, createLocation } from '@/lib/services/dimensions';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createLocationSchema } from '@/lib/validation/dimensions';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -37,8 +39,12 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-    const loc = await createLocation(ctx, { name: body.name });
+    const body = await req.json().catch(() => ({}));
+    const parsed = createLocationSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
+    const loc = await createLocation(ctx, parsed.data);
     return NextResponse.json(loc, { status: 201 });
   } catch (err) {
     return errorResponse(err);

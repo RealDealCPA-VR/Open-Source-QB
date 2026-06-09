@@ -10,6 +10,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getEmployee, updateEmployee } from '@/lib/services/payroll';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { updateEmployeeSchema } from '@/lib/validation/employees';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -56,19 +58,14 @@ export async function PATCH(
   try {
     const ctx = await getServerContext();
     const { id } = await params;
-    const body = await req.json();
+    const body = await req.json().catch(() => ({}));
+    // zod strip mode keeps absent keys absent — only provided fields are updated.
+    const parsed = updateEmployeeSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
 
-    const updated = await updateEmployee(ctx, id, {
-      firstName: body.firstName,
-      lastName: body.lastName,
-      email: body.email,
-      payType: body.payType,
-      payRate: body.payRate,
-      ssn: body.ssn,
-      w4: body.w4,
-      address: body.address,
-      isActive: body.isActive,
-    });
+    const updated = await updateEmployee(ctx, id, parsed.data);
 
     return NextResponse.json(maskEmployee(updated));
   } catch (err) {

@@ -34,6 +34,7 @@ import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   accounts,
   classes,
+  companies,
   customers,
   inventoryLayers,
   invoices,
@@ -113,6 +114,46 @@ export interface CreateInvoiceInput {
    * Defaults to 1 (base currency).
    */
   exchangeRate?: string | number | null;
+  /**
+   * 'draft' saves a PENDING invoice: no GL posting, no inventory relief.
+   * Post it later with `postDraftInvoice` (period check happens at post time).
+   * Defaults to 'open' (post immediately).
+   */
+  status?: 'draft' | 'open' | null;
+  /** Values for company-defined invoice custom fields ({ [fieldName]: value }). */
+  customFields?: Record<string, string> | null;
+}
+
+/** A company-defined custom field rendered on the invoice form. */
+export interface InvoiceCustomFieldDef {
+  name: string;
+}
+
+/**
+ * Read the company-defined custom-field definitions for invoices.
+ *
+ * Definitions live in companies.settings.customFields.invoice as a [{ name }]
+ * array (managed by the custom-fields service/UI). Tolerates plain-string
+ * entries for forward compatibility.
+ */
+export async function getInvoiceCustomFieldDefs(
+  ctx: ServiceContext,
+): Promise<InvoiceCustomFieldDef[]> {
+  const [row] = await ctx.db
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId));
+  const raw = (row?.settings as { customFields?: { invoice?: unknown } } | null)?.customFields
+    ?.invoice;
+  if (!Array.isArray(raw)) return [];
+  const defs: InvoiceCustomFieldDef[] = [];
+  for (const entry of raw) {
+    if (typeof entry === 'string' && entry.trim()) defs.push({ name: entry.trim() });
+    else if (entry && typeof (entry as { name?: unknown }).name === 'string') {
+      defs.push({ name: (entry as { name: string }).name });
+    }
+  }
+  return defs;
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +188,30 @@ async function getOrCreateAccountByCode(
   return created.id;
 }
 
+/**
+ * Sum of an invoice's stored payment-item lines (items.type = 'payment').
+ * `amountPaid` includes these, so "has external payments applied" checks must
+ * compare amountPaid against this sum instead of against zero.
+ */
+async function storedPaymentLineTotal(ctx: ServiceContext, invoiceId: string) {
+  const rows = await ctx.db
+    .select({ amount: invoiceLines.amount })
+    .from(invoiceLines)
+    .innerJoin(items, eq(items.id, invoiceLines.itemId))
+    .where(and(eq(invoiceLines.invoiceId, invoiceId), eq(items.type, 'payment')));
+  return rows.reduce((sum, r) => sum.plus(Money.of(r.amount)), Money.zero());
+}
+
+/** True when the invoice has payments applied beyond its own payment-item lines. */
+async function hasExternalPayments(
+  ctx: ServiceContext,
+  invoice: { id: string; amountPaid: string | null },
+): Promise<boolean> {
+  if (!invoice.amountPaid || !Money.gt(invoice.amountPaid, 0)) return false;
+  const paymentLines = await storedPaymentLineTotal(ctx, invoice.id);
+  return Money.of(invoice.amountPaid).greaterThan(paymentLines);
+}
+
 /** Return the next invoice number for the company (max + 1, 1 if none). */
 async function nextInvoiceNumber(ctx: ServiceContext): Promise<number> {
   const [row] = await ctx.db
@@ -160,6 +225,19 @@ async function nextInvoiceNumber(ctx: ServiceContext): Promise<number> {
 // prepareInvoice — shared validation + computation for create/update
 // ---------------------------------------------------------------------------
 
+/**
+ * Posting semantics of a line, derived from its item's type:
+ *  - 'income'    — normal revenue line (service/inventory/non_inventory/bundle/
+ *                  other_charge or no item). Credits its income account.
+ *  - 'discount'  — negative body line. Debits its discount (income) account.
+ *  - 'subtotal'  — UI helper: amount = sum of body lines since the previous
+ *                  subtotal. Non-posting, excluded from all totals.
+ *  - 'payment'   — reduces the balance: Dr Undeposited Funds / Cr A/R (by
+ *                  shrinking the A/R debit) within the invoice entry.
+ *  - 'sales_tax' — manual tax line: adds to taxAmount (Cr 2200), not subtotal.
+ */
+type LineKind = 'income' | 'discount' | 'subtotal' | 'payment' | 'sales_tax';
+
 type ComputedLine = {
   itemId: string | null;
   accountId: string;         // resolved income account id
@@ -172,6 +250,7 @@ type ComputedLine = {
   classId: string | null;
   jobId: string | null;
   lineOrder: number;
+  kind: LineKind;
 };
 
 interface PreparedInvoice {
@@ -192,6 +271,12 @@ interface PreparedInvoice {
   retainagePct: ReturnType<typeof Money.zero>;
   retainageAmount: ReturnType<typeof Money.zero>;
   dueNow: ReturnType<typeof Money.zero>;
+  /** Gross positive income-line sum (= subtotal + discount-line magnitudes). */
+  grossIncome: ReturnType<typeof Money.zero>;
+  /** Sum of payment-item lines (already received; shrinks the A/R debit). */
+  paymentTotal: ReturnType<typeof Money.zero>;
+  /** Undeposited Funds (1050); resolved only when payment lines exist. */
+  ufAccountId: string | null;
   itemMap: Map<string, { incomeAccountId: string | null; type: string; name: string }>;
 }
 
@@ -322,20 +407,28 @@ async function prepareInvoice(
   let perLineTax = Money.zero();
 
   // --- Compute per-line amounts and subtotal ---
+  // QB item-type semantics: lines whose item is a special type (discount /
+  // subtotal / payment / sales_tax) do NOT post as plain income — see LineKind.
   let subtotal = Money.zero();
   let taxableSubtotal = Money.zero();
+  let grossIncome = Money.zero();
+  let paymentTotal = Money.zero();
+  let salesTaxLines = Money.zero();
+  // Running sum of body lines (income + discount) since the last subtotal item.
+  let runningBody = Money.zero();
   const computedLines: ComputedLine[] = [];
 
   for (let i = 0; i < input.lines.length; i++) {
     const l = input.lines[i];
-    const qty = Money.of(l.quantity);
-    const rate = Money.of(l.rate);
-    if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
-    if (rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
+    const itemType = l.itemId ? (itemMap.get(l.itemId)?.type ?? 'service') : 'service';
+    const kind: LineKind =
+      itemType === 'discount' || itemType === 'subtotal' ||
+      itemType === 'payment' || itemType === 'sales_tax'
+        ? (itemType as LineKind)
+        : 'income';
 
-    const amount = Money.round2(Money.mul(qty, rate));
-
-    // Resolve income account: explicit accountId > item.incomeAccountId > 4000
+    // Resolve income account: explicit accountId > item.incomeAccountId > 4000.
+    // (For discount lines this is the DISCOUNT account that gets debited.)
     let resolvedAccountId = defaultIncomeId;
     if (l.accountId) {
       // Verify it belongs to this company.
@@ -350,15 +443,71 @@ async function prepareInvoice(
       if (itemIncomeId) resolvedAccountId = itemIncomeId;
     }
 
-    const taxable = l.taxable !== false; // default true
-    subtotal = subtotal.plus(amount);
-    if (taxable) {
-      if (l.taxRateId) {
-        // Per-line rate: tax this line directly, keep it out of the invoice-level taxable base.
-        perLineTax = perLineTax.plus(Money.round2(Money.mul(amount, lineTaxRateMap.get(l.taxRateId)!)));
-      } else {
-        taxableSubtotal = taxableSubtotal.plus(amount);
+    if (kind === 'subtotal') {
+      // UI-computed subtotal of the preceding body lines — non-posting,
+      // excluded from every total. Stored so the printed doc shows it.
+      computedLines.push({
+        itemId: l.itemId ?? null,
+        accountId: resolvedAccountId,
+        description: l.description ?? 'Subtotal',
+        quantity: '1.00',
+        rate: toAmountString(runningBody),
+        amount: toAmountString(runningBody),
+        taxable: false,
+        taxRateId: null,
+        classId: l.classId ?? headerClassId,
+        jobId: l.jobId ?? headerJobId,
+        lineOrder: i,
+        kind,
+      });
+      runningBody = Money.zero(); // QB: a subtotal item resets the running group
+      continue;
+    }
+
+    const qty = Money.of(l.quantity);
+    const rate = Money.of(l.rate);
+    if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
+    if (kind !== 'discount' && rate.lessThan(0)) {
+      throw validation(`Line ${i + 1}: rate cannot be negative.`);
+    }
+
+    let amount = Money.round2(Money.mul(qty, rate));
+    let taxable = l.taxable !== false; // default true
+
+    if (kind === 'discount') {
+      // A discount line always REDUCES the invoice: store a negative amount
+      // regardless of the sign the caller entered.
+      amount = Money.abs(amount).negated();
+      // (magnitude check against the whole body happens via the total >= 0 guard)
+    } else if (kind === 'payment') {
+      if (amount.lessThanOrEqualTo(0)) {
+        throw validation(`Line ${i + 1}: payment line amount must be positive.`);
       }
+      taxable = false;
+    } else if (kind === 'sales_tax') {
+      if (amount.lessThan(0)) {
+        throw validation(`Line ${i + 1}: sales tax line amount cannot be negative.`);
+      }
+      taxable = false;
+    }
+
+    if (kind === 'income' || kind === 'discount') {
+      subtotal = subtotal.plus(amount);
+      runningBody = runningBody.plus(amount);
+      if (kind === 'income') grossIncome = grossIncome.plus(amount);
+      if (taxable) {
+        if (l.taxRateId && kind === 'income') {
+          // Per-line rate: tax this line directly, keep it out of the invoice-level taxable base.
+          perLineTax = perLineTax.plus(Money.round2(Money.mul(amount, lineTaxRateMap.get(l.taxRateId)!)));
+        } else {
+          // Taxable discount lines reduce the invoice-level taxable base.
+          taxableSubtotal = taxableSubtotal.plus(amount);
+        }
+      }
+    } else if (kind === 'payment') {
+      paymentTotal = paymentTotal.plus(amount);
+    } else if (kind === 'sales_tax') {
+      salesTaxLines = salesTaxLines.plus(amount);
     }
 
     computedLines.push({
@@ -369,10 +518,11 @@ async function prepareInvoice(
       rate: toAmountString(rate),
       amount: toAmountString(amount),
       taxable,
-      taxRateId: l.taxRateId ?? null,
+      taxRateId: kind === 'income' ? (l.taxRateId ?? null) : null,
       classId: l.classId ?? headerClassId,
       jobId: l.jobId ?? headerJobId,
       lineOrder: i,
+      kind,
     });
   }
 
@@ -389,9 +539,15 @@ async function prepareInvoice(
     discount = discountRaw;
   }
 
-  // taxAmount = (invoice-rate base * rate) + sum of per-line-rate taxes
-  const taxAmount = Money.round2(Money.mul(taxableSubtotal, taxRateDecimal)).plus(perLineTax);
-  // total = subtotal - discount + taxAmount  (all in transaction currency)
+  // taxAmount = (invoice-rate base * rate) + per-line-rate taxes + manual sales_tax lines.
+  // Discount item lines can drag the taxable base negative; tax never goes below 0.
+  const effectiveTaxableBase = taxableSubtotal.lessThan(0) ? Money.zero() : taxableSubtotal;
+  let taxAmount = Money.round2(Money.mul(effectiveTaxableBase, taxRateDecimal))
+    .plus(perLineTax)
+    .plus(salesTaxLines);
+  if (taxAmount.lessThan(0)) taxAmount = Money.zero();
+  // total = subtotal - discount + taxAmount  (all in transaction currency;
+  // subtotal is already net of discount ITEM lines — `discount` here is the header discount)
   const total = Money.round2(subtotal.minus(discount).plus(taxAmount));
 
   if (total.lessThan(0)) {
@@ -406,6 +562,19 @@ async function prepareInvoice(
     ? Money.round2(Money.mul(total, Money.div(retainagePct, 100)))
     : Money.zero();
   const dueNow = Money.round2(total.minus(retainageAmount));
+
+  // --- Payment item lines: cannot exceed what is billable now ---
+  if (paymentTotal.greaterThan(dueNow)) {
+    throw validation('Payment line(s) exceed the invoice balance due.');
+  }
+  // Resolve Undeposited Funds (1050) only when a payment line needs it.
+  const ufAccountId = paymentTotal.greaterThan(0)
+    ? await getOrCreateAccountByCode(ctx, '1050', {
+        name: 'Undeposited Funds',
+        type: 'asset',
+        subtype: 'checking',
+      })
+    : null;
 
   // --- Credit limit check ---
   if (customer.creditLimit != null) {
@@ -453,6 +622,9 @@ async function prepareInvoice(
     retainagePct,
     retainageAmount,
     dueNow,
+    grossIncome,
+    paymentTotal,
+    ufAccountId,
     itemMap,
   };
 }
@@ -491,42 +663,62 @@ async function postInvoiceGL(
   date: Date,
 ) {
   const {
-    subtotal, taxAmount, discount, dueNow, retainageAmount, exchangeRate,
+    taxAmount, discount, dueNow, retainageAmount, exchangeRate,
     arAccountId, defaultIncomeId, taxPayableId, retainageAcctId, headerClassId,
-    computedLines,
+    computedLines, grossIncome, paymentTotal, ufAccountId,
   } = prep;
 
-  const entryBase = Money.round2(Money.mul(subtotal.plus(taxAmount), exchangeRate));
+  // Anchor on the gross credit side: income line amounts + tax. (grossIncome =
+  // subtotal + discount-line magnitudes, so this generalises the old
+  // subtotal+tax anchor when no discount item lines exist.)
+  const entryBase = Money.round2(Money.mul(grossIncome.plus(taxAmount), exchangeRate));
 
   // Aggregate per income account + class (multiple lines may share an account, and
   // class must flow onto the GL line so P&L-by-Class sees invoice revenue).
+  // Only 'income' lines credit revenue; discount lines collect on the debit side.
   const incomeCredits = new Map<
     string,
     { accountId: string; classId: string | null; amount: ReturnType<typeof Money.zero> }
   >();
+  const discountDebits = new Map<
+    string,
+    { accountId: string; classId: string | null; amount: ReturnType<typeof Money.zero> }
+  >();
   for (const cl of computedLines) {
+    if (cl.kind !== 'income' && cl.kind !== 'discount') continue;
     const key = `${cl.accountId}|${cl.classId ?? ''}`;
-    const prev = incomeCredits.get(key);
+    const map = cl.kind === 'income' ? incomeCredits : discountDebits;
+    const lineAmt = Money.abs(Money.of(cl.amount)); // discount amounts are stored negative
+    const prev = map.get(key);
     if (prev) {
-      prev.amount = prev.amount.plus(Money.of(cl.amount));
+      prev.amount = prev.amount.plus(lineAmt);
     } else {
-      incomeCredits.set(key, {
-        accountId: cl.accountId,
-        classId: cl.classId,
-        amount: Money.of(cl.amount),
-      });
+      map.set(key, { accountId: cl.accountId, classId: cl.classId, amount: lineAmt });
     }
   }
 
-  // Debit side: A/R for the amount due now, Retainage Receivable for any held-back
-  // portion, and the discount contra. Weights sum to dueNow + retainage + discount
-  // = total + discount = subtotal + taxAmount, matching the credit side.
+  // Debit side: A/R for the amount still due (after payment item lines),
+  // Undeposited Funds for payment lines, Retainage Receivable for any held-back
+  // portion, the header-discount contra, and each discount item line.
+  // Weights sum to (dueNow - payments) + payments + retainage + discount + discountLines
+  // = total + discount + discountLines = grossIncome + taxAmount, matching the credit side.
   const debitSpecs: Array<{
     accountId: string;
     weight: ReturnType<typeof Money.zero>;
     memo: string;
     classId?: string | null;
-  }> = [{ accountId: arAccountId, weight: dueNow, memo: `Invoice #${invoiceNumber}` }];
+  }> = [{
+    accountId: arAccountId,
+    weight: dueNow.minus(paymentTotal),
+    memo: `Invoice #${invoiceNumber}`,
+  }];
+  if (paymentTotal.greaterThan(0) && ufAccountId) {
+    debitSpecs.push({
+      accountId: ufAccountId,
+      weight: paymentTotal,
+      memo: `Invoice #${invoiceNumber} — payment received`,
+    });
+  }
   if (retainageAmount.greaterThan(0) && retainageAcctId) {
     debitSpecs.push({
       accountId: retainageAcctId,
@@ -541,6 +733,16 @@ async function postInvoiceGL(
       memo: `Invoice #${invoiceNumber} — discount`,
       classId: headerClassId,
     });
+  }
+  for (const spec of discountDebits.values()) {
+    if (spec.amount.greaterThan(0)) {
+      debitSpecs.push({
+        accountId: spec.accountId,
+        weight: spec.amount,
+        memo: `Invoice #${invoiceNumber} — discount`,
+        classId: spec.classId,
+      });
+    }
   }
 
   // Credit side: each income account for its gross line amounts, plus sales tax.
@@ -817,8 +1019,17 @@ async function reverseInvoiceCOGS(
 // createInvoice
 // ---------------------------------------------------------------------------
 
+/** Post-posting status for an invoice given its prepared amounts. */
+function postedStatus(prep: PreparedInvoice): 'open' | 'partial' | 'paid' {
+  const balance = prep.dueNow.minus(prep.paymentTotal);
+  if (prep.paymentTotal.greaterThan(0) && balance.lessThanOrEqualTo(0)) return 'paid';
+  if (prep.paymentTotal.greaterThan(0)) return 'partial';
+  return 'open';
+}
+
 export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInput) {
   const prep = await prepareInvoice(ctx, input);
+  const isDraft = input.status === 'draft';
 
   // ---------------------------------------------------------------------------
   // Persist everything in a single transaction.
@@ -832,6 +1043,8 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
 
     // 1) Insert invoice header.
     //    subtotal / discount / taxAmount / total / balanceDue are stored in TRANSACTION currency.
+    //    Drafts (pending invoices) are saved with NO GL posting and NO inventory
+    //    relief — `postDraftInvoice` posts them later.
     const [invoice] = await tx.db
       .insert(invoices)
       .values({
@@ -840,7 +1053,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         invoiceNumber,
         date: input.date,
         dueDate: input.dueDate ?? null,
-        status: 'open',
+        status: isDraft ? 'draft' : postedStatus(prep),
         taxRateId: input.taxRateId ?? null,
         classId: prep.headerClassId,
         jobId: prep.headerJobId,
@@ -851,12 +1064,13 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         discount: toAmountString(prep.discount),
         taxAmount: toAmountString(prep.taxAmount),
         total: toAmountString(prep.total),
-        amountPaid: '0.00',
-        balanceDue: toAmountString(prep.dueNow),
+        amountPaid: isDraft ? '0.00' : toAmountString(prep.paymentTotal),
+        balanceDue: toAmountString(prep.dueNow.minus(prep.paymentTotal)),
         retainagePercent: prep.usesRetainage ? prep.retainagePct.toFixed(2) : null,
         retainageAmount: toAmountString(prep.retainageAmount),
         memo: input.memo ?? null,
-        // postedEntryId filled below after posting
+        customFields: input.customFields ?? null,
+        // postedEntryId filled below after posting (stays null for drafts)
       })
       .returning();
 
@@ -877,6 +1091,22 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         lineOrder: cl.lineOrder,
       })),
     );
+
+    if (isDraft) {
+      // Pending invoice: no journal entry, no COGS, no stock relief.
+      await writeAudit(tx, {
+        action: 'create',
+        entityType: 'invoice',
+        entityId: invoice.id,
+        newValues: {
+          invoiceNumber,
+          customerId: input.customerId,
+          total: toAmountString(prep.total),
+          status: 'draft',
+        },
+      });
+      return { ...invoice, lines: prep.computedLines };
+    }
 
     // 3) Build and post the journal entry.
     const entry = await postInvoiceGL(tx, prep, invoice.id, invoiceNumber, input.date);
@@ -902,6 +1132,112 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         total: toAmountString(prep.total),
         postedEntryId: entry.id,
       },
+    });
+
+    return { ...updated, lines: prep.computedLines };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// postDraftInvoice — post a pending (draft) invoice to the GL
+// ---------------------------------------------------------------------------
+
+/**
+ * Post a pending (draft) invoice: re-validates and recomputes the document from
+ * its stored lines, posts the GL entry and perpetual-inventory COGS, and flips
+ * the status to open/partial/paid. The fiscal-period check happens NOW (post
+ * time) via `postJournalEntry`'s assertPeriodOpen on the invoice date — drafts
+ * themselves are non-posting and may be saved into any period.
+ */
+export async function postDraftInvoice(ctx: ServiceContext, id: string) {
+  const [existing] = await ctx.db
+    .select()
+    .from(invoices)
+    .where(and(eq(invoices.companyId, ctx.companyId), eq(invoices.id, id)));
+  if (!existing) throw notFound('Invoice');
+  if (existing.status !== 'draft') {
+    throw new ServiceError('CONFLICT', 'Only pending (draft) invoices can be posted.');
+  }
+
+  const storedLines = await ctx.db
+    .select()
+    .from(invoiceLines)
+    .where(eq(invoiceLines.invoiceId, id))
+    .orderBy(invoiceLines.lineOrder);
+
+  // Rebuild the document input from storage. The stored header discount is the
+  // RESOLVED dollar amount, so it re-enters as a flat 'amount' discount.
+  const input: CreateInvoiceInput = {
+    customerId: existing.customerId,
+    date: existing.date,
+    dueDate: existing.dueDate,
+    taxRateId: existing.taxRateId,
+    classId: existing.classId,
+    jobId: existing.jobId,
+    discount: existing.discount,
+    discountType: 'amount',
+    retainagePercent: existing.retainagePercent,
+    currency: existing.currency,
+    exchangeRate: existing.exchangeRate,
+    memo: existing.memo,
+    customFields: existing.customFields ?? null,
+    lines: storedLines.map((l) => ({
+      itemId: l.itemId,
+      accountId: l.accountId,
+      description: l.description,
+      quantity: l.quantity,
+      rate: l.rate,
+      taxable: l.taxable,
+      taxRateId: l.taxRateId,
+      classId: l.classId,
+      jobId: l.jobId,
+    })),
+  };
+
+  const prep = await prepareInvoice(ctx, input, { excludeInvoiceId: id });
+
+  return inTransaction(ctx, async (tx) => {
+    // Re-load inside the transaction to close the read-then-post race.
+    const [invoice] = await tx.db
+      .select()
+      .from(invoices)
+      .where(and(eq(invoices.companyId, tx.companyId), eq(invoices.id, id)));
+    if (!invoice) throw notFound('Invoice');
+    if (invoice.status !== 'draft') {
+      throw new ServiceError('CONFLICT', 'Only pending (draft) invoices can be posted.');
+    }
+
+    // 1) Post the GL entry (assertPeriodOpen runs here, on the invoice date).
+    const entry = await postInvoiceGL(tx, prep, id, invoice.invoiceNumber, invoice.date);
+
+    // 2) Flip the header to its posted state.
+    const [updated] = await tx.db
+      .update(invoices)
+      .set({
+        status: postedStatus(prep),
+        subtotal: toAmountString(prep.subtotal),
+        discount: toAmountString(prep.discount),
+        taxAmount: toAmountString(prep.taxAmount),
+        total: toAmountString(prep.total),
+        amountPaid: toAmountString(prep.paymentTotal),
+        balanceDue: toAmountString(prep.dueNow.minus(prep.paymentTotal)),
+        retainageAmount: toAmountString(prep.retainageAmount),
+        postedEntryId: entry.id,
+        updatedAt: new Date(),
+      })
+      .where(eq(invoices.id, id))
+      .returning();
+
+    // 3) Perpetual inventory: relieve stock + post COGS now that it is real.
+    await postInvoiceCOGS(tx, prep, id, invoice.invoiceNumber, invoice.date);
+
+    // 4) Audit trail.
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'invoice',
+      entityId: id,
+      oldValues: { status: 'draft' },
+      newValues: { status: updated.status, postedEntryId: entry.id },
     });
 
     return { ...updated, lines: prep.computedLines };
@@ -937,7 +1273,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
   if (existing.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot edit a voided invoice.');
   }
-  if (existing.amountPaid && Money.gt(existing.amountPaid, 0)) {
+  if (await hasExternalPayments(ctx, existing)) {
     throw new ServiceError(
       'CONFLICT',
       'Cannot edit an invoice that has payments or credits applied. Unapply them first.',
@@ -947,6 +1283,77 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
   // Validate + compute the new document (read-only). Exclude this invoice's own
   // current balance from the credit-limit exposure — it is being replaced.
   const prep = await prepareInvoice(ctx, input, { excludeInvoiceId: id });
+
+  // ── Drafts: editing a pending invoice is a simple row update — nothing was
+  //    ever posted, so there is no GL/COGS to void or re-post. ──
+  if (existing.status === 'draft') {
+    return inTransaction(ctx, async (tx) => {
+      const [invoice] = await tx.db
+        .select()
+        .from(invoices)
+        .where(and(eq(invoices.companyId, tx.companyId), eq(invoices.id, id)));
+      if (!invoice || invoice.status !== 'draft') {
+        throw new ServiceError('CONFLICT', 'Invoice is no longer a draft — reload and retry.');
+      }
+
+      await tx.db.delete(invoiceLines).where(eq(invoiceLines.invoiceId, id));
+      await tx.db.insert(invoiceLines).values(
+        prep.computedLines.map((cl) => ({
+          invoiceId: id,
+          itemId: cl.itemId,
+          accountId: cl.accountId,
+          description: cl.description,
+          quantity: cl.quantity,
+          rate: cl.rate,
+          amount: cl.amount,
+          taxable: cl.taxable,
+          taxRateId: cl.taxRateId,
+          classId: cl.classId,
+          jobId: cl.jobId,
+          lineOrder: cl.lineOrder,
+        })),
+      );
+
+      const [updated] = await tx.db
+        .update(invoices)
+        .set({
+          customerId: input.customerId,
+          date: input.date,
+          dueDate: input.dueDate ?? null,
+          status: 'draft',
+          taxRateId: input.taxRateId ?? null,
+          classId: prep.headerClassId,
+          jobId: prep.headerJobId,
+          currency: input.currency ?? null,
+          exchangeRate: toAmountString(prep.exchangeRate),
+          discountType: prep.discountType,
+          subtotal: toAmountString(prep.subtotal),
+          discount: toAmountString(prep.discount),
+          taxAmount: toAmountString(prep.taxAmount),
+          total: toAmountString(prep.total),
+          amountPaid: '0.00',
+          balanceDue: toAmountString(prep.dueNow.minus(prep.paymentTotal)),
+          retainagePercent: prep.usesRetainage ? prep.retainagePct.toFixed(2) : null,
+          retainageAmount: toAmountString(prep.retainageAmount),
+          memo: input.memo ?? null,
+          customFields:
+            input.customFields !== undefined ? input.customFields : invoice.customFields,
+          updatedAt: new Date(),
+        })
+        .where(eq(invoices.id, id))
+        .returning();
+
+      await writeAudit(tx, {
+        action: 'update',
+        entityType: 'invoice',
+        entityId: id,
+        oldValues: { status: 'draft', total: invoice.total },
+        newValues: { status: 'draft', total: toAmountString(prep.total) },
+      });
+
+      return { ...updated, lines: prep.computedLines };
+    });
+  }
 
   return inTransaction(ctx, async (tx) => {
     // Re-load inside the transaction to close the read-then-write race.
@@ -958,7 +1365,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
     if (invoice.status === 'void') {
       throw new ServiceError('CONFLICT', 'Cannot edit a voided invoice.');
     }
-    if (invoice.amountPaid && Money.gt(invoice.amountPaid, 0)) {
+    if (await hasExternalPayments(tx, invoice)) {
       throw new ServiceError(
         'CONFLICT',
         'Cannot edit an invoice that has payments or credits applied. Unapply them first.',
@@ -1009,7 +1416,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         customerId: input.customerId,
         date: input.date,
         dueDate: input.dueDate ?? null,
-        status: 'open',
+        status: postedStatus(prep),
         taxRateId: input.taxRateId ?? null,
         classId: prep.headerClassId,
         jobId: prep.headerJobId,
@@ -1020,11 +1427,13 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         discount: toAmountString(prep.discount),
         taxAmount: toAmountString(prep.taxAmount),
         total: toAmountString(prep.total),
-        amountPaid: '0.00',
-        balanceDue: toAmountString(prep.dueNow),
+        amountPaid: toAmountString(prep.paymentTotal),
+        balanceDue: toAmountString(prep.dueNow.minus(prep.paymentTotal)),
         retainagePercent: prep.usesRetainage ? prep.retainagePct.toFixed(2) : null,
         retainageAmount: toAmountString(prep.retainageAmount),
         memo: input.memo ?? null,
+        customFields:
+          input.customFields !== undefined ? input.customFields : invoice.customFields,
         postedEntryId: entry.id,
         updatedAt: new Date(),
       })
@@ -1112,9 +1521,29 @@ export async function getInvoice(ctx: ServiceContext, id: string) {
     .where(and(eq(invoices.companyId, ctx.companyId), eq(invoices.id, id)));
   if (!invoice) throw notFound('Invoice');
 
+  // Left-join item master data so line grids / printed docs can show the item
+  // name, its type (discount/subtotal/payment badges), and unit of measure.
   const lines = await ctx.db
-    .select()
+    .select({
+      id: invoiceLines.id,
+      invoiceId: invoiceLines.invoiceId,
+      itemId: invoiceLines.itemId,
+      accountId: invoiceLines.accountId,
+      description: invoiceLines.description,
+      quantity: invoiceLines.quantity,
+      rate: invoiceLines.rate,
+      amount: invoiceLines.amount,
+      taxable: invoiceLines.taxable,
+      classId: invoiceLines.classId,
+      jobId: invoiceLines.jobId,
+      taxRateId: invoiceLines.taxRateId,
+      lineOrder: invoiceLines.lineOrder,
+      itemName: items.name,
+      itemType: items.type,
+      unitOfMeasure: items.unitOfMeasure,
+    })
     .from(invoiceLines)
+    .leftJoin(items, eq(items.id, invoiceLines.itemId))
     .where(eq(invoiceLines.invoiceId, id))
     .orderBy(invoiceLines.lineOrder);
 
@@ -1137,7 +1566,9 @@ export async function voidInvoice(ctx: ServiceContext, id: string) {
     throw new ServiceError('CONFLICT', 'Invoice is already voided.');
   }
 
-  if (invoice.amountPaid && Money.gt(invoice.amountPaid, 0)) {
+  // Payment-item lines live INSIDE the invoice's own entry (voided with it);
+  // only externally applied payments/credits block the void.
+  if (await hasExternalPayments(ctx, invoice)) {
     throw new ServiceError(
       'CONFLICT',
       'Cannot void an invoice that has payments applied. Unapply payments first.',

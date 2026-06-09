@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { Combine, Layers, Plus, Trash2, Hammer } from 'lucide-react';
+import { Combine, Layers, Plus, Trash2, Hammer, Hourglass, CheckCircle2, XCircle } from 'lucide-react';
 import {
   Button,
   Card,
@@ -16,6 +16,7 @@ import {
   PageHeader,
   EmptyState,
   Spinner,
+  ConfirmDialog,
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
@@ -53,6 +54,194 @@ interface DraftBomRow {
   quantity: string;
 }
 
+interface ComponentAvailabilityRow {
+  componentItemId: string;
+  componentName: string;
+  componentSku: string | null;
+  required: string;
+  onHand: string;
+  shortage: string;
+}
+
+interface PendingBuild {
+  id: string;
+  assemblyItemId: string;
+  assemblyName: string;
+  assemblySku: string | null;
+  quantity: string;
+  date: string;
+  memo: string | null;
+  status: string;
+  components: ComponentAvailabilityRow[];
+  canBuild: boolean;
+  shortageCount: number;
+}
+
+// ── Pending Builds section ────────────────────────────────────────────────────
+
+function PendingBuildsSection({
+  refreshKey,
+  onStockChanged,
+}: {
+  refreshKey: number;
+  onStockChanged: () => void;
+}) {
+  const [builds, setBuilds] = useState<PendingBuild[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [confirm, setConfirm] = useState<{ id: string; action: 'finalize' | 'cancel' } | null>(null);
+  const [acting, setActing] = useState(false);
+
+  const fetchBuilds = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await api.get<{ builds: PendingBuild[] }>('/api/assemblies/pending');
+      setBuilds(data.builds ?? []);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to load pending builds.', 'danger');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchBuilds();
+  }, [fetchBuilds, refreshKey]);
+
+  async function runAction() {
+    if (!confirm) return;
+    setActing(true);
+    try {
+      await api.post(`/api/assemblies/pending/${confirm.id}`, { action: confirm.action });
+      toast(confirm.action === 'finalize' ? 'Build finalized.' : 'Pending build cancelled.', 'success');
+      setConfirm(null);
+      await fetchBuilds();
+      if (confirm.action === 'finalize') onStockChanged();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Action failed.', 'danger');
+    } finally {
+      setActing(false);
+    }
+  }
+
+  const confirmBuild = confirm ? builds.find((b) => b.id === confirm.id) : null;
+
+  return (
+    <Card className="p-6 mb-6">
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-3">
+          <Hourglass className="h-5 w-5 text-electric" />
+          <h2 className="text-lg font-bold text-navy">Pending Builds</h2>
+        </div>
+        <Button variant="secondary" size="sm" onClick={fetchBuilds} disabled={loading}>
+          Refresh
+        </Button>
+      </div>
+
+      {loading ? (
+        <div className="flex items-center justify-center gap-2 text-navy/40 text-sm py-8">
+          <Spinner className="h-4 w-4" /> Loading pending builds…
+        </div>
+      ) : builds.length === 0 ? (
+        <EmptyState
+          icon={Hourglass}
+          title="No pending builds"
+          message="Queue a build below to track it here until components are available."
+        />
+      ) : (
+        <Table>
+          <thead>
+            <Tr>
+              <Th>Assembly</Th>
+              <Th numeric>Qty</Th>
+              <Th>Date</Th>
+              <Th>Status</Th>
+              <Th>Components</Th>
+              <Th className="w-52"></Th>
+            </Tr>
+          </thead>
+          <tbody>
+            {builds.map((b) => (
+              <Tr key={b.id}>
+                <Td className="font-semibold text-navy">
+                  {b.assemblyName}
+                  {b.assemblySku ? <span className="ml-1 text-xs text-navy/40">({b.assemblySku})</span> : null}
+                  {b.memo ? <p className="text-xs font-normal text-navy/40">{b.memo}</p> : null}
+                </Td>
+                <Td numeric className="tabular-nums">{parseFloat(b.quantity).toFixed(2)}</Td>
+                <Td className="text-navy/60 text-sm">{new Date(b.date).toLocaleDateString('en-US')}</Td>
+                <Td>
+                  <Badge
+                    tone={b.status === 'pending' ? 'warning' : b.status === 'built' ? 'success' : 'neutral'}
+                  >
+                    {b.status}
+                  </Badge>
+                </Td>
+                <Td>
+                  {b.status !== 'pending' ? (
+                    <span className="text-navy/30 text-sm">—</span>
+                  ) : b.canBuild ? (
+                    <Badge tone="success">
+                      <CheckCircle2 className="h-3 w-3 mr-1 inline" />
+                      Ready to build
+                    </Badge>
+                  ) : (
+                    <div className="flex flex-wrap gap-1">
+                      {b.components
+                        .filter((c) => parseFloat(c.shortage) > 0)
+                        .map((c) => (
+                          <Badge key={c.componentItemId} tone="danger">
+                            {c.componentName}: short {parseFloat(c.shortage).toFixed(2)}
+                          </Badge>
+                        ))}
+                    </div>
+                  )}
+                </Td>
+                <Td>
+                  {b.status === 'pending' && (
+                    <div className="flex gap-2 justify-end">
+                      <Button
+                        size="sm"
+                        disabled={!b.canBuild}
+                        title={b.canBuild ? undefined : 'Blocked: insufficient component stock'}
+                        onClick={() => setConfirm({ id: b.id, action: 'finalize' })}
+                      >
+                        <Hammer className="h-3.5 w-3.5" /> Finalize
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-red-400 hover:text-red-600 hover:bg-red-50"
+                        onClick={() => setConfirm({ id: b.id, action: 'cancel' })}
+                      >
+                        <XCircle className="h-3.5 w-3.5" /> Cancel
+                      </Button>
+                    </div>
+                  )}
+                </Td>
+              </Tr>
+            ))}
+          </tbody>
+        </Table>
+      )}
+
+      <ConfirmDialog
+        open={confirm !== null}
+        title={confirm?.action === 'finalize' ? 'Finalize Pending Build' : 'Cancel Pending Build'}
+        tone={confirm?.action === 'cancel' ? 'danger' : undefined}
+        confirmLabel={confirm?.action === 'finalize' ? 'Build Now' : 'Cancel Build'}
+        loading={acting}
+        message={
+          confirm?.action === 'finalize'
+            ? `Build ${confirmBuild ? parseFloat(confirmBuild.quantity).toFixed(2) : ''} unit(s) of ${confirmBuild?.assemblyName ?? 'this assembly'} now? Component stock will be consumed.`
+            : `Cancel this pending build of ${confirmBuild?.assemblyName ?? 'this assembly'}? No stock will move.`
+        }
+        onConfirm={runAction}
+        onClose={() => (acting ? undefined : setConfirm(null))}
+      />
+    </Card>
+  );
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export default function AssembliesPage() {
@@ -76,6 +265,10 @@ export default function AssembliesPage() {
   const [buildQty, setBuildQty] = useState('1');
   const [buildAction, setBuildAction] = useState<'build' | 'unbuild'>('build');
   const [building, setBuilding] = useState(false);
+
+  // Pending builds
+  const [pendingRefresh, setPendingRefresh] = useState(0);
+  const [queueing, setQueueing] = useState(false);
 
   // ── Data loading ───────────────────────────────────────────────────────────
 
@@ -211,6 +404,36 @@ export default function AssembliesPage() {
     }
   }
 
+  // ── Queue pending build ────────────────────────────────────────────────────
+
+  async function handleQueuePending() {
+    if (!selectedAssemblyId) return;
+    const qty = parseFloat(buildQty);
+    if (!qty || qty <= 0) {
+      toast('Quantity must be greater than zero.', 'danger');
+      return;
+    }
+    setQueueing(true);
+    try {
+      const data = await api.post<{ build: PendingBuild }>('/api/assemblies/pending', {
+        assemblyItemId: selectedAssemblyId,
+        quantity: buildQty,
+        date: new Date().toISOString().slice(0, 10),
+      });
+      setPendingRefresh((n) => n + 1);
+      toast(
+        data.build.canBuild
+          ? `Queued pending build of ${buildQty} unit(s) — components are available.`
+          : `Queued pending build of ${buildQty} unit(s) — ${data.build.shortageCount} component(s) short.`,
+        data.build.canBuild ? 'success' : 'info',
+      );
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to queue pending build.', 'danger');
+    } finally {
+      setQueueing(false);
+    }
+  }
+
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   // Items available as components (not the assembly itself)
@@ -275,6 +498,18 @@ export default function AssembliesPage() {
           )}
         </div>
       </Card>
+
+      {/* Pending builds (always visible) */}
+      <PendingBuildsSection
+        refreshKey={pendingRefresh}
+        onStockChanged={() => {
+          fetchItems();
+          if (selectedAssemblyId) {
+            refreshAssemblyItem(selectedAssemblyId);
+            fetchBom(selectedAssemblyId);
+          }
+        }}
+      />
 
       {selectedAssemblyId && (
         <>
@@ -414,6 +649,19 @@ export default function AssembliesPage() {
                 <Hammer className="h-4 w-4" />
                 {buildAction === 'build' ? 'Build Assembly' : 'Unbuild Assembly'}
               </Button>
+
+              {buildAction === 'build' && (
+                <Button
+                  variant="secondary"
+                  onClick={handleQueuePending}
+                  loading={queueing}
+                  disabled={bom.length === 0}
+                  title="Save this build as pending — finalize later when components are in stock"
+                >
+                  <Hourglass className="h-4 w-4" />
+                  Queue as Pending
+                </Button>
+              )}
             </div>
 
             {bom.length === 0 && (

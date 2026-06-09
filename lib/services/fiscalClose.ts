@@ -19,6 +19,7 @@ import { and, eq, gte, lt, sql } from 'drizzle-orm';
 import { accounts, companies, journalEntries, journalEntryLines } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError } from './_base';
+import { ensurePreOpBackup } from './backup';
 import { type PostingLine, postJournalEntry } from './posting';
 
 export interface YearEndCloseInput {
@@ -91,6 +92,15 @@ export async function yearEndClose(
   input: YearEndCloseInput,
 ): Promise<YearEndCloseResult> {
   const { fiscalYear } = input;
+
+  // Backup-before-destructive: snapshot the data dir as a rotating pre-op .bka so a
+  // bad close is recoverable. Best-effort — a backup failure must never block closing
+  // (mirrors how restoreBackup treats its pre-op snapshot).
+  try {
+    ensurePreOpBackup(ctx, 'year-end-close');
+  } catch (err) {
+    console.warn('[fiscalClose] pre-op backup before year-end close failed (continuing):', err);
+  }
 
   // Honor the company's configured fiscal year end (settings.fiscalYearEnd, 'MM-DD').
   // Defaults to 12-31 (calendar year) when unset.

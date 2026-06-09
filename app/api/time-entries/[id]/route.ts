@@ -6,6 +6,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { updateTimeEntry, deleteTimeEntry } from '@/lib/services/timeTracking';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { updateTimeEntrySchema } from '@/lib/validation/timeEntries';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -31,20 +33,14 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await req.json().catch(() => ({}));
+    // zod strip mode keeps absent keys absent — only provided fields are updated.
+    const parsed = updateTimeEntrySchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
 
-    const update: Record<string, unknown> = {};
-    if (body.employeeId !== undefined) update.employeeId = body.employeeId;
-    if (body.customerId !== undefined) update.customerId = body.customerId;
-    if (body.jobId !== undefined) update.jobId = body.jobId;
-    if (body.serviceItemId !== undefined) update.serviceItemId = body.serviceItemId;
-    if (body.date !== undefined) update.date = new Date(body.date);
-    if (body.hours !== undefined) update.hours = body.hours;
-    if (body.billable !== undefined) update.billable = Boolean(body.billable);
-    if (body.rate !== undefined) update.rate = body.rate;
-    if (body.description !== undefined) update.description = body.description;
-
-    const updated = await updateTimeEntry(ctx, id, update);
+    const updated = await updateTimeEntry(ctx, id, parsed.data);
     return NextResponse.json(updated);
   } catch (err) {
     return errorResponse(err);

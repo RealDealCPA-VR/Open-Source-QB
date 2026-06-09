@@ -10,7 +10,8 @@ import { Banknote } from 'lucide-react';
 import { Button, Card, PageHeader, Table, Th, Td, Tr, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
-import { RangeControls, downloadCsv, fmtDate, todayStr, yearStartStr, type CsvCell } from '../_components/shared';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
+import { RangeControls, fmtDate, todayStr, yearStartStr, type CsvCell } from '../_components/shared';
 
 interface CheckDetailLine {
   description: string | null;
@@ -64,8 +65,8 @@ export default function CheckDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const exportCsv = () => {
-    if (!data) return;
+  const buildTable = (): ExportTable | null => {
+    if (!data) return null;
     const rows: CsvCell[][] = [];
     for (const r of data.rows) {
       rows.push([
@@ -81,28 +82,32 @@ export default function CheckDetailPage() {
         rows.push(['', '', `  ${l.detail}`, l.description ?? '', '', '', l.amount]);
       }
     }
-    rows.push(['TOTAL (non-void)', '', '', '', '', '', data.total]);
-    downloadCsv(
-      'check-detail.csv',
-      `Check Detail — ${fmtDate(data.from)} to ${fmtDate(data.to)}`,
-      ['Date', 'Check #', 'Payee / Split', 'Memo', 'Type', 'Void', 'Amount'],
+    return {
+      filename: 'check-detail',
+      title: 'Check Detail',
+      subtitle: `${fmtDate(data.from)} to ${fmtDate(data.to)}`,
+      landscape: true,
+      columns: [
+        { header: 'Date' },
+        { header: 'Check #' },
+        { header: 'Payee / Split' },
+        { header: 'Memo' },
+        { header: 'Type' },
+        { header: 'Void' },
+        { header: 'Amount', numeric: true },
+      ],
       rows,
-    );
+      totals: [['TOTAL (non-void)', '', '', '', '', '', data.total]],
+    };
   };
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader
-        title="Check Detail"
-        icon={Banknote}
-        action={
-          <Button variant="secondary" size="sm" disabled={!data || loading} onClick={exportCsv}>
-            Download CSV
-          </Button>
-        }
-      />
+      <PageHeader title="Check Detail" icon={Banknote} />
 
-      <Card className="p-4 mb-4">
+      <ReportToolbar table={buildTable()} disabled={loading} />
+
+      <Card className="p-4 mb-4 print-hidden">
         <RangeControls from={from} to={to} onFrom={setFrom} onTo={setTo} onRun={load} />
       </Card>
 

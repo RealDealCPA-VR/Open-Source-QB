@@ -16,9 +16,19 @@
  *
  * averageCost is maintained as a weighted average: updated on positive receipts only.
  */
-import { and, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, lte, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
-import { items, accounts, inventoryLayers } from '@/lib/db/schema';
+import {
+  items,
+  accounts,
+  inventoryLayers,
+  salesOrders,
+  salesOrderLines,
+  purchaseOrders,
+  purchaseOrderLines,
+  journalEntries,
+  journalEntryLines,
+} from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
@@ -474,4 +484,492 @@ export async function lowStock(ctx: ServiceContext) {
     const reorder = Money.of(r.reorderPoint);
     return qty.lessThanOrEqualTo(reorder);
   });
+}
+
+// ---------------------------------------------------------------------------
+// Sales-order stock commitment + stock status by item
+// ---------------------------------------------------------------------------
+
+/**
+ * Quantity committed to open sales orders for one item:
+ *   SUM(max(quantity - quantityInvoiced, 0)) over SO lines whose order is
+ *   'open' or 'partial'. Closed/void orders no longer commit stock.
+ */
+export async function committedQuantity(ctx: ServiceContext, itemId: string): Promise<string> {
+  const [row] = await ctx.db
+    .select({
+      committed: sql<string>`COALESCE(SUM(GREATEST(${salesOrderLines.quantity} - ${salesOrderLines.quantityInvoiced}, 0)), 0)`,
+    })
+    .from(salesOrderLines)
+    .innerJoin(salesOrders, eq(salesOrderLines.salesOrderId, salesOrders.id))
+    .where(
+      and(
+        eq(salesOrders.companyId, ctx.companyId),
+        eq(salesOrderLines.itemId, itemId),
+        inArray(salesOrders.status, ['open', 'partial']),
+      ),
+    );
+  return Money.of(row?.committed ?? '0').toFixed(4);
+}
+
+export interface StockStatusRow {
+  id: string;
+  name: string;
+  sku: string | null;
+  quantityOnHand: string;
+  /** Open SO line quantity not yet invoiced. */
+  committed: string;
+  /** onHand - committed. */
+  available: string;
+  /** Open PO line quantity not yet billed/received onto a bill. */
+  onPO: string;
+  reorderPoint: string | null;
+  /**
+   * Suggested order quantity: when (available + onPO) has fallen to or below
+   * the reorder point, suggests restocking to 2x the reorder point (the same
+   * heuristic as the reorder report); otherwise '0.0000'.
+   */
+  suggestedOrder: string;
+}
+
+export interface StockStatusResult {
+  rows: StockStatusRow[];
+  /** Count of rows where available <= 0 or below reorder point. */
+  attentionCount: number;
+}
+
+/**
+ * QB "Inventory Stock Status by Item": on-hand, committed (open sales orders),
+ * available, on purchase order, reorder point, and a suggested order quantity
+ * for every active inventory item.
+ */
+export async function stockStatus(ctx: ServiceContext): Promise<StockStatusResult> {
+  const itemRows = await ctx.db
+    .select({
+      id: items.id,
+      name: items.name,
+      sku: items.sku,
+      quantityOnHand: items.quantityOnHand,
+      reorderPoint: items.reorderPoint,
+    })
+    .from(items)
+    .where(
+      and(eq(items.companyId, ctx.companyId), eq(items.isActive, true), eq(items.type, 'inventory')),
+    );
+
+  const committedRows = await ctx.db
+    .select({
+      itemId: salesOrderLines.itemId,
+      committed: sql<string>`COALESCE(SUM(GREATEST(${salesOrderLines.quantity} - ${salesOrderLines.quantityInvoiced}, 0)), 0)`,
+    })
+    .from(salesOrderLines)
+    .innerJoin(salesOrders, eq(salesOrderLines.salesOrderId, salesOrders.id))
+    .where(
+      and(eq(salesOrders.companyId, ctx.companyId), inArray(salesOrders.status, ['open', 'partial'])),
+    )
+    .groupBy(salesOrderLines.itemId);
+  const committedByItem = new Map(committedRows.map((r) => [r.itemId, r.committed]));
+
+  const onPoRows = await ctx.db
+    .select({
+      itemId: purchaseOrderLines.itemId,
+      onPO: sql<string>`COALESCE(SUM(GREATEST(${purchaseOrderLines.quantity} - ${purchaseOrderLines.quantityBilled}, 0)), 0)`,
+    })
+    .from(purchaseOrderLines)
+    .innerJoin(purchaseOrders, eq(purchaseOrderLines.purchaseOrderId, purchaseOrders.id))
+    .where(
+      and(
+        eq(purchaseOrders.companyId, ctx.companyId),
+        inArray(purchaseOrders.status, ['open', 'partial']),
+      ),
+    )
+    .groupBy(purchaseOrderLines.itemId);
+  const onPoByItem = new Map(onPoRows.map((r) => [r.itemId, r.onPO]));
+
+  let attentionCount = 0;
+  const rows: StockStatusRow[] = itemRows
+    .map((r) => {
+      const onHand = Money.of(r.quantityOnHand ?? '0');
+      const committed = Money.of(committedByItem.get(r.id) ?? '0');
+      const available = onHand.minus(committed);
+      const onPO = Money.of(onPoByItem.get(r.id) ?? '0');
+
+      let suggested = Money.zero();
+      let needsAttention = available.lessThanOrEqualTo(0) && committed.greaterThan(0);
+      if (r.reorderPoint != null) {
+        const reorder = Money.of(r.reorderPoint);
+        if (available.plus(onPO).lessThanOrEqualTo(reorder)) {
+          const target = reorder.times(2).minus(available.plus(onPO));
+          suggested = target.greaterThan(0) ? target : Money.zero();
+          needsAttention = true;
+        }
+      }
+      if (needsAttention) attentionCount += 1;
+
+      return {
+        id: r.id,
+        name: r.name,
+        sku: r.sku ?? null,
+        quantityOnHand: onHand.toFixed(4),
+        committed: committed.toFixed(4),
+        available: available.toFixed(4),
+        onPO: onPO.toFixed(4),
+        reorderPoint: r.reorderPoint == null ? null : Money.of(r.reorderPoint).toFixed(4),
+        suggestedOrder: suggested.toFixed(4),
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  return { rows, attentionCount };
+}
+
+// ---------------------------------------------------------------------------
+// As-of-date valuation + valuation detail (GL-derived)
+// ---------------------------------------------------------------------------
+//
+// Every quantity-affecting inventory operation that touches the GL (average
+// receipts/removals via adjustInventory, COGS via recordCOGS, FIFO receipts/
+// consumption via fifo.ts, physical counts and value adjustments via
+// inventoryOps.ts) posts a journal entry tagged sourceRef = `item:<itemId>`
+// with a line on the item's inventory asset account. That makes the item's
+// inventory VALUE at any past date exactly reconstructable from the ledger:
+//   valueAsOf = SUM(debit - credit) over those lines dated <= asOf.
+//
+// Documented approximations:
+//   - QUANTITY as of a past date is approximated as valueAsOf / currentUnitCost
+//     (current averageCost for average items; remaining-layer effective cost
+//     for FIFO items). It is exact whenever the unit cost has not changed
+//     since the as-of date, and is reported null when the current cost is $0.
+//   - Assembly builds/unbuilds post no GL (both sides are the same inventory
+//     asset account), so value moved between an assembly and its components
+//     stays attributed to the component items in this report. The company-wide
+//     grand total still ties to the GL inventory asset balance.
+
+interface ItemGlMovement {
+  entryId: string;
+  entryNumber: number;
+  date: Date;
+  description: string;
+  debit: Decimal;
+  credit: Decimal;
+}
+
+/**
+ * Load all posted inventory-asset GL movements tagged `item:<id>`, grouped by
+ * item id, optionally limited to entries dated <= asOf. Only lines hitting the
+ * item's own inventory asset account (assetAccountId ?? code 1300) count.
+ */
+async function loadItemGlMovements(
+  ctx: ServiceContext,
+  itemAccountById: Map<string, string | null>,
+  asOf?: Date,
+): Promise<Map<string, ItemGlMovement[]>> {
+  const conditions = [
+    eq(journalEntries.companyId, ctx.companyId),
+    eq(journalEntries.status, 'posted'),
+    sql`${journalEntries.sourceRef} LIKE 'item:%'`,
+  ];
+  if (asOf) conditions.push(lte(journalEntries.date, asOf));
+
+  const lines = await ctx.db
+    .select({
+      entryId: journalEntries.id,
+      entryNumber: journalEntries.entryNumber,
+      date: journalEntries.date,
+      description: journalEntries.description,
+      sourceRef: journalEntries.sourceRef,
+      createdAt: journalEntries.createdAt,
+      accountId: journalEntryLines.accountId,
+      debit: journalEntryLines.debit,
+      credit: journalEntryLines.credit,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(and(...conditions))
+    .orderBy(asc(journalEntries.date), asc(journalEntries.createdAt));
+
+  const byItem = new Map<string, ItemGlMovement[]>();
+  for (const line of lines) {
+    const itemId = (line.sourceRef ?? '').slice('item:'.length);
+    if (!itemAccountById.has(itemId)) continue;
+    if (line.accountId !== itemAccountById.get(itemId)) continue;
+    const list = byItem.get(itemId) ?? [];
+    list.push({
+      entryId: line.entryId,
+      entryNumber: line.entryNumber,
+      date: line.date,
+      description: line.description,
+      debit: Money.of(line.debit ?? '0'),
+      credit: Money.of(line.credit ?? '0'),
+    });
+    byItem.set(itemId, list);
+  }
+  return byItem;
+}
+
+/** Build itemId -> inventory asset account id map (assetAccountId ?? code 1300). */
+async function inventoryAccountMap(
+  ctx: ServiceContext,
+  rows: Array<{ id: string; assetAccountId: string | null }>,
+): Promise<Map<string, string | null>> {
+  let defaultAccountId: string | null = null;
+  if (rows.some((r) => !r.assetAccountId)) {
+    const [acct] = await ctx.db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1300')));
+    defaultAccountId = acct?.id ?? null;
+  }
+  return new Map(rows.map((r) => [r.id, r.assetAccountId ?? defaultAccountId]));
+}
+
+/**
+ * Current effective unit cost per item: averageCost for average items, total
+ * remaining layer value / quantity for FIFO items (falling back to the most
+ * recent layer's unitCost when no quantity remains). Null when unknown/zero.
+ */
+async function currentUnitCosts(
+  ctx: ServiceContext,
+  rows: Array<{ id: string; averageCost: string | null }>,
+): Promise<Map<string, { cost: Decimal | null; costingMethod: 'fifo' | 'average' }>> {
+  const layerRows = await ctx.db
+    .select({
+      itemId: inventoryLayers.itemId,
+      date: inventoryLayers.date,
+      quantityRemaining: inventoryLayers.quantityRemaining,
+      unitCost: inventoryLayers.unitCost,
+    })
+    .from(inventoryLayers)
+    .where(eq(inventoryLayers.companyId, ctx.companyId))
+    .orderBy(asc(inventoryLayers.date), asc(inventoryLayers.createdAt));
+
+  const layersByItem = new Map<string, typeof layerRows>();
+  for (const l of layerRows) {
+    const list = layersByItem.get(l.itemId) ?? [];
+    list.push(l);
+    layersByItem.set(l.itemId, list);
+  }
+
+  const result = new Map<string, { cost: Decimal | null; costingMethod: 'fifo' | 'average' }>();
+  for (const r of rows) {
+    const layers = layersByItem.get(r.id);
+    if (layers && layers.length > 0) {
+      let qty = Money.zero();
+      let value = Money.zero();
+      for (const l of layers) {
+        const q = Money.of(l.quantityRemaining);
+        qty = qty.plus(q);
+        value = value.plus(q.times(Money.of(l.unitCost)));
+      }
+      let cost: Decimal | null = null;
+      if (qty.greaterThan(0)) cost = value.dividedBy(qty);
+      else {
+        const last = Money.of(layers[layers.length - 1].unitCost);
+        cost = last.greaterThan(0) ? last : null;
+      }
+      result.set(r.id, { cost: cost && cost.greaterThan(0) ? cost : null, costingMethod: 'fifo' });
+    } else {
+      const avg = Money.of(r.averageCost ?? '0');
+      result.set(r.id, { cost: avg.greaterThan(0) ? avg : null, costingMethod: 'average' });
+    }
+  }
+  return result;
+}
+
+export interface ValuationAsOfRow {
+  id: string;
+  name: string;
+  sku: string | null;
+  costingMethod: 'fifo' | 'average';
+  /** Exact GL-derived inventory value at the as-of date. */
+  valueAsOf: string;
+  /** Approximate quantity (valueAsOf / current unit cost); null when cost is unknown. */
+  quantityAsOf: string | null;
+  /** Unit cost used to derive quantityAsOf (current cost). */
+  unitCostUsed: string | null;
+}
+
+export interface ValuationAsOfResult {
+  asOf: string;
+  items: ValuationAsOfRow[];
+  grandTotal: string;
+  /** Documented approximations for this reconstruction. */
+  notes: string[];
+}
+
+/** Inventory valuation reconstructed at a past date — see module notes above. */
+export async function inventoryValuationAsOf(
+  ctx: ServiceContext,
+  asOf: Date,
+): Promise<ValuationAsOfResult> {
+  const itemRows = await ctx.db
+    .select({
+      id: items.id,
+      name: items.name,
+      sku: items.sku,
+      averageCost: items.averageCost,
+      assetAccountId: items.assetAccountId,
+    })
+    .from(items)
+    .where(
+      and(eq(items.companyId, ctx.companyId), eq(items.isActive, true), eq(items.type, 'inventory')),
+    );
+
+  const accountMap = await inventoryAccountMap(ctx, itemRows);
+  const movements = await loadItemGlMovements(ctx, accountMap, asOf);
+  const costs = await currentUnitCosts(ctx, itemRows);
+
+  let grandTotal = Money.zero();
+  const rows: ValuationAsOfRow[] = itemRows
+    .map((r) => {
+      const moves = movements.get(r.id) ?? [];
+      const value = moves.reduce((s, m) => s.plus(m.debit).minus(m.credit), Money.zero());
+      grandTotal = grandTotal.plus(value);
+      const costInfo = costs.get(r.id) ?? { cost: null, costingMethod: 'average' as const };
+      const qty = costInfo.cost ? value.dividedBy(costInfo.cost) : null;
+      return {
+        id: r.id,
+        name: r.name,
+        sku: r.sku ?? null,
+        costingMethod: costInfo.costingMethod,
+        valueAsOf: toAmountString(Money.round2(value)),
+        quantityAsOf: qty ? qty.toFixed(4) : null,
+        unitCostUsed: costInfo.cost ? costInfo.cost.toFixed(4) : null,
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  return {
+    asOf: asOf.toISOString(),
+    items: rows,
+    grandTotal: toAmountString(Money.round2(grandTotal)),
+    notes: [
+      'Values are reconstructed exactly from posted journal entries on each item’s inventory asset account.',
+      'Quantities are approximated as value ÷ current unit cost (exact when the unit cost has not changed since the as-of date).',
+      'Assembly builds post no GL (net $0 within the inventory account), so value moved between an assembly and its components remains attributed to the component items here; the grand total still ties to the GL.',
+    ],
+  };
+}
+
+export interface ValuationDetailMovement {
+  entryId: string;
+  entryNumber: number;
+  date: string;
+  description: string;
+  /** Value into inventory (debit). */
+  valueIn: string;
+  /** Value out of inventory (credit). */
+  valueOut: string;
+  delta: string;
+  runningValue: string;
+  /** Approximate quantity moved (delta / current unit cost); null when cost unknown. */
+  approxQty: string | null;
+}
+
+export interface ValuationDetailItem {
+  itemId: string;
+  name: string;
+  sku: string | null;
+  costingMethod: 'fifo' | 'average';
+  openingValue: string;
+  closingValue: string;
+  movements: ValuationDetailMovement[];
+}
+
+export interface ValuationDetailResult {
+  from: string | null;
+  to: string | null;
+  items: ValuationDetailItem[];
+  notes: string[];
+}
+
+/**
+ * Inventory Valuation Detail — transaction-level value movements per item from
+ * the GL (sourceRef `item:<id>` lines on the inventory asset account), with a
+ * running balance. Optionally limited to one item and/or a date range; the
+ * opening value accumulates everything before `from`.
+ */
+export async function inventoryValuationDetail(
+  ctx: ServiceContext,
+  opts?: { itemId?: string | null; from?: Date | null; to?: Date | null },
+): Promise<ValuationDetailResult> {
+  const conditions = [
+    eq(items.companyId, ctx.companyId),
+    eq(items.type, 'inventory'),
+  ];
+  if (opts?.itemId) conditions.push(eq(items.id, opts.itemId));
+
+  const itemRows = await ctx.db
+    .select({
+      id: items.id,
+      name: items.name,
+      sku: items.sku,
+      averageCost: items.averageCost,
+      assetAccountId: items.assetAccountId,
+    })
+    .from(items)
+    .where(and(...conditions));
+  if (opts?.itemId && itemRows.length === 0) throw notFound('Item');
+
+  const accountMap = await inventoryAccountMap(ctx, itemRows);
+  const movements = await loadItemGlMovements(ctx, accountMap, opts?.to ?? undefined);
+  const costs = await currentUnitCosts(ctx, itemRows);
+
+  const from = opts?.from ?? null;
+  const resultItems: ValuationDetailItem[] = [];
+
+  for (const r of itemRows.sort((a, b) => a.name.localeCompare(b.name))) {
+    const moves = movements.get(r.id) ?? [];
+    const costInfo = costs.get(r.id) ?? { cost: null, costingMethod: 'average' as const };
+
+    let opening = Money.zero();
+    const inRange: ItemGlMovement[] = [];
+    for (const m of moves) {
+      if (from && m.date.getTime() < from.getTime()) {
+        opening = opening.plus(m.debit).minus(m.credit);
+      } else {
+        inRange.push(m);
+      }
+    }
+
+    if (!opts?.itemId && inRange.length === 0 && opening.isZero()) continue;
+
+    let running = opening;
+    const detailMoves: ValuationDetailMovement[] = inRange.map((m) => {
+      const delta = m.debit.minus(m.credit);
+      running = running.plus(delta);
+      return {
+        entryId: m.entryId,
+        entryNumber: m.entryNumber,
+        date: m.date.toISOString(),
+        description: m.description,
+        valueIn: toAmountString(Money.round2(m.debit)),
+        valueOut: toAmountString(Money.round2(m.credit)),
+        delta: toAmountString(Money.round2(delta)),
+        runningValue: toAmountString(Money.round2(running)),
+        approxQty: costInfo.cost ? delta.dividedBy(costInfo.cost).toFixed(4) : null,
+      };
+    });
+
+    resultItems.push({
+      itemId: r.id,
+      name: r.name,
+      sku: r.sku ?? null,
+      costingMethod: costInfo.costingMethod,
+      openingValue: toAmountString(Money.round2(opening)),
+      closingValue: toAmountString(Money.round2(running)),
+      movements: detailMoves,
+    });
+  }
+
+  return {
+    from: from ? from.toISOString() : null,
+    to: opts?.to ? opts.to.toISOString() : null,
+    items: resultItems,
+    notes: [
+      'Movements are the posted journal-entry lines on each item’s inventory asset account (sourceRef item:<id>).',
+      'Approx. qty is derived as value ÷ current unit cost — exact when the unit cost has not changed.',
+      'Assembly builds/unbuilds move value between items without GL postings and therefore do not appear as movements.',
+    ],
+  };
 }

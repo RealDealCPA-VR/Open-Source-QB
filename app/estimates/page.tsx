@@ -3,8 +3,10 @@
 import { useEffect, useState, useCallback } from 'react';
 import { ClipboardList, Plus, ArrowRight, Trash2, Download, Percent } from 'lucide-react';
 import {
+  AmountInput,
   Button,
   Card,
+  DateInput,
   EmptyState,
   Input,
   Select,
@@ -18,6 +20,7 @@ import {
   PageHeader,
   Spinner,
   toast,
+  useGridKeys,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
@@ -141,7 +144,7 @@ function LineRow({
   const amount = qty * rate;
 
   return (
-    <div className="grid grid-cols-12 gap-2 items-center mb-2">
+    <div data-grid-row className="grid grid-cols-12 gap-2 items-center mb-2">
       <div className="col-span-4">
         <Input
           placeholder="Description"
@@ -150,20 +153,14 @@ function LineRow({
         />
       </div>
       <div className="col-span-2">
-        <Input
-          type="number"
-          min="0.0001"
-          step="any"
+        <AmountInput
           placeholder="Qty"
           value={line.quantity}
           onChange={(e) => onChange(index, 'quantity', e.target.value)}
         />
       </div>
       <div className="col-span-2">
-        <Input
-          type="number"
-          min="0"
-          step="any"
+        <AmountInput
           placeholder="Rate"
           value={line.rate}
           onChange={(e) => onChange(index, 'rate', e.target.value)}
@@ -233,6 +230,15 @@ function EstimateFormBody({
   const taxAmount = taxableSubtotal * (selectedRate ? parseFloat(selectedRate.rate) || 0 : 0);
   const total = subtotal + taxAmount;
 
+  // Line-grid keyboard ergonomics: Ctrl+Insert add / Ctrl+Delete remove / Enter down.
+  const grid = useGridKeys({
+    addRow: onAddLine,
+    removeRow: (idx) => {
+      // Keep at least one line (mirrors the per-row remove button's canRemove).
+      if (form.lines.length > 1) onRemoveLine(idx);
+    },
+  });
+
   return (
     <div className="flex flex-col gap-4">
       <div className="grid grid-cols-2 gap-3">
@@ -255,9 +261,8 @@ function EstimateFormBody({
         </div>
         <div>
           <Label htmlFor="date">Date *</Label>
-          <Input
+          <DateInput
             id="date"
-            type="date"
             value={form.date}
             onChange={(e) => onChange('date', e.target.value)}
             required
@@ -268,9 +273,8 @@ function EstimateFormBody({
       <div className="grid grid-cols-2 gap-3">
         <div>
           <Label htmlFor="expirationDate">Expiration Date</Label>
-          <Input
+          <DateInput
             id="expirationDate"
-            type="date"
             value={form.expirationDate}
             onChange={(e) => onChange('expirationDate', e.target.value)}
           />
@@ -292,7 +296,7 @@ function EstimateFormBody({
         </div>
       </div>
 
-      <div>
+      <div onKeyDown={grid.onKeyDown}>
         <Label>Line Items *</Label>
         <div className="grid grid-cols-12 gap-2 text-xs font-semibold text-navy/50 mb-2">
           <div className="col-span-4">Description</div>
@@ -888,10 +892,7 @@ export default function EstimatesPage() {
                             ({formatCurrency(l.amount)} quoted)
                           </span>
                         </span>
-                        <Input
-                          type="number"
-                          min="0"
-                          step="any"
+                        <AmountInput
                           placeholder="0.00"
                           value={progressLineAmounts[l.id] ?? ''}
                           onChange={(ev) =>

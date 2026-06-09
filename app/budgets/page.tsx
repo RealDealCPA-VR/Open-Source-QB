@@ -51,6 +51,12 @@ interface Account {
   isActive: boolean;
 }
 
+interface PeriodCell {
+  budget: string;
+  actual: string;
+  variance: string;
+}
+
 interface VsActualRow {
   accountId: string;
   code: string;
@@ -58,6 +64,7 @@ interface VsActualRow {
   budget: string;
   actual: string;
   variance: string;
+  periods?: PeriodCell[];
 }
 
 interface VsActualReport {
@@ -68,7 +75,11 @@ interface VsActualReport {
   totalBudget: string;
   totalActual: string;
   totalVariance: string;
+  periodLabels?: string[];
+  periodNetTotals?: PeriodCell[];
 }
+
+type PeriodMode = 'annual' | 'monthly' | 'quarterly';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -259,6 +270,81 @@ function BudgetGrid({
 // ---------------------------------------------------------------------------
 
 function BudgetVsActualView({ report }: { report: VsActualReport }) {
+  // Period-column mode (monthly/quarterly): per-period budget/actual grid.
+  if (report.periodLabels && report.periodLabels.length > 0) {
+    return (
+      <div>
+        <h3 className="text-lg font-bold text-navy mb-3">
+          Budget vs Actual — FY{report.fiscalYear}
+        </h3>
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse text-sm min-w-[900px]">
+            <thead>
+              <tr>
+                <th className="py-2.5 px-3 text-left font-semibold text-navy/70 border-b-2 border-navy/10 sticky left-0 bg-white z-10 min-w-[160px]">
+                  Account
+                </th>
+                {report.periodLabels.map((label) => (
+                  <th
+                    key={label}
+                    className="py-2.5 px-2 text-right font-semibold text-navy/70 border-b-2 border-navy/10 min-w-[110px]"
+                  >
+                    {label}
+                    <div className="text-[10px] font-normal text-navy/40">Actual / Budget</div>
+                  </th>
+                ))}
+                <th className="py-2.5 px-2 text-right font-semibold text-navy/70 border-b-2 border-navy/10 min-w-[110px]">
+                  Total Var.
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {report.rows.map((row) => (
+                <tr key={row.accountId} className="border-b border-slate-100 hover:bg-electric/5">
+                  <td className="py-1.5 px-3 sticky left-0 bg-white z-10">
+                    <span className="text-navy/50 text-xs mr-1">{row.code}</span>
+                    <span className="text-navy font-medium">{row.name}</span>
+                  </td>
+                  {(row.periods ?? []).map((cell, i) => (
+                    <td key={i} className="py-1.5 px-2 text-right tabular-nums">
+                      <div className="text-navy">{formatCurrency(cell.actual)}</div>
+                      <div className="text-xs text-navy/45">{formatCurrency(cell.budget)}</div>
+                    </td>
+                  ))}
+                  <td
+                    className={`py-1.5 px-2 text-right tabular-nums font-semibold ${varianceColor(row.variance)}`}
+                  >
+                    {Number(row.variance) > 0 ? '+' : ''}
+                    {formatCurrency(row.variance)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+            {report.periodNetTotals && (
+              <tfoot>
+                <tr className="border-t-2 border-navy/20 bg-navy/5 font-bold text-navy">
+                  <td className="py-2.5 px-3 sticky left-0 bg-navy/5 z-10">Net (Actual / Budget)</td>
+                  {report.periodNetTotals.map((cell, i) => (
+                    <td key={i} className="py-2.5 px-2 text-right tabular-nums">
+                      <div>{formatCurrency(cell.actual)}</div>
+                      <div className="text-xs font-normal text-navy/50">
+                        {formatCurrency(cell.budget)}
+                      </div>
+                    </td>
+                  ))}
+                  <td className={`py-2.5 px-2 text-right tabular-nums ${varianceColor(report.totalVariance)}`}>
+                    {Number(report.totalVariance) > 0 ? '+' : ''}
+                    {formatCurrency(report.totalVariance)}
+                  </td>
+                </tr>
+              </tfoot>
+            )}
+          </table>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div>
       <h3 className="text-lg font-bold text-navy mb-3">
@@ -340,6 +426,8 @@ export default function BudgetsPage() {
   // Vs-actual report.
   const [vsActual, setVsActual] = useState<VsActualReport | null>(null);
   const [vsActualLoading, setVsActualLoading] = useState(false);
+  // Period columns: annual totals (default), monthly, or quarterly.
+  const [periodMode, setPeriodMode] = useState<PeriodMode>('annual');
 
   // Active tab on the right panel.
   const [tab, setTab] = useState<'grid' | 'vs-actual'>('grid');
@@ -423,17 +511,27 @@ export default function BudgetsPage() {
   // Load vs-actual
   // ---------------------------------------------------------------------------
 
-  async function loadVsActual() {
+  async function loadVsActual(mode: PeriodMode = periodMode) {
     if (!selected) return;
     setVsActualLoading(true);
     try {
-      const report = await api.get<VsActualReport>(`/api/budgets/${selected.id}/vs-actual`);
+      const url =
+        mode === 'annual'
+          ? `/api/budgets/${selected.id}/vs-actual`
+          : `/api/reports/budget-vs-actual?budgetId=${selected.id}&periods=${mode}`;
+      const report = await api.get<VsActualReport>(url);
       setVsActual(report);
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to load vs-actual report', 'danger');
     } finally {
       setVsActualLoading(false);
     }
+  }
+
+  function changePeriodMode(mode: PeriodMode) {
+    setPeriodMode(mode);
+    setVsActual(null);
+    loadVsActual(mode);
   }
 
   function switchTab(t: 'grid' | 'vs-actual') {
@@ -554,6 +652,32 @@ export default function BudgetsPage() {
 
                 {tab === 'vs-actual' && (
                   <>
+                    <div className="flex items-center gap-2 mb-4">
+                      <span className="text-xs font-semibold text-navy/50 uppercase tracking-wide">
+                        Columns
+                      </span>
+                      <div
+                        className="flex rounded-lg border border-slate-200 overflow-hidden"
+                        role="group"
+                        aria-label="Period columns"
+                      >
+                        {(['annual', 'monthly', 'quarterly'] as const).map((mode) => (
+                          <button
+                            key={mode}
+                            type="button"
+                            onClick={() => changePeriodMode(mode)}
+                            disabled={vsActualLoading}
+                            className={`px-3 py-1.5 text-xs font-semibold transition-colors ${
+                              periodMode === mode
+                                ? 'bg-electric text-white'
+                                : 'bg-white text-navy/60 hover:bg-electric/5'
+                            }`}
+                          >
+                            {mode === 'annual' ? 'Annual' : mode === 'monthly' ? 'Monthly' : 'Quarterly'}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
                     {vsActualLoading && (
                       <div className="flex items-center justify-center gap-2 py-12 text-navy/40 text-sm">
                         <Spinner className="text-electric" />
@@ -565,7 +689,7 @@ export default function BudgetsPage() {
                     )}
                     {!vsActualLoading && !vsActual && (
                       <div className="py-12 text-center">
-                        <Button variant="secondary" size="sm" onClick={loadVsActual}>
+                        <Button variant="secondary" size="sm" onClick={() => loadVsActual()}>
                           Load Report
                         </Button>
                       </div>

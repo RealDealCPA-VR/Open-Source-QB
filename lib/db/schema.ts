@@ -285,7 +285,11 @@ export const errorCorrectionsRelations = relations(errorCorrections, ({ one }) =
 // posting engine stays the only writer of balances.
 // ============================================================================
 
-export const itemTypeEnum = pgEnum('item_type', ['service', 'inventory', 'non_inventory', 'bundle']);
+export const itemTypeEnum = pgEnum('item_type', [
+  'service', 'inventory', 'non_inventory', 'bundle',
+  // QB Desktop parity item types (non-posting or special-posting line helpers):
+  'other_charge', 'discount', 'subtotal', 'payment', 'sales_tax',
+]);
 export const docStatusEnum = pgEnum('doc_status', [
   'draft', 'open', 'partial', 'paid', 'overdue', 'void', 'closed', 'accepted', 'rejected',
 ]);
@@ -330,6 +334,8 @@ export const customers = pgTable('customers', {
   balance: decimal('balance', { precision: 15, scale: 2 }).notNull().default('0'),
   notes: text('notes'),
   isActive: boolean('is_active').notNull().default(true),
+  /** Values for company-defined custom fields ({ [fieldName]: value }). */
+  customFields: jsonb('custom_fields').$type<Record<string, string>>(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -349,6 +355,8 @@ export const vendors = pgTable('vendors', {
   balance: decimal('balance', { precision: 15, scale: 2 }).notNull().default('0'),
   notes: text('notes'),
   isActive: boolean('is_active').notNull().default(true),
+  /** Values for company-defined custom fields ({ [fieldName]: value }). */
+  customFields: jsonb('custom_fields').$type<Record<string, string>>(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -373,6 +381,8 @@ export const items = pgTable('items', {
   reorderPoint: decimal('reorder_point', { precision: 15, scale: 4 }),
   averageCost: decimal('average_cost', { precision: 15, scale: 4 }),
   isActive: boolean('is_active').notNull().default(true),
+  /** Values for company-defined custom fields ({ [fieldName]: value }). */
+  customFields: jsonb('custom_fields').$type<Record<string, string>>(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -456,6 +466,8 @@ export const invoices = pgTable('invoices', {
   balanceDue: decimal('balance_due', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  /** Values for company-defined custom fields ({ [fieldName]: value }). */
+  customFields: jsonb('custom_fields').$type<Record<string, string>>(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -710,6 +722,8 @@ export const paychecks = pgTable('paychecks', {
   totalDeductions: decimal('total_deductions', { precision: 15, scale: 2 }).notNull().default('0'),
   netPay: decimal('net_pay', { precision: 15, scale: 2 }).notNull().default('0'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  /** Batch pay run this paycheck was created in (optional). */
+  payRunId: uuid('pay_run_id').references(() => payRuns.id),
   voidedAt: timestamp('voided_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
@@ -720,6 +734,38 @@ export const paycheckLines = pgTable('paycheck_lines', {
   kind: varchar('kind', { length: 50 }).notNull(), // earning|tax|deduction|employer_contribution
   name: varchar('name', { length: 255 }).notNull(),
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** Optional link to a payroll item definition (GL mapping + pre/post-tax behavior). */
+  payrollItemId: uuid('payroll_item_id').references(() => payrollItems.id),
+});
+
+/** Payroll item definitions — QB-style earnings/taxes/deductions with GL mapping. */
+export const payrollItems = pgTable('payroll_items', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 255 }).notNull(),
+  /** earning | tax | deduction | employer_contribution | garnishment */
+  kind: varchar('kind', { length: 50 }).notNull(),
+  /** Deductions: pre-tax reduces taxable wages; post-tax does not. */
+  pretax: boolean('pretax').notNull().default(false),
+  /** GL: expense side (earnings/employer items) and/or liability side (taxes/deductions). */
+  expenseAccountId: uuid('expense_account_id').references(() => accounts.id),
+  liabilityAccountId: uuid('liability_account_id').references(() => accounts.id),
+  /** Optional default: 'fixed' amount or 'percent' of gross. */
+  calcBasis: varchar('calc_basis', { length: 20 }),
+  defaultRate: decimal('default_rate', { precision: 15, scale: 4 }),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/** Batch pay runs grouping paychecks entered together. */
+export const payRuns = pgTable('pay_runs', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  payDate: timestamp('pay_date').notNull(),
+  periodStart: timestamp('period_start'),
+  periodEnd: timestamp('period_end'),
+  memo: text('memo'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
 // ---- Budgets ----
@@ -856,6 +902,8 @@ export const salesOrderLines = pgTable('sales_order_lines', {
   quantity: decimal('quantity', { precision: 15, scale: 4 }).notNull().default('1'),
   rate: decimal('rate', { precision: 15, scale: 4 }).notNull().default('0'),
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** Quantity already pulled onto invoices — enables partial invoicing/backorders. */
+  quantityInvoiced: decimal('quantity_invoiced', { precision: 15, scale: 4 }).notNull().default('0'),
   lineOrder: integer('line_order').notNull().default(0),
 });
 
@@ -944,6 +992,48 @@ export const purchaseOrderLines = pgTable('purchase_order_lines', {
   /** Quantity already pulled onto bills — enables partial billing/receipt of a PO. */
   quantityBilled: decimal('quantity_billed', { precision: 15, scale: 4 }).notNull().default('0'),
   lineOrder: integer('line_order').notNull().default(0),
+});
+
+// ---- Item receipts (QB "Receive Items" before the bill arrives) ----
+export const itemReceipts = pgTable('item_receipts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  vendorId: uuid('vendor_id').references(() => vendors.id).notNull(),
+  purchaseOrderId: uuid('purchase_order_id').references(() => purchaseOrders.id),
+  date: timestamp('date').notNull(),
+  reference: varchar('reference', { length: 100 }),
+  /** open = awaiting bill; billed = converted to a bill; void. */
+  status: varchar('status', { length: 20 }).notNull().default('open'),
+  total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
+  memo: text('memo'),
+  convertedBillId: uuid('converted_bill_id').references(() => bills.id),
+  postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  voidedAt: timestamp('voided_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const itemReceiptLines = pgTable('item_receipt_lines', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  itemReceiptId: uuid('item_receipt_id').references(() => itemReceipts.id).notNull(),
+  itemId: uuid('item_id').references(() => items.id).notNull(),
+  description: text('description'),
+  quantity: decimal('quantity', { precision: 15, scale: 4 }).notNull().default('1'),
+  unitCost: decimal('unit_cost', { precision: 15, scale: 4 }).notNull().default('0'),
+  amount: decimal('amount', { precision: 15, scale: 2 }).notNull().default('0'),
+  lineOrder: integer('line_order').notNull().default(0),
+});
+
+// ---- Pending assembly builds (QB "Pending Builds") ----
+export const pendingBuilds = pgTable('pending_builds', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  assemblyItemId: uuid('assembly_item_id').references(() => items.id).notNull(),
+  quantity: decimal('quantity', { precision: 15, scale: 4 }).notNull(),
+  date: timestamp('date').notNull(),
+  memo: text('memo'),
+  /** pending = waiting on components; built = finalized; cancelled. */
+  status: varchar('status', { length: 20 }).notNull().default('pending'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
 // ---- Bank deposits (Undeposited Funds -> Make Deposit) ----

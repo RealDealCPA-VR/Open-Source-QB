@@ -8,6 +8,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { createBudget, listBudgets } from '@/lib/services/budgets';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createBudgetSchema } from '@/lib/validation/budgets';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -36,11 +38,12 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-    const budget = await createBudget(ctx, {
-      name: body.name,
-      fiscalYear: Number(body.fiscalYear),
-    });
+    const body = await req.json().catch(() => ({}));
+    const parsed = createBudgetSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
+    const budget = await createBudget(ctx, parsed.data);
     return NextResponse.json(budget, { status: 201 });
   } catch (err) {
     return errorResponse(err);

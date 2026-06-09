@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { ArchiveRestore, Building2, Download } from 'lucide-react';
+import { Archive, ArchiveRestore, Building2, Download } from 'lucide-react';
 import {
   Button,
   Card,
@@ -12,6 +12,7 @@ import {
   Select,
   toast,
 } from '@/components/ui';
+import { api, ApiError } from '@/lib/client';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -26,6 +27,24 @@ interface RestoreCompanyResult {
   companyId: string;
   name: string;
   tableCounts: Record<string, number>;
+}
+
+interface CondenseResult {
+  beforeDate: string;
+  months: string[];
+  entriesToCondense: number;
+  linesToCondense: number;
+  voidEntriesToDelete: number;
+  summaryEntriesToCreate: number;
+  summaryLinesToCreate: number;
+  keptOpenDocumentEntries: number;
+  keptInProgressReconciliationEntries: number;
+  reconciliationItemsToDelete: number;
+  bankFeedRowsToDelete: number;
+  draftEntriesSkipped: number;
+  dryRun: boolean;
+  archivePath: string | null;
+  runId: string | null;
 }
 
 /** Download a fetch Response as a file, using Content-Disposition when present. */
@@ -70,6 +89,14 @@ export default function BackupPage() {
   const [pendingCompanyFile, setPendingCompanyFile] = useState<File | null>(null);
   const [restoreName, setRestoreName] = useState('');
   const [restoringCompany, setRestoringCompany] = useState(false);
+
+  // ---- Condense / Archive ----
+  const [condenseDate, setCondenseDate] = useState('');
+  const [condensePreview, setCondensePreview] = useState<CondenseResult | null>(null);
+  const [previewingCondense, setPreviewingCondense] = useState(false);
+  const [condenseModalOpen, setCondenseModalOpen] = useState(false);
+  const [condenseConfirmText, setCondenseConfirmText] = useState('');
+  const [condensing, setCondensing] = useState(false);
 
   async function loadCompanies() {
     try {
@@ -224,6 +251,55 @@ export default function BackupPage() {
   }
 
   // ---------------------------------------------------------------------------
+  // Condense / Archive
+  // ---------------------------------------------------------------------------
+
+  async function handleCondensePreview() {
+    if (!condenseDate) {
+      toast('Pick a cutoff date first.', 'danger');
+      return;
+    }
+    setPreviewingCondense(true);
+    setCondensePreview(null);
+    try {
+      const result = await api.post<CondenseResult>('/api/condense', {
+        beforeDate: condenseDate,
+        dryRun: true,
+      });
+      setCondensePreview(result);
+      if (result.entriesToCondense === 0 && result.voidEntriesToDelete === 0) {
+        toast('Nothing to condense before that date.', 'info');
+      }
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Condense preview failed.', 'danger');
+    } finally {
+      setPreviewingCondense(false);
+    }
+  }
+
+  async function handleCondenseConfirm() {
+    if (condenseConfirmText !== 'CONDENSE') return;
+    setCondensing(true);
+    try {
+      const result = await api.post<CondenseResult>('/api/condense', {
+        beforeDate: condenseDate,
+      });
+      toast(
+        `Condensed ${result.entriesToCondense} entries into ${result.summaryEntriesToCreate} ` +
+          `monthly summaries. Archive saved before condensing.`,
+        'success',
+      );
+      setCondenseModalOpen(false);
+      setCondenseConfirmText('');
+      setCondensePreview(null);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Condense failed. Nothing was changed.', 'danger');
+    } finally {
+      setCondensing(false);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Render
   // ---------------------------------------------------------------------------
 
@@ -327,6 +403,95 @@ export default function BackupPage() {
               </Button>
             </div>
           </Card>
+
+          {/* Condense / Archive card */}
+          <Card className="p-6 flex flex-col gap-3 border-red-200">
+            <h2 className="text-lg font-bold text-navy flex items-center gap-2">
+              <Archive className="h-5 w-5 text-red-600" />
+              Condense / Archive Old Detail
+            </h2>
+            <p className="text-sm text-navy/60">
+              Replace detailed journal entries dated <span className="font-semibold">before</span>{' '}
+              a cutoff with one summary entry per month. Account balances, debit/credit totals,
+              and class totals are preserved exactly; documents with open balances and
+              in-progress reconciliations are kept intact. The affected period must be{' '}
+              <span className="font-semibold">closed</span> first.
+            </p>
+            <p className="text-sm font-medium text-red-600">
+              This permanently deletes transaction detail and cannot be undone. The only way back
+              is the archive <span className="font-mono">.bka</span> snapshot that is saved
+              automatically before condensing.
+            </p>
+            <div className="flex flex-wrap items-end gap-3">
+              <div>
+                <Label htmlFor="condense-date">Remove detail dated before</Label>
+                <Input
+                  id="condense-date"
+                  type="date"
+                  value={condenseDate}
+                  onChange={(e) => {
+                    setCondenseDate(e.target.value);
+                    setCondensePreview(null);
+                  }}
+                  className="max-w-xs"
+                />
+              </div>
+              <Button
+                variant="secondary"
+                onClick={handleCondensePreview}
+                loading={previewingCondense}
+                disabled={!condenseDate}
+              >
+                Preview
+              </Button>
+              <Button
+                variant="danger"
+                onClick={() => {
+                  setCondenseConfirmText('');
+                  setCondenseModalOpen(true);
+                }}
+                disabled={
+                  !condensePreview ||
+                  (condensePreview.entriesToCondense === 0 &&
+                    condensePreview.voidEntriesToDelete === 0)
+                }
+              >
+                <Archive className="h-4 w-4" />
+                Condense…
+              </Button>
+            </div>
+
+            {condensePreview && (
+              <div className="mt-2 rounded-lg bg-slate-50 border border-slate-200 p-4 text-sm text-navy/80">
+                <p className="font-semibold text-navy mb-2">
+                  Preview — condensing before {condensePreview.beforeDate}
+                </p>
+                <ul className="space-y-1">
+                  <li>
+                    <span className="font-medium">{condensePreview.entriesToCondense}</span>{' '}
+                    detail entries ({condensePreview.linesToCondense} lines) will be replaced by{' '}
+                    <span className="font-medium">{condensePreview.summaryEntriesToCreate}</span>{' '}
+                    monthly summary entries
+                    {condensePreview.months.length > 0 && (
+                      <> ({condensePreview.months.join(', ')})</>
+                    )}
+                  </li>
+                  <li>{condensePreview.voidEntriesToDelete} voided entries will be deleted</li>
+                  <li>
+                    {condensePreview.reconciliationItemsToDelete} completed-reconciliation detail
+                    rows and {condensePreview.bankFeedRowsToDelete} matched bank-feed rows will be
+                    removed
+                  </li>
+                  <li>
+                    Kept intact: {condensePreview.keptOpenDocumentEntries} entries behind
+                    open-balance documents, {condensePreview.keptInProgressReconciliationEntries}{' '}
+                    entries in the in-progress reconciliation,{' '}
+                    {condensePreview.draftEntriesSkipped} drafts
+                  </li>
+                </ul>
+              </div>
+            )}
+          </Card>
         </div>
 
         {/* Full-restore confirmation modal */}
@@ -411,6 +576,75 @@ export default function BackupPage() {
               />
             </div>
           </form>
+        </Modal>
+
+        {/* Condense confirmation modal — requires typing CONDENSE */}
+        <Modal
+          open={condenseModalOpen}
+          onClose={() => {
+            if (!condensing) {
+              setCondenseModalOpen(false);
+              setCondenseConfirmText('');
+            }
+          }}
+          title="Permanently condense old detail?"
+          footer={
+            <>
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  setCondenseModalOpen(false);
+                  setCondenseConfirmText('');
+                }}
+                disabled={condensing}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="danger"
+                onClick={handleCondenseConfirm}
+                loading={condensing}
+                disabled={condenseConfirmText !== 'CONDENSE'}
+              >
+                Condense Permanently
+              </Button>
+            </>
+          }
+        >
+          <div className="flex flex-col gap-3 text-sm text-navy/70">
+            <p>
+              You are about to permanently delete{' '}
+              <span className="font-semibold text-navy">
+                {condensePreview?.entriesToCondense ?? 0} journal entries
+              </span>{' '}
+              (plus {condensePreview?.voidEntriesToDelete ?? 0} voided entries) dated before{' '}
+              <span className="font-semibold text-navy">{condenseDate}</span> and replace them with{' '}
+              {condensePreview?.summaryEntriesToCreate ?? 0} monthly summary entries.
+            </p>
+            <p className="text-red-600 font-medium">
+              THIS CANNOT BE UNDONE. Transaction-level detail, drill-down links on old closed
+              documents, and completed-reconciliation detail in this range will be gone forever.
+              The only way back is restoring the archive .bka snapshot saved automatically before
+              condensing — which rolls back EVERYTHING to this moment.
+            </p>
+            <p>
+              Account balances, monthly totals, and class totals are preserved. Open invoices,
+              unpaid bills, unapplied credits/payments, and the in-progress reconciliation are
+              kept intact.
+            </p>
+            <div>
+              <Label htmlFor="condense-confirm">
+                Type <span className="font-mono font-bold">CONDENSE</span> to continue
+              </Label>
+              <Input
+                id="condense-confirm"
+                autoFocus
+                value={condenseConfirmText}
+                onChange={(e) => setCondenseConfirmText(e.target.value)}
+                placeholder="CONDENSE"
+              />
+            </div>
+          </div>
         </Modal>
       </main>
     </>

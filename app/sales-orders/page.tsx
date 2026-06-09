@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { FileCheck, Plus, ArrowRight, PlusCircle, MinusCircle } from 'lucide-react';
+import { FileCheck, Plus, ArrowRight, PlusCircle, MinusCircle, Printer } from 'lucide-react';
 import {
   Button,
   Card,
@@ -42,6 +42,19 @@ interface SalesOrder {
   convertedInvoiceId: string | null;
 }
 
+interface SalesOrderLine {
+  id: string;
+  description: string | null;
+  quantity: string;
+  rate: string;
+  amount: string;
+  quantityInvoiced: string;
+}
+
+interface SalesOrderDetail extends SalesOrder {
+  lines: SalesOrderLine[];
+}
+
 interface LineRow {
   description: string;
   quantity: string;
@@ -56,6 +69,7 @@ type StatusTone = 'info' | 'success' | 'neutral' | 'warning';
 
 function statusTone(status: string): StatusTone {
   if (status === 'open') return 'info';
+  if (status === 'partial') return 'warning';
   if (status === 'closed') return 'success';
   if (status === 'void') return 'neutral';
   return 'warning';
@@ -63,7 +77,8 @@ function statusTone(status: string): StatusTone {
 
 function statusLabel(status: string): string {
   if (status === 'open') return 'Open';
-  if (status === 'closed') return 'Converted';
+  if (status === 'partial') return 'Partially Invoiced';
+  if (status === 'closed') return 'Invoiced';
   if (status === 'void') return 'Void';
   return status;
 }
@@ -288,36 +303,198 @@ function NewOrderModal({ open, onClose, customers, onCreated }: NewOrderModalPro
 }
 
 // ---------------------------------------------------------------------------
-// Convert confirmation modal
+// Invoice modal — per-line quantities with backorder tracking
 // ---------------------------------------------------------------------------
 
-interface ConvertModalProps {
+interface InvoiceModalProps {
   open: boolean;
   order: SalesOrder | null;
-  onConfirm: () => void;
   onClose: () => void;
-  converting: boolean;
+  onInvoiced: () => void;
 }
 
-function ConvertModal({ open, order, onConfirm, onClose, converting }: ConvertModalProps) {
+/** ordered - invoiced, never below 0 (display-side decimal-safe enough at 4dp). */
+function remainingOf(line: SalesOrderLine): number {
+  const rem = (parseFloat(line.quantity) || 0) - (parseFloat(line.quantityInvoiced) || 0);
+  return Math.max(0, Math.round(rem * 10000) / 10000);
+}
+
+function fmtQty(n: number): string {
+  return String(Math.round(n * 10000) / 10000);
+}
+
+function InvoiceModal({ open, order, onClose, onInvoiced }: InvoiceModalProps) {
+  const [detail, setDetail] = useState<SalesOrderDetail | null>(null);
+  const [loadingDetail, setLoadingDetail] = useState(false);
+  const [qtyNow, setQtyNow] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!open || !order) {
+      setDetail(null);
+      setQtyNow({});
+      return;
+    }
+    let cancelled = false;
+    setLoadingDetail(true);
+    api
+      .get<SalesOrderDetail>(`/api/sales-orders/${order.id}`)
+      .then((d) => {
+        if (cancelled) return;
+        setDetail(d);
+        // Default: invoice the full remaining quantity of every line.
+        setQtyNow(
+          Object.fromEntries(d.lines.map((l) => [l.id, fmtQty(remainingOf(l))])),
+        );
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          toast(err instanceof Error ? err.message : 'Failed to load sales order.', 'danger');
+          onClose();
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingDetail(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, order?.id]);
+
+  const lines = detail?.lines ?? [];
+  const invoiceNowTotal = lines.reduce(
+    (sum, l) => sum + (parseFloat(qtyNow[l.id]) || 0) * (parseFloat(l.rate) || 0),
+    0,
+  );
+  const anyQty = lines.some((l) => (parseFloat(qtyNow[l.id]) || 0) > 0);
+
+  async function handleSubmit() {
+    if (!order || !detail) return;
+
+    const plan: Array<{ lineId: string; quantity: string }> = [];
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i];
+      const qty = parseFloat(qtyNow[l.id]) || 0;
+      if (qty < 0) {
+        toast(`Line ${i + 1}: quantity cannot be negative.`, 'danger');
+        return;
+      }
+      const remaining = remainingOf(l);
+      if (qty > remaining) {
+        toast(`Line ${i + 1}: only ${fmtQty(remaining)} remaining (backordered).`, 'danger');
+        return;
+      }
+      if (qty > 0) plan.push({ lineId: l.id, quantity: qtyNow[l.id] });
+    }
+    if (plan.length === 0) {
+      toast('Enter a quantity to invoice on at least one line.', 'danger');
+      return;
+    }
+
+    setSaving(true);
+    try {
+      await api.post(`/api/sales-orders/${order.id}`, { action: 'convert', lines: plan });
+      const fully = lines.every(
+        (l) => (parseFloat(qtyNow[l.id]) || 0) >= remainingOf(l),
+      );
+      toast(
+        fully
+          ? `Sales Order #${order.orderNumber} fully invoiced.`
+          : `Sales Order #${order.orderNumber} partially invoiced — remainder on backorder.`,
+        'success',
+      );
+      onInvoiced();
+      onClose();
+    } catch (err: unknown) {
+      toast(err instanceof Error ? err.message : 'Failed to create invoice.', 'danger');
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <Modal
       open={open}
       onClose={onClose}
-      title="Convert to Invoice"
+      title={`Create Invoice — Sales Order #${order?.orderNumber ?? ''}`}
+      size="lg"
       footer={
         <>
-          <Button variant="secondary" onClick={onClose} disabled={converting}>Cancel</Button>
-          <Button onClick={onConfirm} loading={converting}>
-            Convert to Invoice
+          <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
+          <Button onClick={handleSubmit} loading={saving} disabled={loadingDetail || !anyQty}>
+            <ArrowRight className="h-4 w-4" /> Create Invoice
           </Button>
         </>
       }
     >
-      <p className="text-navy/80 text-sm">
-        Convert <strong>Sales Order #{order?.orderNumber}</strong> ({formatCurrency(order?.total ?? '0')}) to an invoice?
-        This will post the A/R journal entry and close the sales order.
-      </p>
+      {loadingDetail ? (
+        <div className="flex items-center justify-center py-12 text-navy/40">
+          <Spinner className="h-6 w-6" />
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <p className="text-sm text-navy/70">
+            Set the quantity to invoice now for each line. Anything left over stays on the
+            sales order as a <strong>backorder</strong> and can be invoiced later.
+          </p>
+
+          <div className="rounded-lg border border-slate-200 overflow-hidden">
+            <Table>
+              <thead>
+                <Tr>
+                  <Th>Description</Th>
+                  <Th numeric>Ordered</Th>
+                  <Th numeric>Invoiced</Th>
+                  <Th numeric>Invoice Now</Th>
+                  <Th numeric>Backordered</Th>
+                </Tr>
+              </thead>
+              <tbody>
+                {lines.map((l) => {
+                  const remaining = remainingOf(l);
+                  const now = parseFloat(qtyNow[l.id]) || 0;
+                  const backordered = Math.max(0, Math.round((remaining - now) * 10000) / 10000);
+                  return (
+                    <Tr key={l.id}>
+                      <Td className="text-navy">{l.description || '—'}</Td>
+                      <Td numeric>{fmtQty(parseFloat(l.quantity) || 0)}</Td>
+                      <Td numeric className="text-navy/60">
+                        {fmtQty(parseFloat(l.quantityInvoiced) || 0)}
+                      </Td>
+                      <Td numeric>
+                        <Input
+                          type="number"
+                          min="0"
+                          max={remaining}
+                          step="any"
+                          value={qtyNow[l.id] ?? ''}
+                          disabled={remaining <= 0}
+                          onChange={(e) =>
+                            setQtyNow((prev) => ({ ...prev, [l.id]: e.target.value }))
+                          }
+                          className="w-24 text-right ml-auto"
+                          aria-label={`Quantity to invoice for ${l.description || 'line'}`}
+                        />
+                      </Td>
+                      <Td numeric className={backordered > 0 ? 'text-amber-600 font-semibold' : 'text-navy/40'}>
+                        {fmtQty(backordered)}
+                      </Td>
+                    </Tr>
+                  );
+                })}
+              </tbody>
+            </Table>
+          </div>
+
+          <div className="flex items-center justify-between rounded-lg bg-navy/5 px-4 py-3">
+            <span className="text-sm font-semibold text-navy/70">Invoice Total (before tax)</span>
+            <span className="text-lg font-bold text-navy tabular-nums">
+              {formatCurrency(invoiceNowTotal.toFixed(2))}
+            </span>
+          </div>
+        </div>
+      )}
     </Modal>
   );
 }
@@ -332,9 +509,8 @@ export default function SalesOrdersPage() {
   const [loading, setLoading] = useState(true);
   const [showNew, setShowNew] = useState(false);
 
-  // Convert state
-  const [convertTarget, setConvertTarget] = useState<SalesOrder | null>(null);
-  const [converting, setConverting] = useState(false);
+  // Invoice (convert) state
+  const [invoiceTarget, setInvoiceTarget] = useState<SalesOrder | null>(null);
 
   const customerMap = Object.fromEntries(customers.map((c) => [c.id, c.displayName]));
 
@@ -358,22 +534,6 @@ export default function SalesOrdersPage() {
   useEffect(() => {
     fetchData();
   }, [fetchData]);
-
-  async function handleConvert() {
-    if (!convertTarget) return;
-    setConverting(true);
-    try {
-      await api.post(`/api/sales-orders/${convertTarget.id}`, { action: 'convert' });
-      toast(`Sales Order #${convertTarget.orderNumber} converted to invoice.`, 'success');
-      setConvertTarget(null);
-      fetchData();
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to convert sales order.';
-      toast(msg, 'danger');
-    } finally {
-      setConverting(false);
-    }
-  }
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
@@ -428,19 +588,41 @@ export default function SalesOrdersPage() {
                     <Badge tone={statusTone(order.status)}>{statusLabel(order.status)}</Badge>
                   </Td>
                   <Td className="text-right">
-                    {order.status === 'open' && (
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => setConvertTarget(order)}
-                        title="Convert to Invoice"
-                      >
-                        <ArrowRight className="h-3.5 w-3.5" /> Convert to Invoice
-                      </Button>
-                    )}
-                    {order.status === 'closed' && (
-                      <span className="text-xs text-navy/30 italic">Converted</span>
-                    )}
+                    <div className="flex items-center justify-end gap-1">
+                      {(order.status === 'open' || order.status === 'partial') && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setInvoiceTarget(order)}
+                          title={
+                            order.status === 'partial'
+                              ? 'Invoice the backordered quantity'
+                              : 'Create an invoice (full or partial)'
+                          }
+                        >
+                          <ArrowRight className="h-3.5 w-3.5" />
+                          {order.status === 'partial' ? 'Invoice Backorder' : 'Invoice'}
+                        </Button>
+                      )}
+                      {order.convertedInvoiceId && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() =>
+                            window.open(
+                              `/api/invoices/${order.convertedInvoiceId}/packing-slip`,
+                              '_blank',
+                            )
+                          }
+                          title="Print packing slip (no prices) for the linked invoice"
+                        >
+                          <Printer className="h-3.5 w-3.5" /> Packing Slip
+                        </Button>
+                      )}
+                      {order.status === 'closed' && !order.convertedInvoiceId && (
+                        <span className="text-xs text-navy/30 italic">Closed</span>
+                      )}
+                    </div>
                   </Td>
                 </Tr>
               ))}
@@ -462,11 +644,17 @@ export default function SalesOrdersPage() {
             </span>
           </span>
           <span>
+            Partially invoiced:{' '}
+            <span className="font-semibold text-amber-600">
+              {orders.filter((o) => o.status === 'partial').length}
+            </span>
+          </span>
+          <span>
             Open total:{' '}
             <span className="font-semibold text-navy/70">
               {formatCurrency(
                 orders
-                  .filter((o) => o.status === 'open')
+                  .filter((o) => o.status === 'open' || o.status === 'partial')
                   .reduce((s, o) => s + Number(o.total), 0)
                   .toFixed(2),
               )}
@@ -482,12 +670,11 @@ export default function SalesOrdersPage() {
         onCreated={fetchData}
       />
 
-      <ConvertModal
-        open={!!convertTarget}
-        order={convertTarget}
-        onConfirm={handleConvert}
-        onClose={() => setConvertTarget(null)}
-        converting={converting}
+      <InvoiceModal
+        open={!!invoiceTarget}
+        order={invoiceTarget}
+        onClose={() => setInvoiceTarget(null)}
+        onInvoiced={fetchData}
       />
     </main>
   );

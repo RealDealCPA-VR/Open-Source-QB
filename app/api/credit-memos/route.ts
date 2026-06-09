@@ -11,6 +11,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { createCreditMemo, listCreditMemos } from '@/lib/services/creditMemos';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createCreditMemoSchema } from '@/lib/validation/creditMemos';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -46,33 +48,13 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    if (!body.customerId) {
-      return NextResponse.json({ error: 'customerId is required', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (!body.date) {
-      return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (!Array.isArray(body.lines) || body.lines.length === 0) {
-      return NextResponse.json({ error: 'lines must be a non-empty array', code: 'VALIDATION' }, { status: 400 });
+    const body = await req.json().catch(() => ({}));
+    const parsed = createCreditMemoSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const memo = await createCreditMemo(ctx, {
-      customerId: body.customerId,
-      date: new Date(body.date),
-      memo: body.memo ?? null,
-      taxRateId: (body.taxRateId as string | undefined) ?? null,
-      lines: body.lines.map((l: Record<string, unknown>) => ({
-        itemId: (l.itemId as string | undefined) ?? null,
-        description: (l.description as string | undefined) ?? null,
-        quantity: l.quantity as string | number,
-        rate: l.rate as string | number,
-        accountId: (l.accountId as string | undefined) ?? null,
-        taxable: l.taxable === undefined ? undefined : l.taxable !== false,
-        restock: l.restock === undefined ? undefined : l.restock !== false,
-      })),
-    });
+    const memo = await createCreditMemo(ctx, parsed.data);
 
     return NextResponse.json(memo, { status: 201 });
   } catch (err) {

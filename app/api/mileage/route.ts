@@ -12,6 +12,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listMileage, logMiles, mileageSummary } from '@/lib/services/mileage';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { logMilesSchema } from '@/lib/validation/mileage';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -57,17 +59,16 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await req.json().catch(() => ({}));
+    const parsed = logMilesSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
 
     const log = await logMiles(ctx, {
-      employeeId: body.employeeId ?? null,
-      customerId: body.customerId ?? null,
-      jobId: body.jobId ?? null,
-      date: body.date ? new Date(body.date) : new Date(),
-      miles: body.miles,
-      ratePerMile: body.ratePerMile ?? null,
-      purpose: body.purpose ?? null,
-      billable: body.billable ?? false,
+      ...parsed.data,
+      date: parsed.data.date ?? new Date(),
+      billable: parsed.data.billable ?? false,
     });
     return NextResponse.json(log, { status: 201 });
   } catch (err) {

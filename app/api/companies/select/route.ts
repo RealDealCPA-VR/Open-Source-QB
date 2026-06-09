@@ -7,6 +7,7 @@ import { companies, userCompanies } from '@/lib/db/schema';
 import { and, eq } from 'drizzle-orm';
 import { getSessionUserId } from '@/lib/auth';
 import { COMPANY_COOKIE } from '@/lib/context';
+import { stampLastOpened } from '../[id]/manage';
 
 export async function POST(req: NextRequest) {
   // Require a session and verify the caller is a member of the company before pointing
@@ -32,6 +33,8 @@ export async function POST(req: NextRequest) {
   if (!c) {
     return NextResponse.json({ error: 'Company not found', code: 'NOT_FOUND' }, { status: 404 });
   }
+  // Recency ordering for the companies page: stamp settings.lastOpenedAt on every open.
+  await stampLastOpened(db, companyId);
   const res = NextResponse.json({ ok: true, company: c });
   res.cookies.set(COMPANY_COOKIE, companyId, {
     httpOnly: true,

@@ -1,13 +1,21 @@
 /**
  * Recurring / memorized transaction service.
  *
- * Templates store a docType (invoice | bill | journal_entry), a frequency, a nextRunDate,
- * and a JSON payload that mirrors the create-input of the target service.
+ * Templates store a docType (invoice | bill | journal_entry | expense), a frequency,
+ * a nextRunDate, and a JSON payload that mirrors the create-input of the target service.
  *
- * `runDue(ctx, asOf)` finds all active templates whose nextRunDate <= asOf, generates the
- * document by delegating to the matching service, and advances nextRunDate by the frequency.
+ * Auto-enter mode (QB "Automate Transaction Entry" vs "Remind Me"): the schema has no
+ * dedicated column, so the option is stored INSIDE the template jsonb under the reserved
+ * `__options` key ({ autoEnter: boolean }, default true) and stripped before the payload
+ * is handed to the create services.
  *
- * `runTemplateNow(ctx, id)` generates a single template immediately regardless of nextRunDate.
+ * `runDue(ctx, asOf)` finds all active templates whose nextRunDate <= asOf. Auto-enter
+ * templates generate their document and advance nextRunDate by the frequency; remind-only
+ * templates are returned as reminders WITHOUT generating or advancing (they stay due until
+ * the user runs them via runTemplateNow).
+ *
+ * `runTemplateNow(ctx, id)` generates a single template immediately regardless of
+ * nextRunDate or auto-enter mode.
  */
 
 import { and, eq, lte } from 'drizzle-orm';
@@ -22,12 +30,13 @@ import {
 import { createInvoice, type CreateInvoiceInput } from './invoices';
 import { createBill, type CreateBillInput } from './bills';
 import { createManualEntry, type ManualEntryInput } from './journal';
+import { createExpense, type CreateExpenseInput } from './expenses';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-export type DocType = 'invoice' | 'bill' | 'journal_entry';
+export type DocType = 'invoice' | 'bill' | 'journal_entry' | 'expense';
 export type Frequency = 'weekly' | 'monthly' | 'quarterly' | 'yearly';
 
 export interface CreateTemplateInput {
@@ -38,6 +47,12 @@ export interface CreateTemplateInput {
   nextRunDate: string | Date;
   /** JSON payload matching the create-input of the docType. Date fields as ISO strings. */
   template: Record<string, unknown>;
+  /**
+   * true (default) — runDue posts the document automatically on schedule.
+   * false — remind-only: runDue surfaces the template as a reminder; the user
+   * posts it explicitly via runTemplateNow.
+   */
+  autoEnter?: boolean;
 }
 
 export interface GeneratedDoc {
@@ -48,11 +63,38 @@ export interface GeneratedDoc {
   docId: string;
 }
 
+export interface TemplateReminder {
+  templateId: string;
+  templateName: string;
+  docType: DocType;
+  /** The run date the template is (over)due for. */
+  dueDate: Date;
+}
+
+/** Reserved key inside the template jsonb that carries non-payload options. */
+const OPTIONS_KEY = '__options';
+
+interface TemplateOptions {
+  autoEnter?: boolean;
+}
+
+/** Read the auto-enter flag from a stored template jsonb (default true). */
+export function templateAutoEnter(template: Record<string, unknown>): boolean {
+  const opts = template[OPTIONS_KEY] as TemplateOptions | undefined;
+  return opts?.autoEnter !== false;
+}
+
+/** Strip reserved option keys so the create services see a clean payload. */
+function payloadOf(template: Record<string, unknown>): Record<string, unknown> {
+  const { [OPTIONS_KEY]: _options, ...payload } = template;
+  return payload;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const DOC_TYPES: DocType[] = ['invoice', 'bill', 'journal_entry'];
+const DOC_TYPES: DocType[] = ['invoice', 'bill', 'journal_entry', 'expense'];
 const FREQUENCIES: Frequency[] = ['weekly', 'monthly', 'quarterly', 'yearly'];
 
 function advanceDate(date: Date, frequency: Frequency): Date {
@@ -116,6 +158,13 @@ function toManualEntryInput(payload: Record<string, unknown>, runDate: Date): Ma
   };
 }
 
+function toExpenseInput(payload: Record<string, unknown>, runDate: Date): CreateExpenseInput {
+  return {
+    ...(payload as unknown as CreateExpenseInput),
+    date: runDate,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // listTemplates
 // ---------------------------------------------------------------------------
@@ -169,6 +218,13 @@ export async function createTemplate(ctx: ServiceContext, input: CreateTemplateI
     throw validation('nextRunDate is not a valid date.');
   }
 
+  // Persist the auto-enter option inside the template jsonb (no schema column).
+  const autoEnter = input.autoEnter ?? true;
+  const template: Record<string, unknown> = {
+    ...input.template,
+    [OPTIONS_KEY]: { autoEnter },
+  };
+
   const [row] = await ctx.db
     .insert(recurringTemplates)
     .values({
@@ -177,7 +233,7 @@ export async function createTemplate(ctx: ServiceContext, input: CreateTemplateI
       docType: input.docType,
       frequency: input.frequency,
       nextRunDate: nextRunDate,
-      template: input.template,
+      template,
       isActive: true,
     })
     .returning();
@@ -186,7 +242,7 @@ export async function createTemplate(ctx: ServiceContext, input: CreateTemplateI
     action: 'create',
     entityType: 'recurring_template',
     entityId: row.id,
-    newValues: { name: row.name, docType: row.docType, frequency: row.frequency },
+    newValues: { name: row.name, docType: row.docType, frequency: row.frequency, autoEnter },
   });
 
   return row;
@@ -201,7 +257,7 @@ async function generateFromTemplate(
   template: Awaited<ReturnType<typeof getTemplate>>,
   runDate: Date,
 ): Promise<GeneratedDoc> {
-  const payload = template.template as Record<string, unknown>;
+  const payload = payloadOf(template.template as Record<string, unknown>);
   let docId: string;
 
   if (template.docType === 'invoice') {
@@ -215,6 +271,10 @@ async function generateFromTemplate(
   } else if (template.docType === 'journal_entry') {
     const input = toManualEntryInput(payload, runDate);
     const result = await createManualEntry(ctx, input);
+    docId = result.id;
+  } else if (template.docType === 'expense') {
+    const input = toExpenseInput(payload, runDate);
+    const result = await createExpense(ctx, input);
     docId = result.id;
   } else {
     throw new ServiceError('VALIDATION', `Unknown docType: ${template.docType}`);
@@ -233,13 +293,14 @@ async function generateFromTemplate(
 // ---------------------------------------------------------------------------
 
 /**
- * Find all active templates with nextRunDate <= asOf, generate each document,
- * and advance nextRunDate by the frequency.
+ * Find all active templates with nextRunDate <= asOf. Auto-enter templates
+ * generate their document and advance nextRunDate by the frequency; remind-only
+ * templates are reported as reminders without generating or advancing.
  */
 export async function runDue(
   ctx: ServiceContext,
   asOf: Date = new Date(),
-): Promise<{ generated: GeneratedDoc[] }> {
+): Promise<{ generated: GeneratedDoc[]; reminders: TemplateReminder[] }> {
   const due = await ctx.db
     .select()
     .from(recurringTemplates)
@@ -252,9 +313,22 @@ export async function runDue(
     );
 
   const generated: GeneratedDoc[] = [];
+  const reminders: TemplateReminder[] = [];
 
   for (const template of due) {
     const runDate = template.nextRunDate ?? asOf;
+
+    // Remind-only templates never auto-post: surface them and leave nextRunDate
+    // untouched so the reminder persists until the user runs the template.
+    if (!templateAutoEnter(template.template as Record<string, unknown>)) {
+      reminders.push({
+        templateId: template.id,
+        templateName: template.name,
+        docType: template.docType as DocType,
+        dueDate: runDate,
+      });
+      continue;
+    }
     const doc = await generateFromTemplate(ctx, template, runDate);
     generated.push(doc);
 
@@ -279,7 +353,7 @@ export async function runDue(
     });
   }
 
-  return { generated };
+  return { generated, reminders };
 }
 
 // ---------------------------------------------------------------------------

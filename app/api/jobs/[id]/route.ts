@@ -10,6 +10,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getJob, updateJob, deactivateJob, jobProfitability } from '@/lib/services/jobs';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { updateJobSchema } from '@/lib/validation/jobs';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -52,17 +54,14 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await req.json().catch(() => ({}));
+    // zod strip mode keeps absent keys absent — only provided fields are updated.
+    const parsed = updateJobSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
 
-    const patch: Record<string, unknown> = {};
-    if (body.name !== undefined) patch.name = body.name;
-    if (body.customerId !== undefined) patch.customerId = body.customerId;
-    if (body.budget !== undefined) patch.budget = body.budget;
-    if (body.startDate !== undefined) patch.startDate = body.startDate ? new Date(body.startDate) : null;
-    if (body.endDate !== undefined) patch.endDate = body.endDate ? new Date(body.endDate) : null;
-    if (body.status !== undefined) patch.status = body.status;
-
-    const job = await updateJob(ctx, id, patch);
+    const job = await updateJob(ctx, id, parsed.data);
     return NextResponse.json(job);
   } catch (err) {
     return errorResponse(err);

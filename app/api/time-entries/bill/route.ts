@@ -7,6 +7,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { billTimeToInvoice } from '@/lib/services/timeTracking';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { billTimeSchema } from '@/lib/validation/timeEntries';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -29,16 +31,13 @@ function errorResponse(err: unknown) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    if (!body.customerId) {
-      return NextResponse.json(
-        { error: 'customerId is required', code: 'VALIDATION' },
-        { status: 400 },
-      );
+    const body = await req.json().catch(() => ({}));
+    const parsed = billTimeSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const invoice = await billTimeToInvoice(ctx, { customerId: body.customerId });
+    const invoice = await billTimeToInvoice(ctx, parsed.data);
     return NextResponse.json(invoice, { status: 201 });
   } catch (err) {
     return errorResponse(err);

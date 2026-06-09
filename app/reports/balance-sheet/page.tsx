@@ -5,6 +5,7 @@ import { getServerContext } from '@/lib/context';
 import { balanceSheet } from '@/lib/services/reports';
 import { balanceSheetComparative } from '@/lib/services/reportsExtra';
 import { formatCurrency, Money } from '@/lib/money';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
 
 export const dynamic = 'force-dynamic';
 
@@ -194,6 +195,32 @@ export default async function BalanceSheetPage({
         change: comp.retainedEarnings.change,
       },
     ];
+    const compSection = (title: string, lines: CompLine[]) =>
+      [
+        [title.toUpperCase(), null, null, null],
+        ...lines.map((l) => [l.name, l.current, l.prior, l.change]),
+      ] as (string | null)[][];
+    const compTable: ExportTable = {
+      filename: 'balance-sheet-comparative',
+      title: 'Balance Sheet - Comparative',
+      subtitle: `${asOf.toLocaleDateString('en-US')} vs ${compareTo.toLocaleDateString('en-US')}`,
+      columns: [
+        { header: 'Account' },
+        { header: asOf.toLocaleDateString('en-US'), numeric: true },
+        { header: compareTo.toLocaleDateString('en-US'), numeric: true },
+        { header: 'Change', numeric: true },
+      ],
+      rows: [
+        ...compSection('Assets', comp.assets),
+        ['Total Assets', comp.totals.assets.current, comp.totals.assets.prior, comp.totals.assets.change],
+        ...compSection('Liabilities', comp.liabilities),
+        ['Total Liabilities', comp.totals.liabilities.current, comp.totals.liabilities.prior, comp.totals.liabilities.change],
+        ...compSection('Equity', equityLines),
+      ],
+      totals: [
+        ['Total Equity', comp.totals.equity.current, comp.totals.equity.prior, comp.totals.equity.change],
+      ],
+    };
     return (
       <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
         <div className="max-w-4xl">
@@ -205,6 +232,14 @@ export default async function BalanceSheetPage({
                 {comp.balanced ? 'Assets = Liabilities + Equity' : 'OUT OF BALANCE'}
               </Badge>
             }
+          />
+          <ReportToolbar
+            table={compTable}
+            basisNav={{
+              value: 'accrual',
+              accrualHref: `/reports/balance-sheet?asOf=${asOfStr}`,
+              cashHref: `/reports/balance-sheet-cash?asOf=${asOfStr}`,
+            }}
           />
         </div>
         {dateForm}
@@ -238,6 +273,27 @@ export default async function BalanceSheetPage({
     { accountId: 're', code: '3900', name: 'Net Income / Retained Earnings', amount: bs.retainedEarnings },
   ];
 
+  const exportTable: ExportTable = {
+    filename: 'balance-sheet',
+    title: 'Balance Sheet',
+    subtitle: `As of ${asOf.toLocaleDateString('en-US')}`,
+    columns: [{ header: 'Account' }, { header: 'Amount', numeric: true }],
+    rows: [
+      ['ASSETS', null],
+      ...bs.assets.map((l) => [l.name, l.amount] as (string | null)[]),
+      ['Total Assets', bs.totalAssets],
+      ['', null],
+      ['LIABILITIES', null],
+      ...bs.liabilities.map((l) => [l.name, l.amount] as (string | null)[]),
+      ['Total Liabilities', bs.totalLiabilities],
+      ['', null],
+      ['EQUITY', null],
+      ...equityLines.map((l) => [l.name, l.amount] as (string | null)[]),
+      ['Total Equity', bs.totalEquity],
+    ],
+    totals: [['Total Liabilities + Equity', Money.add(bs.totalLiabilities, bs.totalEquity).toFixed(2)]],
+  };
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <div className="max-w-4xl">
@@ -254,6 +310,14 @@ export default async function BalanceSheetPage({
               </Badge>
             </div>
           }
+        />
+        <ReportToolbar
+          table={exportTable}
+          basisNav={{
+            value: 'accrual',
+            accrualHref: `/reports/balance-sheet?asOf=${asOfStr}`,
+            cashHref: `/reports/balance-sheet-cash?asOf=${asOfStr}`,
+          }}
         />
       </div>
       {dateForm}

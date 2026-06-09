@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { Suspense, useEffect, useState, useCallback } from 'react';
 import {
   NotebookPen,
   Plus,
@@ -13,8 +13,10 @@ import {
   XCircle,
 } from 'lucide-react';
 import {
+  AmountInput,
   Button,
   Card,
+  DateInput,
   Input,
   Select,
   Label,
@@ -29,9 +31,11 @@ import {
   Spinner,
   PageHeader,
   toast,
+  useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { useNewParam } from '@/lib/useFocusParam';
 import EntryDetailModal from '@/components/EntryDetailModal';
 
 // ---------------------------------------------------------------------------
@@ -201,6 +205,16 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
   const removeLine = (id: number) =>
     setLines((prev) => (prev.length > 2 ? prev.filter((l) => l.id !== id) : prev));
 
+  // Line-grid keyboard ergonomics: Ctrl+Insert add / Ctrl+Delete remove / Enter down.
+  const grid = useGridKeys({
+    addRow: addLine,
+    removeRow: (idx) => {
+      const line = lines[idx];
+      if (line) removeLine(line.id);
+    },
+    disabled: saving,
+  });
+
   const totalDebits = sumLines(lines, 'debit');
   const totalCredits = sumLines(lines, 'credit');
   const balanced = isBalanced(lines);
@@ -288,9 +302,8 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
       <div className="grid grid-cols-2 gap-4 mb-5">
         <div>
           <Label htmlFor="je-date">Date</Label>
-          <Input
+          <DateInput
             id="je-date"
-            type="date"
             autoFocus
             value={date}
             onChange={(e) => setDate(e.target.value)}
@@ -327,9 +340,9 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
           <span />
         </div>
 
-        <div className="flex flex-col gap-2">
+        <div className="flex flex-col gap-2" onKeyDown={grid.onKeyDown}>
           {lines.map((line) => (
-            <div key={line.id} className={`grid ${gridCols} gap-2 items-center`}>
+            <div key={line.id} data-grid-row className={`grid ${gridCols} gap-2 items-center`}>
               <Select
                 value={line.accountId}
                 onChange={(e) => updateLine(line.id, 'accountId', e.target.value)}
@@ -360,20 +373,14 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, editEntry }
                 onChange={(e) => updateLine(line.id, 'memo', e.target.value)}
               />
 
-              <Input
-                type="number"
-                min="0"
-                step="0.01"
+              <AmountInput
                 placeholder="0.00"
                 value={line.debit}
                 onChange={(e) => updateLine(line.id, 'debit', e.target.value)}
                 className="text-right"
               />
 
-              <Input
-                type="number"
-                min="0"
-                step="0.01"
+              <AmountInput
                 placeholder="0.00"
                 value={line.credit}
                 onChange={(e) => updateLine(line.id, 'credit', e.target.value)}
@@ -492,9 +499,8 @@ function ReverseModal({ entry, onClose, onReversed }: ReverseModalProps) {
       </p>
       <div>
         <Label htmlFor="rev-date">Reversal date</Label>
-        <Input
+        <DateInput
           id="rev-date"
-          type="date"
           value={asOfDate}
           onChange={(e) => setAsOfDate(e.target.value)}
         />
@@ -508,7 +514,7 @@ function ReverseModal({ entry, onClose, onReversed }: ReverseModalProps) {
 // Main page
 // ---------------------------------------------------------------------------
 
-export default function JournalPage() {
+function JournalPageContent() {
   const [entries, setEntries] = useState<JournalEntry[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [classes, setClasses] = useState<ClassOption[]>([]);
@@ -555,6 +561,12 @@ export default function JournalPage() {
     fetchAccounts();
     fetchClasses();
   }, [fetchEntries, fetchAccounts, fetchClasses]);
+
+  // Quick Actions navigate here with ?new=1 — open the create modal.
+  useNewParam(() => {
+    setEditTarget(null);
+    setShowForm(true);
+  });
 
   const openEdit = async (entry: JournalEntry) => {
     try {
@@ -751,5 +763,13 @@ export default function JournalPage() {
 
       <EntryDetailModal entryId={detailId} onClose={() => setDetailId(null)} />
     </main>
+  );
+}
+
+export default function JournalPage() {
+  return (
+    <Suspense fallback={null}>
+      <JournalPageContent />
+    </Suspense>
   );
 }

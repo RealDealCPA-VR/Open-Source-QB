@@ -14,6 +14,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listPaychecks, runPaycheck } from '@/lib/services/payroll';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { runPaycheckSchema } from '@/lib/validation/payroll';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -45,45 +47,18 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    // Optional withholding parameters — validate when present.
-    if (body.filingStatus !== undefined && body.filingStatus !== 'single' && body.filingStatus !== 'married') {
-      return NextResponse.json(
-        { error: "filingStatus must be 'single' or 'married'", code: 'VALIDATION' },
-        { status: 400 },
-      );
-    }
-    if (body.periodsPerYear !== undefined &&
-        (!Number.isInteger(body.periodsPerYear) || body.periodsPerYear <= 0)) {
-      return NextResponse.json(
-        { error: 'periodsPerYear must be a positive integer', code: 'VALIDATION' },
-        { status: 400 },
-      );
-    }
-
-    if (body.earnings !== undefined && !Array.isArray(body.earnings)) {
-      return NextResponse.json(
-        { error: 'earnings must be an array of earning lines', code: 'VALIDATION' },
-        { status: 400 },
-      );
+    const body = await req.json().catch(() => ({}));
+    // IMPORTANT: `taxes` / `employerTaxes` pass through as-is. An OMITTED array
+    // triggers the service's auto-withholding (computeWithholding); an explicit
+    // [] means "no taxes". The schema keeps absent keys absent.
+    const parsed = runPaycheckSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
     const paycheck = await runPaycheck(ctx, {
-      employeeId: body.employeeId,
-      payDate: new Date(body.payDate),
-      periodStart: body.periodStart ? new Date(body.periodStart) : null,
-      periodEnd: body.periodEnd ? new Date(body.periodEnd) : null,
-      grossPay: body.grossPay,
-      earnings: body.earnings,
-      // IMPORTANT: pass `taxes` through as-is. An OMITTED array triggers the service's
-      // auto-withholding (computeWithholding); an explicit [] means "no taxes".
-      // Coercing undefined to [] here would silently disable auto-withholding.
-      taxes: body.taxes,
-      employerTaxes: body.employerTaxes,
-      deductions: body.deductions ?? [],
-      filingStatus: body.filingStatus,
-      periodsPerYear: body.periodsPerYear,
+      ...parsed.data,
+      deductions: parsed.data.deductions ?? [],
     });
 
     return NextResponse.json(paycheck, { status: 201 });

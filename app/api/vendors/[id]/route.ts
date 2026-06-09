@@ -7,6 +7,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getVendor, updateVendor, deactivateVendor } from '@/lib/services/vendors';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { updateVendorSchema } from '@/lib/validation/vendors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -43,30 +45,16 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await req.json().catch(() => ({}));
 
-    // Build patch — only forward keys that are present in the request body so
-    // the service can distinguish "not supplied" from "explicitly set to null".
-    const patch: Record<string, unknown> = {};
-    const allowed = [
-      'displayName',
-      'companyName',
-      'email',
-      'phone',
-      'address',
-      'terms',
-      'is1099',
-      'taxId',
-      'defaultExpenseAccountId',
-      'notes',
-    ] as const;
-    for (const key of allowed) {
-      if (Object.prototype.hasOwnProperty.call(body, key)) {
-        patch[key] = body[key];
-      }
+    // zod partial(): absent keys stay absent in the output, so the service can
+    // distinguish "not supplied" from "explicitly set to null".
+    const parsed = updateVendorSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const vendor = await updateVendor(ctx, id, patch);
+    const vendor = await updateVendor(ctx, id, parsed.data);
     return NextResponse.json(vendor);
   } catch (err) {
     return errorResponse(err);

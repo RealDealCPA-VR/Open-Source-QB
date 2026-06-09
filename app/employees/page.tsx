@@ -1,7 +1,11 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { UserSquare, Plus, Play, KeyRound, Pencil, Ban, RotateCcw, MinusCircle } from 'lucide-react';
+import Link from 'next/link';
+import {
+  UserSquare, Plus, Play, KeyRound, Pencil, Ban, RotateCcw, MinusCircle,
+  CalendarClock, ListChecks,
+} from 'lucide-react';
 import {
   Button,
   Card,
@@ -103,6 +107,39 @@ interface EarningRow {
 interface PayrollLineInput {
   name: string;
   amount: string;
+  /** Deduction rows only: payroll item providing GL mapping / pre-tax behavior. */
+  payrollItemId?: string;
+}
+
+type PayrollItemKind = 'earning' | 'tax' | 'deduction' | 'employer_contribution' | 'garnishment';
+
+interface PayrollItem {
+  id: string;
+  name: string;
+  kind: PayrollItemKind;
+  pretax: boolean;
+  expenseAccountId: string | null;
+  liabilityAccountId: string | null;
+  calcBasis: 'fixed' | 'percent' | null;
+  defaultRate: string | null;
+  isActive: boolean;
+}
+
+interface Account {
+  id: string;
+  code: string;
+  name: string;
+  type: string;
+}
+
+interface PayrollItemFormState {
+  name: string;
+  kind: PayrollItemKind;
+  pretax: boolean;
+  expenseAccountId: string;
+  liabilityAccountId: string;
+  calcBasis: '' | 'fixed' | 'percent';
+  defaultRate: string;
 }
 
 interface PayrollFormState {
@@ -113,6 +150,31 @@ interface PayrollFormState {
   earnings: EarningRow[];
   taxes: PayrollLineInput[];
   deductions: PayrollLineInput[];
+}
+
+// Leave accruals (GET/PUT /api/payroll/accruals)
+
+interface AccrualBucket {
+  rate: string | null;
+  starting: string;
+  accrued: string;
+  balance: string;
+}
+
+interface AccrualRow {
+  employeeId: string;
+  hasPolicy: boolean;
+  asOf: string | null;
+  sick: AccrualBucket;
+  vacation: AccrualBucket;
+}
+
+interface AccrualFormState {
+  sickRate: string;
+  vacRate: string;
+  sickBalance: string;
+  vacBalance: string;
+  asOf: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +199,14 @@ const EMPTY_EMPLOYEE_FORM: EmployeeFormState = {
   isActive: true,
 };
 
+const EMPTY_ACCRUAL_FORM: AccrualFormState = {
+  sickRate: '',
+  vacRate: '',
+  sickBalance: '',
+  vacBalance: '',
+  asOf: '',
+};
+
 const EMPTY_PAYROLL_FORM: PayrollFormState = {
   employeeId: '',
   payDate: new Date().toISOString().slice(0, 10),
@@ -158,6 +228,33 @@ const EARNING_LABELS: Record<EarningKind, string> = {
   overtime: 'Overtime',
   bonus: 'Bonus',
   commission: 'Commission',
+};
+
+const ITEM_KIND_LABELS: Record<PayrollItemKind, string> = {
+  earning: 'Earning',
+  tax: 'Tax',
+  deduction: 'Deduction',
+  employer_contribution: 'Employer Contribution',
+  garnishment: 'Garnishment',
+};
+
+const EMPTY_ITEM_FORM: PayrollItemFormState = {
+  name: '',
+  kind: 'deduction',
+  pretax: false,
+  expenseAccountId: '',
+  liabilityAccountId: '',
+  calcBasis: '',
+  defaultRate: '',
+};
+
+/** GL sides required per payroll item kind (mirrors the service validation). */
+const KIND_SIDES: Record<PayrollItemKind, { expense: boolean; liability: boolean }> = {
+  earning: { expense: true, liability: false },
+  tax: { expense: false, liability: true },
+  deduction: { expense: false, liability: true },
+  employer_contribution: { expense: true, liability: true },
+  garnishment: { expense: false, liability: true },
 };
 
 // ---------------------------------------------------------------------------
@@ -453,8 +550,16 @@ function LineEditor({
 export default function EmployeesPage() {
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [paychecks, setPaychecks] = useState<Paycheck[]>([]);
+  const [payrollItems, setPayrollItems] = useState<PayrollItem[]>([]);
+  const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
   const [showInactive, setShowInactive] = useState(false);
+
+  // Payroll item modal (add + edit share the form)
+  const [itemOpen, setItemOpen] = useState(false);
+  const [itemEditId, setItemEditId] = useState<string | null>(null);
+  const [itemForm, setItemForm] = useState<PayrollItemFormState>(EMPTY_ITEM_FORM);
+  const [itemSaving, setItemSaving] = useState(false);
 
   // Add employee modal
   const [addOpen, setAddOpen] = useState(false);
@@ -466,6 +571,11 @@ export default function EmployeesPage() {
   const [editId, setEditId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<EmployeeFormState>(EMPTY_EMPLOYEE_FORM);
   const [editSaving, setEditSaving] = useState(false);
+
+  // Leave accruals (within the edit modal)
+  const [accrualForm, setAccrualForm] = useState<AccrualFormState>(EMPTY_ACCRUAL_FORM);
+  const [accrualRow, setAccrualRow] = useState<AccrualRow | null>(null);
+  const [accrualSaving, setAccrualSaving] = useState(false);
 
   // Run payroll modal
   const [payrollOpen, setPayrollOpen] = useState(false);
@@ -492,12 +602,16 @@ export default function EmployeesPage() {
   async function fetchAll() {
     setLoading(true);
     try {
-      const [empData, pcData] = await Promise.all([
+      const [empData, pcData, itemData, acctData] = await Promise.all([
         api.get<Employee[]>('/api/employees?includeInactive=true'),
         api.get<Paycheck[]>('/api/payroll?includeVoided=true'),
+        api.get<PayrollItem[]>('/api/payroll-items?includeInactive=true'),
+        api.get<Account[]>('/api/accounts'),
       ]);
       setEmployees(empData);
       setPaychecks(pcData);
+      setPayrollItems(itemData);
+      setAccounts(acctData);
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to load data', 'danger');
     } finally {
@@ -555,7 +669,62 @@ export default function EmployeesPage() {
   function openEditModal(emp: Employee) {
     setEditId(emp.id);
     setEditForm(employeeToForm(emp));
+    setAccrualRow(null);
+    setAccrualForm(EMPTY_ACCRUAL_FORM);
     setEditOpen(true);
+    // Load the leave-accrual policy + derived balances (best-effort).
+    api
+      .get<AccrualRow[]>(`/api/payroll/accruals?employeeId=${encodeURIComponent(emp.id)}`)
+      .then(([row]) => {
+        if (!row) return;
+        setAccrualRow(row);
+        if (row.hasPolicy) {
+          setAccrualForm({
+            sickRate: row.sick.rate ?? '',
+            vacRate: row.vacation.rate ?? '',
+            sickBalance: row.sick.starting,
+            vacBalance: row.vacation.starting,
+            asOf: row.asOf ?? '',
+          });
+        }
+      })
+      .catch(() => {
+        /* accruals are optional — the rest of the modal still works */
+      });
+  }
+
+  function updateAccrualForm(field: keyof AccrualFormState, value: string) {
+    setAccrualForm((prev) => ({ ...prev, [field]: value }));
+  }
+
+  async function handleSaveAccruals() {
+    if (!editId) return;
+    const hasAny = [
+      accrualForm.sickRate, accrualForm.vacRate,
+      accrualForm.sickBalance, accrualForm.vacBalance,
+    ].some((v) => v.trim() !== '');
+    setAccrualSaving(true);
+    try {
+      const row = await api.put<AccrualRow>('/api/payroll/accruals', {
+        employeeId: editId,
+        // Empty form clears the policy (PUT with policy: null).
+        policy: hasAny
+          ? {
+              sickRateHrsPerHour: accrualForm.sickRate ? Number(accrualForm.sickRate) : null,
+              vacRateHrsPerHour: accrualForm.vacRate ? Number(accrualForm.vacRate) : null,
+              sickBalance: accrualForm.sickBalance ? Number(accrualForm.sickBalance) : null,
+              vacBalance: accrualForm.vacBalance ? Number(accrualForm.vacBalance) : null,
+              asOf: accrualForm.asOf || null,
+            }
+          : null,
+      });
+      setAccrualRow(row);
+      toast(hasAny ? 'Leave accruals saved' : 'Leave accrual policy cleared', 'success');
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to save leave accruals', 'danger');
+    } finally {
+      setAccrualSaving(false);
+    }
   }
 
   function updateEditForm(field: keyof EmployeeFormState, value: string) {
@@ -822,7 +991,12 @@ export default function EmployeesPage() {
           .map((t) => ({ kind: 'tax', name: t.name.trim(), amount: t.amount })),
         deductions: payrollForm.deductions
           .filter((d) => d.name.trim() && Number(d.amount) > 0)
-          .map((d) => ({ kind: 'deduction', name: d.name.trim(), amount: d.amount })),
+          .map((d) => ({
+            kind: 'deduction',
+            name: d.name.trim(),
+            amount: d.amount,
+            payrollItemId: d.payrollItemId || undefined,
+          })),
       });
       toast('Paycheck posted to GL', 'success');
       setPayrollOpen(false);
@@ -855,8 +1029,106 @@ export default function EmployeesPage() {
   }
 
   // ---------------------------------------------------------------------------
+  // Payroll items
+  // ---------------------------------------------------------------------------
+
+  function openAddItemModal() {
+    setItemEditId(null);
+    setItemForm(EMPTY_ITEM_FORM);
+    setItemOpen(true);
+  }
+
+  function openEditItemModal(item: PayrollItem) {
+    setItemEditId(item.id);
+    setItemForm({
+      name: item.name,
+      kind: item.kind,
+      pretax: item.pretax,
+      expenseAccountId: item.expenseAccountId ?? '',
+      liabilityAccountId: item.liabilityAccountId ?? '',
+      calcBasis: item.calcBasis ?? '',
+      defaultRate: item.defaultRate ?? '',
+    });
+    setItemOpen(true);
+  }
+
+  async function handleSaveItem() {
+    if (!itemForm.name.trim()) { toast('Item name is required', 'danger'); return; }
+    const sides = KIND_SIDES[itemForm.kind];
+    if (sides.expense && !itemForm.expenseAccountId) {
+      toast('This item kind needs an expense account', 'danger'); return;
+    }
+    if (sides.liability && !itemForm.liabilityAccountId) {
+      toast('This item kind needs a liability account', 'danger'); return;
+    }
+    setItemSaving(true);
+    try {
+      const body = {
+        name: itemForm.name.trim(),
+        pretax: itemForm.kind === 'deduction' ? itemForm.pretax : false,
+        expenseAccountId: itemForm.expenseAccountId || null,
+        liabilityAccountId: itemForm.liabilityAccountId || null,
+        calcBasis: itemForm.calcBasis || null,
+        defaultRate: itemForm.defaultRate || null,
+      };
+      if (itemEditId) {
+        await api.patch(`/api/payroll-items/${itemEditId}`, body);
+        toast('Payroll item updated', 'success');
+      } else {
+        await api.post('/api/payroll-items', { ...body, kind: itemForm.kind });
+        toast('Payroll item created', 'success');
+      }
+      setItemOpen(false);
+      await fetchAll();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to save payroll item', 'danger');
+    } finally {
+      setItemSaving(false);
+    }
+  }
+
+  async function toggleItemActive(item: PayrollItem) {
+    try {
+      await api.patch(`/api/payroll-items/${item.id}`, { isActive: !item.isActive });
+      toast(`Payroll item ${item.isActive ? 'deactivated' : 'reactivated'}`, 'success');
+      await fetchAll();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to update payroll item', 'danger');
+    }
+  }
+
+  /** Deduction row: picking a payroll item sets name/GL mapping and prefills a fixed default. */
+  function selectDeductionItem(idx: number, itemId: string) {
+    setPayrollForm((prev) => {
+      const deductions = [...prev.deductions];
+      const item = payrollItems.find((i) => i.id === itemId);
+      if (!item) {
+        deductions[idx] = { ...deductions[idx], payrollItemId: undefined };
+      } else {
+        let amount = deductions[idx].amount;
+        if (!amount && item.calcBasis === 'fixed' && item.defaultRate) {
+          amount = toDecimalSafe(item.defaultRate).toFixed(2);
+        } else if (!amount && item.calcBasis === 'percent' && item.defaultRate) {
+          amount = computeGross(prev.earnings)
+            .times(toDecimalSafe(item.defaultRate))
+            .dividedBy(100)
+            .toFixed(2);
+        }
+        deductions[idx] = { name: item.name, amount, payrollItemId: item.id };
+      }
+      return { ...prev, deductions };
+    });
+  }
+
+  // ---------------------------------------------------------------------------
   // Derived values
   // ---------------------------------------------------------------------------
+
+  function accountLabel(id: string | null): string {
+    if (!id) return '—';
+    const a = accounts.find((x) => x.id === id);
+    return a ? `${a.code} ${a.name}` : '—';
+  }
 
   const grossPreview = computeGross(payrollForm.earnings).toFixed(2);
   const netPreview = computeNet(payrollForm);
@@ -885,6 +1157,12 @@ export default function EmployeesPage() {
         icon={UserSquare}
         action={
           <div className="flex items-center gap-3">
+            <Link href="/pay-runs">
+              <Button variant="secondary" title="Batch payroll: run paychecks for several employees at once">
+                <CalendarClock className="h-4 w-4" />
+                Pay Runs
+              </Button>
+            </Link>
             <Button variant="secondary" onClick={() => openPayrollModal()} disabled={employees.filter((e) => e.isActive).length === 0}>
               <Play className="h-4 w-4" />
               Run Payroll
@@ -1084,6 +1362,237 @@ export default function EmployeesPage() {
         )}
       </Card>
 
+      {/* ---- Payroll items table ---- */}
+      <Card className="mt-6">
+        <div className="px-5 pt-4 pb-2 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-navy/60 uppercase tracking-wide">
+            Payroll Items
+          </h2>
+          <Button variant="ghost" size="sm" onClick={openAddItemModal}>
+            <Plus className="h-3.5 w-3.5" />
+            Add Item
+          </Button>
+        </div>
+        {loading ? (
+          <div className="p-8 flex justify-center text-electric">
+            <Spinner className="h-6 w-6" />
+          </div>
+        ) : payrollItems.length === 0 ? (
+          <EmptyState
+            icon={ListChecks}
+            title="No payroll items"
+            message="Payroll items map earnings, taxes, deductions and garnishments to GL accounts. Defaults are seeded automatically on first load."
+            action={
+              <Button onClick={openAddItemModal}>
+                <Plus className="h-4 w-4" /> Add Payroll Item
+              </Button>
+            }
+          />
+        ) : (
+          <Table>
+            <thead>
+              <tr>
+                <Th>Name</Th>
+                <Th>Kind</Th>
+                <Th>Tax Treatment</Th>
+                <Th>Expense Account</Th>
+                <Th>Liability Account</Th>
+                <Th numeric>Default</Th>
+                <Th>Status</Th>
+                <Th className="text-right">Actions</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {payrollItems.map((item) => (
+                <Tr key={item.id} className={item.isActive ? undefined : 'opacity-60'}>
+                  <Td className="font-semibold text-navy">{item.name}</Td>
+                  <Td className="text-navy/70">{ITEM_KIND_LABELS[item.kind]}</Td>
+                  <Td>
+                    {item.kind === 'deduction' ? (
+                      item.pretax ? <Badge tone="info">Pre-tax</Badge> : <Badge tone="neutral">Post-tax</Badge>
+                    ) : item.kind === 'garnishment' ? (
+                      <Badge tone="warning">Post-tax</Badge>
+                    ) : (
+                      <span className="text-navy/30">—</span>
+                    )}
+                  </Td>
+                  <Td className="text-navy/70 text-sm">{accountLabel(item.expenseAccountId)}</Td>
+                  <Td className="text-navy/70 text-sm">{accountLabel(item.liabilityAccountId)}</Td>
+                  <Td numeric className="text-navy/70 font-mono text-sm">
+                    {item.defaultRate
+                      ? item.calcBasis === 'percent'
+                        ? `${toDecimalSafe(item.defaultRate).toFixed(2)}%`
+                        : formatCurrency(item.defaultRate)
+                      : '—'}
+                  </Td>
+                  <Td>
+                    {item.isActive ? (
+                      <Badge tone="success">Active</Badge>
+                    ) : (
+                      <Badge tone="neutral">Inactive</Badge>
+                    )}
+                  </Td>
+                  <Td className="text-right whitespace-nowrap">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => openEditItemModal(item)}
+                      title="Edit payroll item"
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                      Edit
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => toggleItemActive(item)}
+                      title={item.isActive ? 'Deactivate item' : 'Reactivate item'}
+                    >
+                      {item.isActive ? (
+                        <><Ban className="h-3.5 w-3.5" /> Deactivate</>
+                      ) : (
+                        <><RotateCcw className="h-3.5 w-3.5" /> Reactivate</>
+                      )}
+                    </Button>
+                  </Td>
+                </Tr>
+              ))}
+            </tbody>
+          </Table>
+        )}
+      </Card>
+
+      {/* ---- Payroll Item Modal (add / edit) ---- */}
+      <Modal
+        open={itemOpen}
+        onClose={() => setItemOpen(false)}
+        title={itemEditId ? 'Edit Payroll Item' : 'Add Payroll Item'}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setItemOpen(false)} disabled={itemSaving}>
+              Cancel
+            </Button>
+            <Button onClick={handleSaveItem} loading={itemSaving}>
+              {itemEditId ? 'Save Changes' : 'Create Item'}
+            </Button>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-4">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label htmlFor="piName">Name *</Label>
+              <Input
+                id="piName"
+                autoFocus
+                placeholder="e.g. Dental Insurance"
+                value={itemForm.name}
+                onChange={(e) => setItemForm((p) => ({ ...p, name: e.target.value }))}
+              />
+            </div>
+            <div>
+              <Label htmlFor="piKind">Kind *</Label>
+              <Select
+                id="piKind"
+                value={itemForm.kind}
+                disabled={!!itemEditId}
+                onChange={(e) =>
+                  setItemForm((p) => ({ ...p, kind: e.target.value as PayrollItemKind, pretax: false }))
+                }
+              >
+                {(Object.keys(ITEM_KIND_LABELS) as PayrollItemKind[]).map((k) => (
+                  <option key={k} value={k}>{ITEM_KIND_LABELS[k]}</option>
+                ))}
+              </Select>
+              {itemEditId && (
+                <p className="text-[11px] text-navy/40 mt-1">Kind cannot change after creation.</p>
+              )}
+            </div>
+          </div>
+
+          {itemForm.kind === 'deduction' && (
+            <label className="flex items-center gap-2 text-sm text-navy/70 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                className="accent-electric"
+                checked={itemForm.pretax}
+                onChange={(e) => setItemForm((p) => ({ ...p, pretax: e.target.checked }))}
+              />
+              Pre-tax (reduces the wage base before withholding — e.g. 401(k), Section 125 health)
+            </label>
+          )}
+          {itemForm.kind === 'garnishment' && (
+            <p className="text-xs text-navy/50">
+              Garnishments are always withheld AFTER taxes and credited to their own liability account.
+            </p>
+          )}
+
+          <div className="grid grid-cols-2 gap-3">
+            {KIND_SIDES[itemForm.kind].expense && (
+              <div>
+                <Label htmlFor="piExpense">Expense Account *</Label>
+                <Select
+                  id="piExpense"
+                  value={itemForm.expenseAccountId}
+                  onChange={(e) => setItemForm((p) => ({ ...p, expenseAccountId: e.target.value }))}
+                >
+                  <option value="">Select account…</option>
+                  {accounts.filter((a) => a.type === 'expense').map((a) => (
+                    <option key={a.id} value={a.id}>{a.code} — {a.name}</option>
+                  ))}
+                </Select>
+              </div>
+            )}
+            {KIND_SIDES[itemForm.kind].liability && (
+              <div>
+                <Label htmlFor="piLiability">Liability Account *</Label>
+                <Select
+                  id="piLiability"
+                  value={itemForm.liabilityAccountId}
+                  onChange={(e) => setItemForm((p) => ({ ...p, liabilityAccountId: e.target.value }))}
+                >
+                  <option value="">Select account…</option>
+                  {accounts.filter((a) => a.type === 'liability').map((a) => (
+                    <option key={a.id} value={a.id}>{a.code} — {a.name}</option>
+                  ))}
+                </Select>
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label htmlFor="piCalc">Calculation</Label>
+              <Select
+                id="piCalc"
+                value={itemForm.calcBasis}
+                onChange={(e) =>
+                  setItemForm((p) => ({ ...p, calcBasis: e.target.value as '' | 'fixed' | 'percent' }))
+                }
+              >
+                <option value="">None (entered per check)</option>
+                <option value="fixed">Fixed amount per check</option>
+                <option value="percent">Percent of gross</option>
+              </Select>
+            </div>
+            <div>
+              <Label htmlFor="piRate">
+                Default {itemForm.calcBasis === 'percent' ? 'Rate (%)' : 'Amount'}
+              </Label>
+              <Input
+                id="piRate"
+                type="number"
+                min="0"
+                step="0.01"
+                placeholder={itemForm.calcBasis === 'percent' ? 'e.g. 6.2' : '0.00'}
+                value={itemForm.defaultRate}
+                onChange={(e) => setItemForm((p) => ({ ...p, defaultRate: e.target.value }))}
+              />
+            </div>
+          </div>
+        </div>
+      </Modal>
+
       {/* ---- Add Employee Modal ---- */}
       <Modal
         open={addOpen}
@@ -1125,6 +1634,92 @@ export default function EmployeesPage() {
           ssnLast4={editingEmployee?.ssnLast4}
           showPayrollInfo
         />
+
+        {/* ---- Leave accruals (saved separately via PUT /api/payroll/accruals) ---- */}
+        <div className="border-t border-slate-200 pt-3 mt-4">
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-xs font-semibold text-navy/50 uppercase tracking-wide">
+              Leave Accruals
+            </p>
+            {accrualRow?.hasPolicy && (
+              <span className="text-[11px] text-navy/40">
+                Current: sick {accrualRow.sick.balance} hrs · vacation {accrualRow.vacation.balance} hrs
+              </span>
+            )}
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label htmlFor="accSickRate">
+                Sick Accrual ({editingEmployee?.payType === 'hourly' ? 'hrs / hour worked' : 'hrs / paycheck'})
+              </Label>
+              <Input
+                id="accSickRate"
+                type="number"
+                min="0"
+                step="0.01"
+                placeholder="e.g. 0.04"
+                value={accrualForm.sickRate}
+                onChange={(e) => updateAccrualForm('sickRate', e.target.value)}
+              />
+            </div>
+            <div>
+              <Label htmlFor="accVacRate">
+                Vacation Accrual ({editingEmployee?.payType === 'hourly' ? 'hrs / hour worked' : 'hrs / paycheck'})
+              </Label>
+              <Input
+                id="accVacRate"
+                type="number"
+                min="0"
+                step="0.01"
+                placeholder="e.g. 0.06"
+                value={accrualForm.vacRate}
+                onChange={(e) => updateAccrualForm('vacRate', e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-3 mt-3">
+            <div>
+              <Label htmlFor="accSickBal">Sick Starting (hrs)</Label>
+              <Input
+                id="accSickBal"
+                type="number"
+                step="0.01"
+                placeholder="0"
+                value={accrualForm.sickBalance}
+                onChange={(e) => updateAccrualForm('sickBalance', e.target.value)}
+              />
+            </div>
+            <div>
+              <Label htmlFor="accVacBal">Vacation Starting (hrs)</Label>
+              <Input
+                id="accVacBal"
+                type="number"
+                step="0.01"
+                placeholder="0"
+                value={accrualForm.vacBalance}
+                onChange={(e) => updateAccrualForm('vacBalance', e.target.value)}
+              />
+            </div>
+            <div>
+              <Label htmlFor="accAsOf">Balances As Of</Label>
+              <Input
+                id="accAsOf"
+                type="date"
+                value={accrualForm.asOf}
+                onChange={(e) => updateAccrualForm('asOf', e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="flex items-center justify-between mt-3">
+            <p className="text-[11px] text-navy/40 pr-3">
+              Paychecks after the as-of date accrue on top of the starting balances.
+              Leave every field blank and save to clear the policy.
+            </p>
+            <Button variant="secondary" size="sm" onClick={handleSaveAccruals} loading={accrualSaving}>
+              Save Accruals
+            </Button>
+          </div>
+        </div>
       </Modal>
 
       {/* ---- Run Payroll Modal ---- */}
@@ -1283,14 +1878,73 @@ export default function EmployeesPage() {
             onRemove={removeTaxLine}
           />
 
-          {/* Deduction lines */}
-          <LineEditor
-            label="Deductions"
-            lines={payrollForm.deductions}
-            onChange={updateDeductionLine}
-            onAdd={addDeductionLine}
-            onRemove={removeDeductionLine}
-          />
+          {/* Deduction lines — may reference a payroll item (GL mapping / pre-tax) */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <Label>Deductions</Label>
+              <button
+                type="button"
+                onClick={addDeductionLine}
+                className="text-xs text-electric hover:underline"
+              >
+                + Add line
+              </button>
+            </div>
+            {payrollForm.deductions.length === 0 && (
+              <p className="text-xs text-navy/40 italic">No deduction lines.</p>
+            )}
+            {payrollForm.deductions.map((line, idx) => {
+              const item = payrollItems.find((i) => i.id === line.payrollItemId);
+              return (
+                <div key={idx} className="flex gap-2 mb-2 items-center">
+                  <Select
+                    value={line.payrollItemId ?? ''}
+                    onChange={(e) => selectDeductionItem(idx, e.target.value)}
+                    className="w-44"
+                    title="Payroll item — maps the deduction to its GL liability account"
+                  >
+                    <option value="">Custom…</option>
+                    {payrollItems
+                      .filter((i) => i.isActive && (i.kind === 'deduction' || i.kind === 'garnishment'))
+                      .map((i) => (
+                        <option key={i.id} value={i.id}>
+                          {i.name}{i.kind === 'garnishment' ? ' (garnishment)' : i.pretax ? ' (pre-tax)' : ''}
+                        </option>
+                      ))}
+                  </Select>
+                  <Input
+                    placeholder="Description"
+                    value={line.name}
+                    onChange={(e) => updateDeductionLine(idx, 'name', e.target.value)}
+                    className="flex-1"
+                  />
+                  <Input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    placeholder="0.00"
+                    value={line.amount}
+                    onChange={(e) => updateDeductionLine(idx, 'amount', e.target.value)}
+                    className="w-28"
+                  />
+                  {item?.pretax && <Badge tone="info">pre-tax</Badge>}
+                  {item?.kind === 'garnishment' && <Badge tone="warning">post-tax</Badge>}
+                  <button
+                    type="button"
+                    onClick={() => removeDeductionLine(idx)}
+                    className="text-red-400 hover:text-red-600 px-1 transition-colors"
+                    title="Remove line"
+                  >
+                    <MinusCircle className="h-4 w-4" />
+                  </button>
+                </div>
+              );
+            })}
+            <p className="text-[11px] text-navy/40">
+              Pre-tax items reduce the wage base before withholding; garnishments are
+              withheld after tax to the item&apos;s liability account.
+            </p>
+          </div>
 
           {/* Net pay preview */}
           <div className={`rounded-lg p-4 border ${netIsNegative ? 'bg-red-50 border-red-200' : 'bg-slate-50 border-slate-200'}`}>
@@ -1304,6 +1958,7 @@ export default function EmployeesPage() {
               <p className="text-xs text-navy/40 mt-1">
                 GL: Dr 6500 Payroll Expense {formatCurrency(grossPreview)} |
                 Cr 2300 Payroll Liabilities + Cr 1000 Checking
+                (deduction lines with a payroll item post to that item&apos;s account)
               </p>
             )}
             {netIsNegative && (

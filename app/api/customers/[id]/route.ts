@@ -11,6 +11,8 @@ import {
   deactivateCustomer,
 } from '@/lib/services/customers';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { updateCustomerSchema } from '@/lib/validation/customers';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -45,8 +47,12 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const body = await req.json();
-    const customer = await updateCustomer(ctx, id, body);
+    const body = await req.json().catch(() => ({}));
+    const parsed = updateCustomerSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
+    const customer = await updateCustomer(ctx, id, parsed.data);
     return NextResponse.json(customer);
   } catch (err) {
     return errorResponse(err);

@@ -12,6 +12,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getClosingDateSettings, setClosingDate } from '@/lib/services/company';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { setClosingDateSchema } from '@/lib/validation/company';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -40,23 +42,12 @@ export async function GET() {
 export async function PATCH(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-    if (body.closingDate !== null && typeof body.closingDate !== 'string') {
-      return NextResponse.json(
-        { error: "closingDate must be 'YYYY-MM-DD' or null", code: 'VALIDATION' },
-        { status: 400 },
-      );
+    const body = await req.json().catch(() => ({}));
+    const parsed = setClosingDateSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
-    if (body.password !== undefined && body.password !== null && typeof body.password !== 'string') {
-      return NextResponse.json(
-        { error: 'password must be a string or null', code: 'VALIDATION' },
-        { status: 400 },
-      );
-    }
-    const settings = await setClosingDate(ctx, {
-      closingDate: body.closingDate,
-      password: body.password,
-    });
+    const settings = await setClosingDate(ctx, parsed.data);
     return NextResponse.json(settings);
   } catch (err) {
     return errorResponse(err);

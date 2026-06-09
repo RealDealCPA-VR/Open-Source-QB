@@ -6,6 +6,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listEstimates, createEstimate } from '@/lib/services/estimates';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createEstimateSchema } from '@/lib/validation/estimates';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -35,18 +37,13 @@ export async function GET(_req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
+    const body = await req.json().catch(() => ({}));
+    const parsed = createEstimateSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    }
 
-    const { customerId, date, expirationDate, lines, memo, taxRateId } = body;
-
-    const estimate = await createEstimate(ctx, {
-      customerId,
-      date: new Date(date),
-      expirationDate: expirationDate ? new Date(expirationDate) : null,
-      lines: lines ?? [],
-      taxRateId: taxRateId ?? null,
-      memo: memo ?? null,
-    });
+    const estimate = await createEstimate(ctx, parsed.data);
 
     return NextResponse.json(estimate, { status: 201 });
   } catch (err) {

@@ -1,0 +1,59 @@
+/**
+ * Zod schemas for /api/items — mirrors CreateItemInput / UpdateItemInput
+ * (lib/services/items.ts) plus the route-level `reorderPoint` extra that is
+ * forwarded to inventory.setReorderPoint ('' / null clears it).
+ */
+import { z } from 'zod';
+import { zDecimal, zUuid } from './helpers';
+
+export const itemTypeSchema = z.enum([
+  'service',
+  'inventory',
+  'non_inventory',
+  'bundle',
+  'other_charge',
+  'discount',
+  'subtotal',
+  'payment',
+  'sales_tax',
+]);
+
+/** Reorder point: decimal, or ''/null to clear. */
+const zReorderPoint = z.union([zDecimal, z.literal('')]).nullish();
+
+export const createItemSchema = z.object({
+  name: z.string({ required_error: 'name is required' }).trim().min(1, 'Item name is required.'),
+  sku: z.string().nullish(),
+  /** Defaults to 'service' in the service. */
+  type: itemTypeSchema.optional(),
+  description: z.string().nullish(),
+  salesPrice: zDecimal.nullish(),
+  purchaseCost: zDecimal.nullish(),
+  incomeAccountId: zUuid.nullish(),
+  expenseAccountId: zUuid.nullish(),
+  assetAccountId: zUuid.nullish(),
+  /** Defaults to true in the service. */
+  taxable: z.boolean().optional(),
+  unitOfMeasure: z.string().nullish(),
+  /** Route-level: forwarded to setReorderPoint after creation. */
+  reorderPoint: zReorderPoint,
+});
+export type CreateItemBody = z.infer<typeof createItemSchema>;
+
+export const updateItemSchema = z.object({
+  name: z.string().trim().min(1, 'Item name is required.').optional(),
+  sku: z.string().nullish(),
+  type: itemTypeSchema.optional(),
+  description: z.string().nullish(),
+  salesPrice: zDecimal.nullish(),
+  purchaseCost: zDecimal.nullish(),
+  incomeAccountId: zUuid.nullish(),
+  expenseAccountId: zUuid.nullish(),
+  assetAccountId: zUuid.nullish(),
+  taxable: z.boolean().optional(),
+  unitOfMeasure: z.string().nullish(),
+  isActive: z.boolean().optional(),
+  /** Route-level: forwarded to setReorderPoint when the key is present. */
+  reorderPoint: zReorderPoint,
+});
+export type UpdateItemBody = z.infer<typeof updateItemSchema>;

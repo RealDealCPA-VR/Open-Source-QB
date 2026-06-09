@@ -6,6 +6,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listTemplates, createTemplate } from '@/lib/services/recurring';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createRecurringTemplateSchema } from '@/lib/validation/recurring';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -40,27 +42,17 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    if (!body.name) {
-      return NextResponse.json({ error: 'name is required', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (!body.docType) {
-      return NextResponse.json({ error: 'docType is required', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (!body.frequency) {
-      return NextResponse.json({ error: 'frequency is required', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (!body.template || typeof body.template !== 'object') {
-      return NextResponse.json({ error: 'template payload is required', code: 'VALIDATION' }, { status: 400 });
+    const body = await req.json().catch(() => ({}));
+    const parsed = createRecurringTemplateSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
     const tpl = await createTemplate(ctx, {
-      name: body.name,
-      docType: body.docType,
-      frequency: body.frequency,
-      nextRunDate: body.nextRunDate ? new Date(body.nextRunDate) : new Date(),
-      template: body.template,
+      ...parsed.data,
+      nextRunDate: parsed.data.nextRunDate ?? new Date(),
+      // Auto-enter (default) posts on schedule; remind-only surfaces a reminder.
+      autoEnter: parsed.data.autoEnter ?? true,
     });
 
     return NextResponse.json(tpl, { status: 201 });

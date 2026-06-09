@@ -13,7 +13,8 @@ import { Button, Card, Input, Label, PageHeader, Select, Table, Th, Td, Tr, toas
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { sourceRefLink } from '@/components/EntryDetailModal';
-import { downloadCsv, fmtDate, todayStr, yearStartStr, type CsvCell } from '../_components/shared';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
+import { fmtDate, todayStr, yearStartStr, type CsvCell } from '../_components/shared';
 
 interface AccountOption {
   id: string;
@@ -90,41 +91,45 @@ export default function TransactionDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const exportCsv = () => {
-    if (!data) return;
-    const rows: CsvCell[][] = data.rows.map((r) => [
-      fmtDate(r.date),
-      r.entryNumber,
-      r.description,
-      r.memo ?? '',
-      `${r.accountCode} ${r.accountName}`,
-      r.debit,
-      r.credit,
-      r.amount,
-      r.runningTotal,
-    ]);
-    rows.push(['TOTAL', '', '', '', '', data.totalDebit, data.totalCredit, '', '']);
-    downloadCsv(
-      'transaction-detail.csv',
-      `Transaction Detail — ${fmtDate(data.from)} to ${fmtDate(data.to)}`,
-      ['Date', 'Entry #', 'Description', 'Memo', 'Account', 'Debit', 'Credit', 'Amount', 'Running Total'],
-      rows,
-    );
-  };
+  const table: ExportTable | null = data
+    ? {
+        filename: 'transaction-detail',
+        title: 'Transaction Detail',
+        subtitle: `${fmtDate(data.from)} to ${fmtDate(data.to)}`,
+        landscape: true,
+        columns: [
+          { header: 'Date' },
+          { header: 'Entry #', numeric: true },
+          { header: 'Description' },
+          { header: 'Memo' },
+          { header: 'Account' },
+          { header: 'Debit', numeric: true },
+          { header: 'Credit', numeric: true },
+          { header: 'Amount', numeric: true },
+          { header: 'Running Total', numeric: true },
+        ],
+        rows: data.rows.map((r): CsvCell[] => [
+          fmtDate(r.date),
+          r.entryNumber,
+          r.description,
+          r.memo ?? '',
+          `${r.accountCode} ${r.accountName}`,
+          r.debit,
+          r.credit,
+          r.amount,
+          r.runningTotal,
+        ]),
+        totals: [['TOTAL', '', '', '', '', data.totalDebit, data.totalCredit, '', '']],
+      }
+    : null;
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader
-        title="Transaction Detail"
-        icon={ListChecks}
-        action={
-          <Button variant="secondary" size="sm" disabled={!data || loading} onClick={exportCsv}>
-            Download CSV
-          </Button>
-        }
-      />
+      <PageHeader title="Transaction Detail" icon={ListChecks} />
 
-      <Card className="p-4 mb-4">
+      <ReportToolbar table={table} disabled={loading} />
+
+      <Card className="p-4 mb-4 print-hidden">
         <form
           className="flex items-end gap-3 flex-wrap"
           onSubmit={(e) => {
@@ -152,11 +157,11 @@ export default function TransactionDetailPage() {
             </Select>
           </div>
           <div>
-            <Label htmlFor="td-search">Search</Label>
+            <Label htmlFor="td-search">Name / memo contains</Label>
             <Input
               id="td-search"
               type="text"
-              placeholder="Description, memo, source…"
+              placeholder="Name, memo, source…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />

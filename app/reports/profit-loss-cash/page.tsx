@@ -13,6 +13,7 @@ import { formatCurrency, Money, toAmountString } from '@/lib/money';
 import { api } from '@/lib/client';
 import { Button, Card, PageHeader, toast } from '@/components/ui';
 import type { ProfitAndLossCashBasis } from '@/lib/services/cashBasisReports';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
 import { RangeControls } from '../_components/shared';
 
 // ---- Section sub-component ----
@@ -111,9 +112,42 @@ export default function ProfitLossCashPage() {
 
   const net = report ? parseFloat(report.netIncome) : 0;
 
+  const table: ExportTable | null = report
+    ? {
+        filename: 'profit-loss-cash',
+        title: 'Profit & Loss (Cash Basis)',
+        subtitle: `${report.from ? new Date(report.from).toLocaleDateString() : 'start'} - ${
+          report.to ? new Date(report.to).toLocaleDateString() : 'today'
+        }`,
+        columns: [{ header: 'Account' }, { header: 'Amount', numeric: true }],
+        rows: [
+          ['INCOME', null],
+          ...report.income.map((l) => [l.name, l.amount] as (string | null)[]),
+          ['AR adjustment', report.arAdjustment],
+          ['Cash Income', report.totalIncome],
+          ['', null],
+          ['EXPENSES', null],
+          ...report.expenses.map((l) => [l.name, l.amount] as (string | null)[]),
+          ['AP adjustment', report.apAdjustment],
+          ['Cash Expenses', report.totalExpenses],
+        ],
+        totals: [['Net Income (Cash Basis)', report.netIncome]],
+      }
+    : null;
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader title="Profit & Loss (Cash Basis)" icon={Wallet} />
+
+      <ReportToolbar
+        table={table}
+        disabled={loading}
+        basisNav={{
+          value: 'cash',
+          accrualHref: '/reports/profit-loss',
+          cashHref: '/reports/profit-loss-cash',
+        }}
+      />
 
       {/* Explainer banner */}
       <Card className="mb-6 p-4 border-l-4 border-electric bg-electric/5 max-w-3xl">
@@ -138,7 +172,7 @@ export default function ProfitLossCashPage() {
       </Card>
 
       {/* Date range controls */}
-      <Card className="p-4 mb-6 max-w-3xl">
+      <Card className="p-4 mb-6 max-w-3xl print-hidden">
         <RangeControls
           from={from}
           to={to}

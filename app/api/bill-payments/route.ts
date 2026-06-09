@@ -28,6 +28,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { payBills, listBillPayments } from '@/lib/services/billPayments';
 import { ServiceError } from '@/lib/services/_base';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { payBillsSchema } from '@/lib/validation/billPayments';
 
 // Map ServiceError codes to HTTP status codes.
 function errorStatus(code: string): number {
@@ -71,37 +73,14 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx  = await getServerContext();
-    const body = await req.json();
+    const body = await req.json().catch(() => ({}));
 
-    // Light structural validation before handing off to the service.
-    if (!body.vendorId || typeof body.vendorId !== 'string') {
-      return NextResponse.json({ error: 'vendorId is required.' }, { status: 400 });
-    }
-    if (!body.date || typeof body.date !== 'string') {
-      return NextResponse.json({ error: 'date (ISO string) is required.' }, { status: 400 });
-    }
-    if (!body.method || typeof body.method !== 'string') {
-      return NextResponse.json({ error: 'method is required.' }, { status: 400 });
-    }
-    if (!body.paymentAccountId || typeof body.paymentAccountId !== 'string') {
-      return NextResponse.json({ error: 'paymentAccountId is required.' }, { status: 400 });
-    }
-    if (!Array.isArray(body.applications) || body.applications.length === 0) {
-      return NextResponse.json(
-        { error: 'applications must be a non-empty array.' },
-        { status: 400 },
-      );
+    const parsed = payBillsSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const payment = await payBills(ctx, {
-      vendorId:         body.vendorId,
-      date:             new Date(body.date),
-      method:           body.method,
-      reference:        body.reference ?? null,
-      paymentAccountId: body.paymentAccountId,
-      discountAccountId: body.discountAccountId ?? null,
-      applications:     body.applications,
-    });
+    const payment = await payBills(ctx, parsed.data);
 
     return NextResponse.json({ payment }, { status: 201 });
   } catch (err) {

@@ -27,7 +27,7 @@ import {
   taxRates, timeEntries, transactionRules, transfers, userCompanies, vendorCreditLines,
   vendorCredits, vendors,
 } from '@/lib/db/schema';
-import { ServiceError } from './_base';
+import { ServiceError, type ServiceContext } from './_base';
 
 /** Name of the manifest entry embedded at the root of every .bka archive. */
 export const BACKUP_MANIFEST_ENTRY = 'bookkeeper-manifest.json';
@@ -98,6 +98,87 @@ function buildBackupFilename(prefix: string, companyName?: string | null): strin
     ? `-${companyName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`
     : '';
   return `${prefix}${slug}-${ts}.bka`;
+}
+
+// ---------------------------------------------------------------------------
+// Pre-operation safety backups (backup-before-destructive)
+// ---------------------------------------------------------------------------
+
+/** How many pre-op .bka files to keep (oldest beyond this are pruned). */
+export const PRE_OP_BACKUP_KEEP = 5;
+
+/**
+ * Directory where pre-op backups are written: a sibling of the company data
+ * dir (NOT inside it, so backups never recursively include older backups).
+ * e.g. `.bookkeeper-data/default` -> `.bookkeeper-data/pre-op-backups`.
+ */
+export function preOpBackupDir(dataDir?: string): string {
+  const dir = resolveDataDir(dataDir);
+  return path.join(path.dirname(dir), 'pre-op-backups');
+}
+
+export interface PreOpBackupResult {
+  path: string;
+  filename: string;
+}
+
+/** Monotonic suffix so two pre-op backups in the same millisecond never collide. */
+let preOpSeq = 0;
+
+/** Parse the sortable numeric key out of a pre-op filename (Date.now() + sequence). */
+function preOpSortKey(filename: string): number {
+  const m = filename.match(/-(\d{13})-(\d{1,6})\.bka$/);
+  return m ? Number(m[1]) * 1_000_000 + Number(m[2]) : 0;
+}
+
+/**
+ * Backup-before-destructive: write a rotating pre-op .bka snapshot of the
+ * company data directory, keeping only the newest PRE_OP_BACKUP_KEEP files.
+ *
+ * Called at the start of every destructive operation (full restore, company
+ * restore, condense; year-end close belongs to another module). Always-on —
+ * there is no settings toggle.
+ *
+ * @param _ctx     ServiceContext when available (API paths); null for raw
+ *                 file-level operations like restoreBackup. Currently unused
+ *                 beyond the signature contract — the snapshot is file-level.
+ * @param label    Operation label embedded in the filename (e.g. 'restore', 'condense').
+ * @param dataDir  Optional data-dir override; defaults to the active dir.
+ * @returns the written file's path/filename, or null when the data dir does
+ *          not exist yet (nothing to protect — e.g. first run).
+ */
+export function ensurePreOpBackup(
+  _ctx: Pick<ServiceContext, 'companyId'> | null,
+  label: string,
+  dataDir?: string,
+): PreOpBackupResult | null {
+  const dir = resolveDataDir(dataDir);
+  if (!fs.existsSync(dir)) return null;
+
+  const { buffer } = createBackup(undefined, dir);
+
+  const outDir = preOpBackupDir(dataDir);
+  fs.mkdirSync(outDir, { recursive: true });
+  const slug = label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'op';
+  preOpSeq = (preOpSeq + 1) % 1_000_000;
+  const filename = `preop-${slug}-${Date.now()}-${preOpSeq}.bka`;
+  const outPath = path.join(outDir, filename);
+  fs.writeFileSync(outPath, buffer);
+
+  // Rotate: keep only the newest PRE_OP_BACKUP_KEEP pre-op backups overall.
+  try {
+    const files = fs
+      .readdirSync(outDir)
+      .filter((f) => f.startsWith('preop-') && f.endsWith('.bka'))
+      .sort((a, b) => preOpSortKey(b) - preOpSortKey(a));
+    for (const stale of files.slice(PRE_OP_BACKUP_KEEP)) {
+      fs.rmSync(path.join(outDir, stale), { force: true });
+    }
+  } catch {
+    /* pruning is best-effort — a leftover file is harmless */
+  }
+
+  return { path: outPath, filename };
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +276,16 @@ export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise
 
   // (1) Validate before touching anything on disk.
   const zip = validateBackupZip(buffer);
+
+  // (1b) Backup-before-destructive: snapshot the CURRENT data dir as a rotating
+  // pre-op .bka so a bad restore is recoverable after the fact. Best-effort —
+  // an unreadable live dir must not block restoring a known-good backup (the
+  // rename-aside in step 4 still provides in-flight rollback).
+  try {
+    ensurePreOpBackup(null, 'restore', dir);
+  } catch (err) {
+    console.warn('[backup] pre-op backup before restore failed (continuing):', err);
+  }
 
   // (2) Extract to a sibling temp dir.
   const tmpDir = `${dir}.restore-tmp-${Date.now()}`;
@@ -589,6 +680,14 @@ export async function restoreCompanyBackup(
   opts: { ownerId: string; name?: string },
 ): Promise<RestoreCompanyResult> {
   const data = readCompanyBackup(buffer);
+
+  // Backup-before-destructive: company restore only inserts a brand-new company,
+  // but it still mutates the shared data dir — snapshot it first (best-effort).
+  try {
+    ensurePreOpBackup(null, 'restore-company');
+  } catch (err) {
+    console.warn('[backup] pre-op backup before company restore failed (continuing):', err);
+  }
 
   // Build the global id remap: one fresh UUID for every exported row id.
   const idMap = new Map<string, string>();

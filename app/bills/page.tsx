@@ -2,11 +2,13 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import Link from 'next/link';
-import { Banknote, Plus, Receipt, Trash2 } from 'lucide-react';
+import { Banknote, Pencil, Plus, Receipt, Trash2 } from 'lucide-react';
 import {
+  AmountInput,
   Button,
   Card,
   ConfirmDialog,
+  DateInput,
   EmptyState,
   Input,
   Select,
@@ -20,6 +22,7 @@ import {
   Modal,
   PageHeader,
   toast,
+  useGridKeys,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
@@ -36,9 +39,29 @@ interface Bill {
   date: string;
   dueDate: string | null;
   total: string;
+  amountPaid: string;
+  amountCredited: string;
   balanceDue: string;
   status: 'open' | 'partial' | 'paid' | 'void';
   memo: string | null;
+}
+
+interface BillDetailLine {
+  id: string;
+  accountId: string;
+  itemId: string | null;
+  description: string | null;
+  quantity: string;
+  amount: string;
+}
+
+/** A bill can be edited while nothing has been applied against it. */
+function isEditable(bill: Bill): boolean {
+  return (
+    bill.status !== 'void' &&
+    Number(bill.amountPaid) === 0 &&
+    Number(bill.amountCredited) === 0
+  );
 }
 
 interface Vendor {
@@ -133,9 +156,11 @@ export default function BillsPage() {
   const [items, setItems] = useState<Item[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // Modal state
+  // Modal state — editingId set means the modal is editing an existing bill.
   const [modalOpen, setModalOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [loadingEditId, setLoadingEditId] = useState<string | null>(null);
 
   // Form fields
   const [vendorId, setVendorId] = useState('');
@@ -197,12 +222,59 @@ export default function BillsPage() {
   // ---------------------------------------------------------------------------
 
   function openModal() {
+    setEditingId(null);
     setVendorId('');
     setBillNumber('');
     setDate(new Date().toISOString().slice(0, 10));
     setDueDate('');
     setLines([emptyLine()]);
     setModalOpen(true);
+  }
+
+  /** Prefill the form from a saved bill and open the modal in edit mode. */
+  async function openEditModal(bill: Bill) {
+    setLoadingEditId(bill.id);
+    try {
+      const detail = await api.get<Bill & { lines: BillDetailLine[] }>(`/api/bills/${bill.id}`);
+      setEditingId(bill.id);
+      setVendorId(detail.vendorId);
+      setBillNumber(detail.billNumber ?? '');
+      setDate(detail.date.slice(0, 10));
+      setDueDate(detail.dueDate ? detail.dueDate.slice(0, 10) : '');
+      setLines(
+        detail.lines.length === 0
+          ? [emptyLine()]
+          : detail.lines.map((l) => {
+              if (l.itemId) {
+                const qty = Number(l.quantity) || 1;
+                const unitCost = Number(l.amount) / qty;
+                return {
+                  mode: 'item' as LineMode,
+                  accountId: '',
+                  amount: '',
+                  itemId: l.itemId,
+                  quantity: String(qty),
+                  unitCost: String(parseFloat(unitCost.toFixed(4))),
+                  description: l.description ?? '',
+                };
+              }
+              return {
+                mode: 'expense' as LineMode,
+                accountId: l.accountId,
+                amount: l.amount,
+                itemId: '',
+                quantity: '',
+                unitCost: '',
+                description: l.description ?? '',
+              };
+            }),
+      );
+      setModalOpen(true);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to load bill.', 'danger');
+    } finally {
+      setLoadingEditId(null);
+    }
   }
 
   function closeModal() {
@@ -236,8 +308,17 @@ export default function BillsPage() {
   }
 
   function removeLine(index: number) {
-    setLines((prev) => prev.filter((_, i) => i !== index));
+    // Keep at least one line (mirrors the per-row remove button being disabled).
+    setLines((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== index) : prev));
   }
+
+  // Line-grid keyboard ergonomics: Ctrl+Insert adds a line (same mode as the
+  // last line), Ctrl+Delete removes the focused row, Enter moves down.
+  const grid = useGridKeys({
+    addRow: () => setLines((prev) => [...prev, emptyLine(prev[prev.length - 1]?.mode ?? 'expense')]),
+    removeRow: removeLine,
+    disabled: submitting,
+  });
 
   // Compute running total for display (Number() only — display only, not stored)
   const runningTotal = lines.reduce((sum, l) => sum + lineAmount(l), 0);
@@ -283,7 +364,7 @@ export default function BillsPage() {
 
     setSubmitting(true);
     try {
-      await api.post('/api/bills', {
+      const payload = {
         vendorId,
         billNumber: billNumber.trim() || undefined,
         date,
@@ -302,12 +383,25 @@ export default function BillsPage() {
                 amount: l.amount,
               },
         ),
-      });
-      toast('Bill created.', 'success');
+      };
+      if (editingId) {
+        await api.patch(`/api/bills/${editingId}`, payload);
+        toast('Bill updated.', 'success');
+      } else {
+        await api.post('/api/bills', payload);
+        toast('Bill created.', 'success');
+      }
       setModalOpen(false);
       await fetchBills();
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to create bill.', 'danger');
+      toast(
+        err instanceof ApiError
+          ? err.message
+          : editingId
+            ? 'Failed to update bill.'
+            : 'Failed to create bill.',
+        'danger',
+      );
     } finally {
       setSubmitting(false);
     }
@@ -401,6 +495,19 @@ export default function BillsPage() {
                     <Badge tone={statusTone(bill.status)}>{statusLabel(bill.status)}</Badge>
                   </Td>
                   <Td className="text-right">
+                    {isEditable(bill) && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={loadingEditId === bill.id}
+                        loading={loadingEditId === bill.id}
+                        onClick={() => openEditModal(bill)}
+                        title="Edit this bill (re-posts the GL entry)"
+                      >
+                        <Pencil className="h-4 w-4" />
+                        Edit
+                      </Button>
+                    )}
                     {bill.status !== 'void' && (
                       <Button
                         variant="ghost"
@@ -421,11 +528,11 @@ export default function BillsPage() {
         )}
       </Card>
 
-      {/* New Bill Modal */}
+      {/* New / Edit Bill Modal */}
       <Modal
         open={modalOpen}
         onClose={closeModal}
-        title="New Bill"
+        title={editingId ? 'Edit Bill' : 'New Bill'}
         size="lg"
         footer={
           <>
@@ -433,12 +540,18 @@ export default function BillsPage() {
               Cancel
             </Button>
             <Button onClick={handleSubmit} loading={submitting}>
-              Save Bill
+              {editingId ? 'Save Changes' : 'Save Bill'}
             </Button>
           </>
         }
       >
         <div className="space-y-4">
+          {editingId && (
+            <p className="text-xs text-navy/50 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2">
+              Saving re-posts the bill&apos;s journal entry on the new date and re-receives any
+              inventory item lines. Editing is only possible while no payments or credits are applied.
+            </p>
+          )}
           {/* Vendor */}
           <div>
             <Label htmlFor="bill-vendor">Vendor *</Label>
@@ -470,9 +583,8 @@ export default function BillsPage() {
             </div>
             <div>
               <Label htmlFor="bill-date">Bill Date *</Label>
-              <Input
+              <DateInput
                 id="bill-date"
-                type="date"
                 value={date}
                 onChange={(e) => setDate(e.target.value)}
               />
@@ -482,9 +594,8 @@ export default function BillsPage() {
           {/* Due Date */}
           <div>
             <Label htmlFor="bill-due">Due Date (optional)</Label>
-            <Input
+            <DateInput
               id="bill-due"
-              type="date"
               value={dueDate}
               onChange={(e) => setDueDate(e.target.value)}
             />
@@ -512,9 +623,9 @@ export default function BillsPage() {
               </span>
             </div>
 
-            <div className="space-y-2">
+            <div className="space-y-2" onKeyDown={grid.onKeyDown}>
               {lines.map((line, idx) => (
-                <div key={idx} className="flex gap-2 items-start">
+                <div key={idx} data-grid-row className="flex gap-2 items-start">
                   {/* Mode toggle */}
                   <div className="flex rounded-lg border border-slate-200 overflow-hidden shrink-0">
                     {(['expense', 'item'] as const).map((m) => (
@@ -556,10 +667,7 @@ export default function BillsPage() {
 
                       {/* Qty */}
                       <div className="w-16 shrink-0">
-                        <Input
-                          type="number"
-                          min="0"
-                          step="any"
+                        <AmountInput
                           placeholder="Qty"
                           value={line.quantity}
                           onChange={(e) => updateLine(idx, { quantity: e.target.value })}
@@ -568,10 +676,7 @@ export default function BillsPage() {
 
                       {/* Unit cost */}
                       <div className="w-24 shrink-0">
-                        <Input
-                          type="number"
-                          min="0"
-                          step="any"
+                        <AmountInput
                           placeholder="Cost"
                           value={line.unitCost}
                           onChange={(e) => updateLine(idx, { unitCost: e.target.value })}
@@ -611,10 +716,7 @@ export default function BillsPage() {
 
                       {/* Amount */}
                       <div className="w-24 shrink-0">
-                        <Input
-                          type="number"
-                          min="0.01"
-                          step="0.01"
+                        <AmountInput
                           placeholder="0.00"
                           value={line.amount}
                           onChange={(e) => updateLine(idx, { amount: e.target.value })}

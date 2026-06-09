@@ -488,3 +488,239 @@ export async function convertToBill(
     return bill;
   });
 }
+
+// ---------------------------------------------------------------------------
+// Item-receipt quantity links (QB "Receive Items" against a PO)
+// ---------------------------------------------------------------------------
+//
+// Item receipts (lib/services/itemReceipts.ts) consume PO quantities through the
+// SAME purchaseOrderLines.quantityBilled counter that convertToBill uses, so a
+// quantity received on an item receipt can never be billed again from the PO
+// (and vice versa). Receipts reference PO lines by ITEM (item_receipt_lines has
+// no PO-line column), so claims are allocated greedily across the PO's lines for
+// that item in lineOrder; releases (receipt void) walk the same lines in reverse.
+
+/** A received-quantity request keyed by item (receipts link to POs by item). */
+export interface ReceiptQuantityRequest {
+  itemId: string;
+  quantity: string | number;
+}
+
+/** Sum requests per item so multiple receipt lines for one item claim once. */
+function aggregateByItem(
+  requests: ReceiptQuantityRequest[],
+): Map<string, ReturnType<typeof Money.zero>> {
+  const byItem = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const r of requests) {
+    const qty = Money.of(r.quantity);
+    if (qty.lessThanOrEqualTo(0)) continue;
+    const prev = byItem.get(r.itemId);
+    byItem.set(r.itemId, prev ? prev.plus(qty) : qty);
+  }
+  return byItem;
+}
+
+/** Recompute open/partial/closed from line quantities after a claim or release. */
+async function recomputePoStatusFromLines(
+  ctx: ServiceContext,
+  poId: string,
+  prevStatus: string,
+  reason: string,
+): Promise<'open' | 'partial' | 'closed'> {
+  const refreshed = await ctx.db
+    .select({
+      quantity: purchaseOrderLines.quantity,
+      quantityBilled: purchaseOrderLines.quantityBilled,
+    })
+    .from(purchaseOrderLines)
+    .where(eq(purchaseOrderLines.purchaseOrderId, poId));
+
+  const anyBilled = refreshed.some((l) => Money.of(l.quantityBilled ?? '0').greaterThan(0));
+  const fullyBilled = refreshed.every(
+    (l) => !Money.of(l.quantity).minus(Money.of(l.quantityBilled ?? '0')).greaterThan(0),
+  );
+  const newStatus = fullyBilled ? ('closed' as const) : anyBilled ? ('partial' as const) : ('open' as const);
+
+  if (newStatus !== prevStatus) {
+    await ctx.db
+      .update(purchaseOrders)
+      .set({ status: newStatus })
+      .where(and(eq(purchaseOrders.id, poId), eq(purchaseOrders.companyId, ctx.companyId)));
+    await writeAudit(ctx, {
+      action: 'update',
+      entityType: 'purchase_order',
+      entityId: poId,
+      oldValues: { status: prevStatus },
+      newValues: { status: newStatus, reason },
+    });
+  }
+  return newStatus;
+}
+
+/**
+ * Claim received quantities against a PO for an item receipt. Call INSIDE the
+ * receipt's transaction. Validates the PO (exists, not void/closed, optional
+ * vendor match) and that every requested item has enough remaining unbilled
+ * quantity, then increments quantityBilled with the same guarded conditional
+ * UPDATE convertToBill uses (zero rows back = concurrent consumer -> CONFLICT).
+ */
+export async function claimReceiptQuantities(
+  ctx: ServiceContext,
+  poId: string,
+  requests: ReceiptQuantityRequest[],
+  opts?: { vendorId?: string; sourceRef?: string },
+): Promise<void> {
+  const [po] = await ctx.db
+    .select()
+    .from(purchaseOrders)
+    .where(and(eq(purchaseOrders.id, poId), eq(purchaseOrders.companyId, ctx.companyId)));
+  if (!po) throw notFound('Purchase order');
+  if (po.status === 'void') {
+    throw new ServiceError('CONFLICT', 'Cannot receive against a voided purchase order.');
+  }
+  if (po.status === 'closed') {
+    throw new ServiceError('CONFLICT', 'Cannot receive against a closed purchase order.');
+  }
+  if (opts?.vendorId && po.vendorId !== opts.vendorId) {
+    throw validation('The purchase order belongs to a different vendor.');
+  }
+
+  const lines = await ctx.db
+    .select()
+    .from(purchaseOrderLines)
+    .where(eq(purchaseOrderLines.purchaseOrderId, poId))
+    .orderBy(asc(purchaseOrderLines.lineOrder));
+
+  for (const [itemId, qty] of aggregateByItem(requests)) {
+    const candidates = lines.filter((l) => l.itemId === itemId);
+    if (candidates.length === 0) {
+      throw validation(
+        `Item ${itemId} is not on purchase order #${po.poNumber}. Remove the PO link or receive it without a PO.`,
+      );
+    }
+    const remainingTotal = candidates.reduce(
+      (sum, l) => sum.plus(Money.of(l.quantity).minus(Money.of(l.quantityBilled ?? '0'))),
+      Money.zero(),
+    );
+    if (qty.greaterThan(remainingTotal)) {
+      throw validation(
+        `Only ${remainingTotal.toFixed(4)} of this item remain unreceived on purchase order #${po.poNumber}.`,
+      );
+    }
+
+    // Greedy allocation across the PO's lines for this item (lineOrder).
+    let left = qty;
+    for (const line of candidates) {
+      if (left.lessThanOrEqualTo(0)) break;
+      const remaining = Money.of(line.quantity).minus(Money.of(line.quantityBilled ?? '0'));
+      if (!remaining.greaterThan(0)) continue;
+      const take = left.lessThanOrEqualTo(remaining) ? left : remaining;
+      const takeStr = take.toFixed(4);
+      const claimed = await ctx.db
+        .update(purchaseOrderLines)
+        .set({
+          quantityBilled: sql`${purchaseOrderLines.quantityBilled} + ${takeStr}::numeric`,
+        })
+        .where(
+          and(
+            eq(purchaseOrderLines.id, line.id),
+            eq(purchaseOrderLines.purchaseOrderId, poId),
+            sql`${purchaseOrderLines.quantityBilled} + ${takeStr}::numeric <= ${purchaseOrderLines.quantity}`,
+          ),
+        )
+        .returning({ id: purchaseOrderLines.id });
+      if (claimed.length === 0) {
+        throw new ServiceError(
+          'CONFLICT',
+          'Purchase order quantities were consumed by another transaction. Reload and retry.',
+        );
+      }
+      left = left.minus(take);
+    }
+    if (left.greaterThan(0)) {
+      throw new ServiceError(
+        'CONFLICT',
+        'Purchase order quantities were consumed by another transaction. Reload and retry.',
+      );
+    }
+  }
+
+  await recomputePoStatusFromLines(ctx, poId, po.status, opts?.sourceRef ?? 'item_receipt_claim');
+}
+
+/**
+ * Release previously claimed receipt quantities (item receipt void). Decrements
+ * quantityBilled greedily across the PO's lines for each item (reverse
+ * lineOrder), guarded so it can never go below zero, then recomputes the PO
+ * status (a fully released PO returns to 'open').
+ */
+export async function releaseReceiptQuantities(
+  ctx: ServiceContext,
+  poId: string,
+  requests: ReceiptQuantityRequest[],
+  opts?: { sourceRef?: string },
+): Promise<void> {
+  const [po] = await ctx.db
+    .select()
+    .from(purchaseOrders)
+    .where(and(eq(purchaseOrders.id, poId), eq(purchaseOrders.companyId, ctx.companyId)));
+  if (!po) throw notFound('Purchase order');
+
+  const lines = await ctx.db
+    .select()
+    .from(purchaseOrderLines)
+    .where(eq(purchaseOrderLines.purchaseOrderId, poId))
+    .orderBy(asc(purchaseOrderLines.lineOrder));
+
+  for (const [itemId, qty] of aggregateByItem(requests)) {
+    // Walk in reverse lineOrder — undo claims from the lines filled last.
+    const candidates = lines.filter((l) => l.itemId === itemId).reverse();
+    const billedTotal = candidates.reduce(
+      (sum, l) => sum.plus(Money.of(l.quantityBilled ?? '0')),
+      Money.zero(),
+    );
+    if (qty.greaterThan(billedTotal)) {
+      throw new ServiceError(
+        'CONFLICT',
+        `Cannot release ${qty.toFixed(4)} of item ${itemId} from purchase order #${po.poNumber}: only ${billedTotal.toFixed(4)} is recorded as received/billed.`,
+      );
+    }
+
+    let left = qty;
+    for (const line of candidates) {
+      if (left.lessThanOrEqualTo(0)) break;
+      const billed = Money.of(line.quantityBilled ?? '0');
+      if (!billed.greaterThan(0)) continue;
+      const give = left.lessThanOrEqualTo(billed) ? left : billed;
+      const giveStr = give.toFixed(4);
+      const released = await ctx.db
+        .update(purchaseOrderLines)
+        .set({
+          quantityBilled: sql`${purchaseOrderLines.quantityBilled} - ${giveStr}::numeric`,
+        })
+        .where(
+          and(
+            eq(purchaseOrderLines.id, line.id),
+            eq(purchaseOrderLines.purchaseOrderId, poId),
+            sql`${purchaseOrderLines.quantityBilled} - ${giveStr}::numeric >= 0`,
+          ),
+        )
+        .returning({ id: purchaseOrderLines.id });
+      if (released.length === 0) {
+        throw new ServiceError(
+          'CONFLICT',
+          'Purchase order quantities changed in another transaction. Reload and retry.',
+        );
+      }
+      left = left.minus(give);
+    }
+    if (left.greaterThan(0)) {
+      throw new ServiceError(
+        'CONFLICT',
+        'Purchase order quantities changed in another transaction. Reload and retry.',
+      );
+    }
+  }
+
+  await recomputePoStatusFromLines(ctx, poId, po.status, opts?.sourceRef ?? 'item_receipt_release');
+}

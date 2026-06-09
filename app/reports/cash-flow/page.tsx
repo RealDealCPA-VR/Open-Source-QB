@@ -10,6 +10,7 @@ import { TrendingUp } from 'lucide-react';
 import { Button, Card, Input, Label, PageHeader, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
 import { fmtDate } from '../_components/shared';
 
 interface CashFlowLine {
@@ -43,48 +44,39 @@ interface CashFlowReport {
 }
 
 // ---------------------------------------------------------------------------
-// CSV helpers
+// Export table (shared ReportToolbar: CSV / Excel / PDF / Print)
 // ---------------------------------------------------------------------------
 
-function toCsvRow(...cells: (string | number)[]): string {
-  return cells
-    .map((c) => {
-      const s = String(c);
-      return s.includes(',') || s.includes('"') || s.includes('\n')
-        ? `"${s.replace(/"/g, '""')}"`
-        : s;
-    })
-    .join(',');
-}
-
-function buildCsv(report: CashFlowReport): string {
-  const lines: string[] = [
-    'Section,Line Item,Amount',
-    toCsvRow('Operating', 'Net Income', report.operating.netIncome),
-    toCsvRow('Operating', 'Change in Accounts Receivable', report.operating.changeInAR),
-    toCsvRow('Operating', 'Change in Accounts Payable', report.operating.changeInAP),
-    toCsvRow('Operating', 'Change in Inventory', report.operating.changeInInventory),
-    ...report.operating.otherChanges.map((l) =>
-      toCsvRow('Operating', `${l.code} ${l.name}`, l.amount),
-    ),
-    toCsvRow('Operating', 'Total Operating', report.operating.total),
-    ...report.investing.lines.map((l) => toCsvRow('Investing', `${l.code} ${l.name}`, l.amount)),
-    toCsvRow('Investing', 'Total Investing', report.investing.total),
-    ...report.financing.lines.map((l) => toCsvRow('Financing', `${l.code} ${l.name}`, l.amount)),
-    toCsvRow('Financing', 'Total Financing', report.financing.total),
-    toCsvRow('Summary', 'Net Cash Change', report.netCashChange),
-  ];
-  return lines.join('\n');
-}
-
-function downloadCsv(csv: string, filename: string) {
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
+function buildTable(report: CashFlowReport): ExportTable {
+  return {
+    filename: 'cash-flow',
+    title: 'Cash Flow Statement',
+    subtitle: `${report.from ? fmtDate(report.from) : 'Beginning'} - ${report.to ? fmtDate(report.to) : 'Present'}`,
+    columns: [
+      { header: 'Section' },
+      { header: 'Line Item' },
+      { header: 'Amount', numeric: true },
+    ],
+    rows: [
+      ['Operating', 'Net Income', report.operating.netIncome],
+      ['Operating', 'Change in Accounts Receivable', report.operating.changeInAR],
+      ['Operating', 'Change in Accounts Payable', report.operating.changeInAP],
+      ['Operating', 'Change in Inventory', report.operating.changeInInventory],
+      ...report.operating.otherChanges.map(
+        (l) => ['Operating', `${l.code} ${l.name}`, l.amount] as (string | null)[],
+      ),
+      ['Operating', 'Total Operating', report.operating.total],
+      ...report.investing.lines.map(
+        (l) => ['Investing', `${l.code} ${l.name}`, l.amount] as (string | null)[],
+      ),
+      ['Investing', 'Total Investing', report.investing.total],
+      ...report.financing.lines.map(
+        (l) => ['Financing', `${l.code} ${l.name}`, l.amount] as (string | null)[],
+      ),
+      ['Financing', 'Total Financing', report.financing.total],
+    ],
+    totals: [['Summary', 'Net Cash Change', report.netCashChange]],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -173,33 +165,16 @@ export default function CashFlowPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function handleDownload() {
-    if (!report) return;
-    downloadCsv(buildCsv(report), 'cash-flow.csv');
-    toast('CSV downloaded.', 'success');
-  }
-
   const netCash = report ? Number(report.netCashChange) : 0;
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader
-        title="Cash Flow Statement"
-        icon={TrendingUp}
-        action={
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={handleDownload}
-            disabled={!report}
-          >
-            Download CSV
-          </Button>
-        }
-      />
+      <PageHeader title="Cash Flow Statement" icon={TrendingUp} />
+
+      <ReportToolbar table={report ? buildTable(report) : null} disabled={loading} />
 
       {/* Filters */}
-      <Card className="p-5 mb-6 flex flex-wrap items-end gap-4">
+      <Card className="p-5 mb-6 flex flex-wrap items-end gap-4 print-hidden">
         <div className="flex-1 min-w-[160px]">
           <Label htmlFor="cf-from">From</Label>
           <Input

@@ -12,6 +12,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { createManualEntry, listEntries } from '@/lib/services/journal';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { createJournalEntrySchema } from '@/lib/validation/journal';
 
 export async function GET(req: NextRequest) {
   try {
@@ -33,19 +35,13 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json();
-
-    const date = body.date ? new Date(body.date) : undefined;
-    if (!date || isNaN(date.getTime())) {
-      return NextResponse.json({ error: 'date is required (ISO string).' }, { status: 400 });
+    const body = await req.json().catch(() => ({}));
+    const parsed = createJournalEntrySchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
-    const entry = await createManualEntry(ctx, {
-      date,
-      description: body.description ?? '',
-      reference: body.reference ?? null,
-      lines: body.lines ?? [],
-    });
+    const entry = await createManualEntry(ctx, parsed.data);
 
     return NextResponse.json({ entry }, { status: 201 });
   } catch (err) {

@@ -3,9 +3,11 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Receipt, Plus, Trash2, PlusCircle, MinusCircle } from 'lucide-react';
 import {
+  AmountInput,
   Button,
   Card,
   ConfirmDialog,
+  DateInput,
   EmptyState,
   Input,
   Select,
@@ -19,6 +21,7 @@ import {
   PageHeader,
   Spinner,
   toast,
+  useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
@@ -186,8 +189,12 @@ function NewReceiptModal({
   }
 
   function removeLine(idx: number) {
-    setLines((prev) => prev.filter((_, i) => i !== idx));
+    // Keep at least one line (mirrors the per-row remove button being disabled).
+    setLines((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== idx) : prev));
   }
+
+  // Line-grid keyboard ergonomics: Ctrl+Insert add / Ctrl+Delete remove / Enter down.
+  const grid = useGridKeys({ addRow: addLine, removeRow: removeLine, disabled: saving });
 
   const selectedTaxRate = taxRates.find((t) => t.id === taxRateId);
   const { subtotal, tax, total } = computeTotals(lines, selectedTaxRate);
@@ -269,9 +276,8 @@ function NewReceiptModal({
           </div>
           <div>
             <Label htmlFor="sr-date">Sale Date *</Label>
-            <Input
+            <DateInput
               id="sr-date"
-              type="date"
               value={date}
               onChange={(e) => setDate(e.target.value)}
             />
@@ -332,7 +338,7 @@ function NewReceiptModal({
             </button>
           </div>
 
-          <div className="rounded-lg border border-slate-200 overflow-hidden">
+          <div className="rounded-lg border border-slate-200 overflow-hidden" onKeyDown={grid.onKeyDown}>
             {/* Header row */}
             <div className="grid grid-cols-[150px_1fr_60px_80px_44px_32px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
               <span>Item</span>
@@ -346,6 +352,7 @@ function NewReceiptModal({
             {lines.map((line, idx) => (
               <div
                 key={idx}
+                data-grid-row
                 className="grid grid-cols-[150px_1fr_60px_80px_44px_32px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
               >
                 <Select
@@ -363,19 +370,13 @@ function NewReceiptModal({
                   value={line.description}
                   onChange={(e) => updateLine(idx, { description: e.target.value })}
                 />
-                <Input
+                <AmountInput
                   placeholder="1"
-                  type="number"
-                  min="0"
-                  step="any"
                   value={line.quantity}
                   onChange={(e) => updateLine(idx, { quantity: e.target.value })}
                 />
-                <Input
+                <AmountInput
                   placeholder="0.00"
-                  type="number"
-                  min="0"
-                  step="any"
                   value={line.rate}
                   onChange={(e) => updateLine(idx, { rate: e.target.value })}
                 />

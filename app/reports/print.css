@@ -1,0 +1,54 @@
+/*
+ * Print stylesheet for the report pages (imported by app/reports/layout.tsx —
+ * deliberately NOT in globals.css). Hides the app chrome (sidebar nav, command
+ * palette, toolbars, filter forms, buttons) so window.print() yields a clean
+ * paper report.
+ */
+@media print {
+  body {
+    background: #fff !important;
+  }
+
+  /* App chrome: sidebar nav + any interactive controls. */
+  aside,
+  nav,
+  button,
+  form,
+  .print-hidden {
+    display: none !important;
+  }
+
+  main {
+    padding: 0 !important;
+    background: #fff !important;
+    min-height: 0 !important;
+  }
+
+  /* Flatten cards and drop drill-down link styling on paper. */
+  main a {
+    color: inherit !important;
+    text-decoration: none !important;
+  }
+
+  main * {
+    box-shadow: none !important;
+  }
+
+  /* Let long tables break across pages instead of clipping. */
+  .overflow-hidden,
+  .overflow-x-auto {
+    overflow: visible !important;
+  }
+
+  table {
+    page-break-inside: auto;
+  }
+
+  tr {
+    page-break-inside: avoid;
+  }
+
+  thead {
+    display: table-header-group;
+  }
+}

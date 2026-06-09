@@ -1,0 +1,64 @@
+/**
+ * POST /api/inventory/batch-count
+ *
+ * Body: {
+ *   date: string;
+ *   counts: Array<{ itemId: string; countedQty: string | number }>;
+ *   adjustmentAccountId?: string;
+ * }
+ *
+ * Applies a whole physical count sheet at once. Each entry posts its own
+ * shrinkage/overage adjustment via physicalCount; FIFO-tracked items (and any
+ * other guard rejections) are returned in `skipped` with the reason rather
+ * than failing the batch.
+ */
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerContext } from '@/lib/context';
+import { batchPhysicalCount } from '@/lib/services/inventoryOps';
+import { ServiceError } from '@/lib/services/_base';
+
+function serviceErrorToResponse(err: ServiceError): NextResponse {
+  const statusMap: Record<string, number> = {
+    NOT_FOUND: 404,
+    VALIDATION: 400,
+    UNBALANCED: 400,
+    FORBIDDEN: 403,
+    CONFLICT: 409,
+    PERIOD_CLOSED: 409,
+  };
+  const status = statusMap[err.code] ?? 500;
+  return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
+}
+
+export async function POST(req: NextRequest): Promise<NextResponse> {
+  try {
+    const ctx = await getServerContext();
+    const body = (await req.json()) as {
+      date?: string;
+      counts?: Array<{ itemId: string; countedQty: string | number }>;
+      adjustmentAccountId?: string | null;
+    };
+
+    if (!body.date) {
+      return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
+    }
+    if (!Array.isArray(body.counts) || body.counts.length === 0) {
+      return NextResponse.json(
+        { error: 'counts must be a non-empty array', code: 'VALIDATION' },
+        { status: 400 },
+      );
+    }
+
+    const result = await batchPhysicalCount(ctx, {
+      date: new Date(body.date),
+      counts: body.counts,
+      adjustmentAccountId: body.adjustmentAccountId ?? null,
+    });
+
+    return NextResponse.json(result, { status: 201 });
+  } catch (err) {
+    if (err instanceof ServiceError) return serviceErrorToResponse(err);
+    console.error('[POST /api/inventory/batch-count]', err);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}

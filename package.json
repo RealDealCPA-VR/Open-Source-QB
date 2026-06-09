@@ -76,6 +76,14 @@
     "directories": {
       "output": "release"
     },
+    "fileAssociations": [
+      {
+        "ext": "bka",
+        "name": "BookKeeper AI Company Backup",
+        "description": "BookKeeper AI Company Backup",
+        "role": "Editor"
+      }
+    ],
     "files": [
       "electron/**/*",
       "drizzle/**/*"
