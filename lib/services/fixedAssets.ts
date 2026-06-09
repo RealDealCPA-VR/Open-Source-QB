@@ -319,6 +319,26 @@ export async function postDepreciation(ctx: ServiceContext, input: PostDepreciat
     }));
 
   return inTransaction(ctx, async (tx) => {
+    // Idempotency guard: refuse to post the same asset's depreciation twice for the same
+    // date (e.g. a double-clicked "Run depreciation" or a re-run monthly job). Checked inside
+    // the transaction so concurrent posts can't both pass.
+    const [dup] = await tx.db
+      .select({ id: depreciationEntries.id })
+      .from(depreciationEntries)
+      .where(
+        and(
+          eq(depreciationEntries.companyId, tx.companyId),
+          eq(depreciationEntries.fixedAssetId, assetId),
+          eq(depreciationEntries.date, date),
+        ),
+      );
+    if (dup) {
+      throw new ServiceError(
+        'CONFLICT',
+        `Depreciation for "${asset.name}" on ${date.toISOString().slice(0, 10)} has already been posted.`,
+      );
+    }
+
     // Post GL entry: Dr Depreciation Expense / Cr Accumulated Depreciation.
     const entry = await postJournalEntry(tx, {
       date,

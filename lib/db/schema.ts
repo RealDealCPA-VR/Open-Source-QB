@@ -84,6 +84,8 @@ export const journalEntries = pgTable('journal_entries', {
   description: text('description').notNull(),
   reference: varchar('reference', { length: 100 }),
   status: journalEntryStatusEnum('status').notNull().default('draft'),
+  /** Link to the source document, e.g. "invoice:<id>" — enables drill-down + duplicate-post guards. */
+  sourceRef: varchar('source_ref', { length: 255 }),
   createdBy: uuid('created_by').references(() => users.id).notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
@@ -408,6 +410,8 @@ export const estimates = pgTable('estimates', {
   total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   convertedInvoiceId: uuid('converted_invoice_id'),
+  /** Total billed so far via progress invoicing (≤ total). */
+  amountInvoiced: decimal('amount_invoiced', { precision: 15, scale: 2 }).notNull().default('0'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -482,9 +486,49 @@ export const paymentsReceived = pgTable('payments_received', {
   reference: varchar('reference', { length: 100 }),
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
   unapplied: decimal('unapplied', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** Payment currency + rate to base — needed to clear A/R on foreign-currency invoices. */
+  currency: varchar('currency', { length: 3 }),
+  exchangeRate: decimal('exchange_rate', { precision: 15, scale: 6 }),
   depositAccountId: uuid('deposit_account_id').references(() => accounts.id), // bank or undeposited funds
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  voidedAt: timestamp('voided_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ---- Sales receipts (paid-at-point-of-sale; posts income + payment in one step) ----
+export const salesReceipts = pgTable('sales_receipts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  customerId: uuid('customer_id').references(() => customers.id),
+  receiptNumber: integer('receipt_number').notNull(),
+  date: timestamp('date').notNull(),
+  method: paymentMethodEnum('method').notNull().default('cash'),
+  reference: varchar('reference', { length: 100 }),
+  status: docStatusEnum('status').notNull().default('paid'),
+  classId: uuid('class_id').references(() => classes.id),
+  subtotal: decimal('subtotal', { precision: 15, scale: 2 }).notNull().default('0'),
+  taxAmount: decimal('tax_amount', { precision: 15, scale: 2 }).notNull().default('0'),
+  total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
+  depositAccountId: uuid('deposit_account_id').references(() => accounts.id), // bank or undeposited funds
+  memo: text('memo'),
+  postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const salesReceiptLines = pgTable('sales_receipt_lines', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  salesReceiptId: uuid('sales_receipt_id').references(() => salesReceipts.id).notNull(),
+  itemId: uuid('item_id').references(() => items.id),
+  accountId: uuid('account_id').references(() => accounts.id), // income account
+  description: text('description'),
+  quantity: decimal('quantity', { precision: 15, scale: 4 }).notNull().default('1'),
+  rate: decimal('rate', { precision: 15, scale: 4 }).notNull().default('0'),
+  amount: decimal('amount', { precision: 15, scale: 2 }).notNull().default('0'),
+  taxable: boolean('taxable').notNull().default(true),
+  classId: uuid('class_id').references(() => classes.id),
+  jobId: uuid('job_id').references(() => jobs.id),
+  taxRateId: uuid('tax_rate_id').references(() => taxRates.id),
+  lineOrder: integer('line_order').notNull().default(0),
 });
 
 export const paymentApplications = pgTable('payment_applications', {
@@ -507,6 +551,8 @@ export const bills = pgTable('bills', {
   classId: uuid('class_id').references(() => classes.id),
   total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
   amountPaid: decimal('amount_paid', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** Portion of the bill settled by vendor credits (not cash) — kept separate from amountPaid. */
+  amountCredited: decimal('amount_credited', { precision: 15, scale: 2 }).notNull().default('0'),
   balanceDue: decimal('balance_due', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
@@ -525,6 +571,8 @@ export const billLines = pgTable('bill_lines', {
   classId: uuid('class_id').references(() => classes.id),
   customerId: uuid('customer_id').references(() => customers.id), // billable
   jobId: uuid('job_id').references(() => jobs.id),
+  /** Set when this billable line has been pulled onto a customer invoice. */
+  billedInvoiceId: uuid('billed_invoice_id').references(() => invoices.id),
   lineOrder: integer('line_order').notNull().default(0),
 });
 
@@ -539,6 +587,7 @@ export const billPayments = pgTable('bill_payments', {
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
   paymentAccountId: uuid('payment_account_id').references(() => accounts.id), // bank/CC
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  voidedAt: timestamp('voided_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -562,6 +611,9 @@ export const expenses = pgTable('expenses', {
   total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  /** 'check' expenses queue for check printing until printed (QB Write Checks → Print Queue). */
+  toPrint: boolean('to_print').notNull().default(false),
+  voidedAt: timestamp('voided_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -574,6 +626,8 @@ export const expenseLines = pgTable('expense_lines', {
   classId: uuid('class_id').references(() => classes.id),
   customerId: uuid('customer_id').references(() => customers.id),
   jobId: uuid('job_id').references(() => jobs.id),
+  /** Set when this billable line has been pulled onto a customer invoice. */
+  billedInvoiceId: uuid('billed_invoice_id').references(() => invoices.id),
   lineOrder: integer('line_order').notNull().default(0),
 });
 
@@ -603,6 +657,8 @@ export const bankTransactions = pgTable('bank_transactions', {
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
   matched: boolean('matched').notNull().default(false),
   matchedEntryId: uuid('matched_entry_id').references(() => journalEntries.id),
+  /** User excluded this feed line from review (duplicate/personal) — QB "Exclude". */
+  excluded: boolean('excluded').notNull().default(false),
   suggestedAccountId: uuid('suggested_account_id').references(() => accounts.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
@@ -633,6 +689,10 @@ export const employees = pgTable('employees', {
   ssn: text('ssn'), // encrypted at rest
   portalPasswordHash: text('portal_password_hash'), // employee self-service login
   w4: jsonb('w4').$type<Record<string, unknown>>(),
+  /** Mailing address for W-2/pay stubs: { line1, line2, city, state, zip }. */
+  address: jsonb('address').$type<Record<string, unknown>>(),
+  /** Sick/vacation accrual policy + running balances (hours). */
+  accruals: jsonb('accruals').$type<Record<string, unknown>>(),
   isActive: boolean('is_active').notNull().default(true),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
@@ -650,6 +710,7 @@ export const paychecks = pgTable('paychecks', {
   totalDeductions: decimal('total_deductions', { precision: 15, scale: 2 }).notNull().default('0'),
   netPay: decimal('net_pay', { precision: 15, scale: 2 }).notNull().default('0'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  voidedAt: timestamp('voided_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -728,6 +789,8 @@ export const creditMemos = pgTable('credit_memos', {
   taxAmount: decimal('tax_amount', { precision: 15, scale: 2 }).notNull().default('0'),
   total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
   unapplied: decimal('unapplied', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** Portion refunded by check (reduces unapplied). */
+  refundedAmount: decimal('refunded_amount', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
@@ -754,6 +817,8 @@ export const vendorCredits = pgTable('vendor_credits', {
   status: docStatusEnum('status').notNull().default('open'),
   total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
   unapplied: decimal('unapplied', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** Portion refunded by check (reduces unapplied). */
+  refundedAmount: decimal('refunded_amount', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
@@ -876,6 +941,8 @@ export const purchaseOrderLines = pgTable('purchase_order_lines', {
   quantity: decimal('quantity', { precision: 15, scale: 4 }).notNull().default('1'),
   rate: decimal('rate', { precision: 15, scale: 4 }).notNull().default('0'),
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** Quantity already pulled onto bills — enables partial billing/receipt of a PO. */
+  quantityBilled: decimal('quantity_billed', { precision: 15, scale: 4 }).notNull().default('0'),
   lineOrder: integer('line_order').notNull().default(0),
 });
 
@@ -888,6 +955,7 @@ export const deposits = pgTable('deposits', {
   total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
+  voidedAt: timestamp('voided_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 

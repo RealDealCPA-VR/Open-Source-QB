@@ -1,10 +1,16 @@
 /**
  * Fiscal periods & period close. Closing a period locks it: the posting engine refuses to post or
  * void entries dated within a closed period (prevents editing prior, reported-on books).
+ *
+ * Also enforces the company-level closing date (QB "Set Closing Date" + password): postings
+ * dated on/before companies.settings.closingDate are blocked unless the request carried a
+ * valid closing-date password (ctx.closingDateOverride, set by getServerContext from the
+ * x-closing-password header — see lib/services/company.ts setClosingDate).
  */
 import { and, eq, lte, gte } from 'drizzle-orm';
-import { fiscalPeriods } from '@/lib/db/schema';
+import { companies, fiscalPeriods } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError, notFound, writeAudit } from './_base';
+import { assertWrite } from './rbac';
 
 export async function listPeriods(ctx: ServiceContext) {
   return ctx.db
@@ -17,6 +23,7 @@ export async function closePeriod(
   ctx: ServiceContext,
   input: { periodStart: Date; periodEnd: Date },
 ) {
+  assertWrite(ctx); // reject viewers before the insert (writeAudit runs after it)
   const [row] = await ctx.db
     .insert(fiscalPeriods)
     .values({
@@ -38,6 +45,7 @@ export async function closePeriod(
 }
 
 export async function reopenPeriod(ctx: ServiceContext, id: string) {
+  assertWrite(ctx); // reject viewers before the update (writeAudit runs after it)
   const [existing] = await ctx.db
     .select()
     .from(fiscalPeriods)
@@ -59,7 +67,8 @@ export async function reopenPeriod(ctx: ServiceContext, id: string) {
 }
 
 /**
- * Throw PERIOD_CLOSED if `date` falls within a closed period for this company.
+ * Throw PERIOD_CLOSED if `date` falls within a closed period for this company, or on/before
+ * the company closing date without a valid closing-date password for this request.
  * Called by the posting engine before posting or voiding.
  */
 export async function assertPeriodOpen(ctx: ServiceContext, date: Date): Promise<void> {
@@ -78,7 +87,26 @@ export async function assertPeriodOpen(ctx: ServiceContext, date: Date): Promise
   if (closed.length) {
     throw new ServiceError(
       'PERIOD_CLOSED',
-      `The accounting period containing ${date.toISOString().slice(0, 10)} is closed. Reopen it to post.`,
+      `The accounting period containing ${date.toISOString().slice(0, 10)} is closed. Reopen it under Fiscal Periods to post.`,
     );
+  }
+
+  // Company-level closing date (QB Set Closing Date). A verified closing-date password for
+  // this request (ctx.closingDateOverride) bypasses the lock, exactly like QBD's password prompt.
+  if (!ctx.closingDateOverride) {
+    const [company] = await ctx.db
+      .select({ settings: companies.settings })
+      .from(companies)
+      .where(eq(companies.id, ctx.companyId));
+    const closingDate = (company?.settings as Record<string, unknown> | null)?.closingDate;
+    if (typeof closingDate === 'string' && closingDate) {
+      const dateStr = date.toISOString().slice(0, 10);
+      if (dateStr <= closingDate) {
+        throw new ServiceError(
+          'PERIOD_CLOSED',
+          `The books are closed through ${closingDate}. Transactions dated on or before the closing date require the closing-date password (or clear the closing date in Settings).`,
+        );
+      }
+    }
   }
 }

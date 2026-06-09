@@ -17,6 +17,7 @@ import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
 import { postJournalEntry } from './posting';
 import { trialBalance } from './reports';
+import { createTaxAgency } from './salesTax';
 import {
   paySalesTax,
   payPayrollLiabilities,
@@ -224,5 +225,23 @@ describe('Liability Payments — end-to-end', () => {
 
     const tb = await trialBalance(ctx);
     expect(tb.balanced).toBe(true);
+  });
+
+  // ── paySalesTax GL memo uses the agency display name, never its UUID ───────
+
+  it('paySalesTax interpolates the agency display name into the description', async () => {
+    const agency = await createTaxAgency(ctx, { name: 'CA Dept of Tax & Fee Admin' });
+
+    const entry = await paySalesTax(ctx, {
+      amount: '10.00',
+      date: new Date('2025-05-01'),
+      paymentAccountId: acct['1000'],
+      agencyId: agency.id,
+    });
+
+    expect(entry.description).toBe('Pay Sales Tax — CA Dept of Tax & Fee Admin');
+    expect(entry.description).not.toContain(agency.id);
+    // The machine-readable id lives in sourceRef only.
+    expect(entry.sourceRef).toBe(`tax_agency:${agency.id}`);
   });
 });

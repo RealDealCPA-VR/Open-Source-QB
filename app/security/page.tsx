@@ -1,15 +1,43 @@
 'use client';
-import { useState } from 'react';
-import { ShieldCheck } from 'lucide-react';
-import { Button, Card, Input, Label, PageHeader, toast } from '@/components/ui';
+import { useEffect, useState } from 'react';
+import { CheckCircle2, ShieldCheck } from 'lucide-react';
+import { QRCodeSVG } from 'qrcode.react';
+import { Button, Card, Input, Label, PageHeader, Spinner, toast } from '@/components/ui';
 import { api } from '@/lib/client';
+
+interface Me {
+  id: string;
+  email: string;
+  name: string | null;
+  totpEnabled: boolean;
+}
 
 export default function SecurityPage() {
   const [secret, setSecret] = useState('');
   const [otpUrl, setOtpUrl] = useState('');
   const [code, setCode] = useState('');
   const [enabled, setEnabled] = useState(false);
+  const [statusLoading, setStatusLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+
+  // Initialize from the server so a refresh doesn't offer "Set up authenticator"
+  // (which would regenerate the secret) to a user who already has 2FA on.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const me = await api.get<Me | null>('/api/auth/me');
+        if (!cancelled) setEnabled(!!me?.totpEnabled);
+      } catch {
+        // Treat as not-enabled; the enable/disable calls still verify server-side.
+      } finally {
+        if (!cancelled) setStatusLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function setup() {
     setBusy(true);
@@ -29,6 +57,7 @@ export default function SecurityPage() {
     try {
       await api.post('/api/auth/2fa/enable', { token: code });
       setEnabled(true);
+      setCode('');
       toast('Two-factor authentication enabled.', 'success');
     } catch (e) {
       toast(e instanceof Error ? e.message : 'Invalid code', 'danger');
@@ -43,6 +72,7 @@ export default function SecurityPage() {
       setEnabled(false);
       setSecret('');
       setOtpUrl('');
+      setCode('');
       toast('Two-factor authentication disabled.', 'info');
     } catch (e) {
       toast(e instanceof Error ? e.message : 'Failed', 'danger');
@@ -60,37 +90,49 @@ export default function SecurityPage() {
           Add a second step at sign-in using Google Authenticator, Authy, or 1Password.
         </p>
 
-        {!secret && !enabled && (
-          <Button onClick={setup} disabled={busy}>Set up authenticator</Button>
-        )}
-
-        {secret && !enabled && (
-          <div className="space-y-3">
-            <div>
-              <Label>Secret key (enter in your app)</Label>
-              <code className="block bg-navy/5 rounded-lg px-3 py-2 text-navy font-mono text-sm break-all">{secret}</code>
-            </div>
-            <div>
-              <Label>otpauth URL</Label>
-              <code className="block bg-navy/5 rounded-lg px-3 py-2 text-navy/70 font-mono text-xs break-all">{otpUrl}</code>
-            </div>
-            <div>
-              <Label>Enter the 6-digit code to confirm</Label>
-              <Input value={code} onChange={(e) => setCode(e.target.value)} placeholder="123456" inputMode="numeric" />
-            </div>
-            <Button onClick={enable} disabled={busy || code.length < 6}>Enable 2FA</Button>
+        {statusLoading ? (
+          <div className="flex items-center gap-2 text-navy/40 text-sm py-2">
+            <Spinner className="h-4 w-4" /> Checking 2FA status…
           </div>
-        )}
+        ) : (
+          <>
+            {!secret && !enabled && (
+              <Button onClick={setup} loading={busy}>Set up authenticator</Button>
+            )}
 
-        {enabled && (
-          <div className="space-y-3">
-            <p className="text-emerald font-semibold">✓ Two-factor authentication is enabled.</p>
-            <div>
-              <Label>Enter a current code to disable</Label>
-              <Input value={code} onChange={(e) => setCode(e.target.value)} placeholder="123456" inputMode="numeric" />
-            </div>
-            <Button variant="danger" onClick={disable} disabled={busy}>Disable 2FA</Button>
-          </div>
+            {secret && !enabled && (
+              <div className="space-y-3">
+                <div>
+                  <Label>Scan with your authenticator app</Label>
+                  <div className="inline-block rounded-lg border border-slate-200 bg-white p-3">
+                    <QRCodeSVG value={otpUrl} size={168} aria-label="2FA setup QR code" />
+                  </div>
+                </div>
+                <div>
+                  <Label>Or enter the secret key manually</Label>
+                  <code className="block bg-navy/5 rounded-lg px-3 py-2 text-navy font-mono text-sm break-all">{secret}</code>
+                </div>
+                <div>
+                  <Label>Enter the 6-digit code to confirm</Label>
+                  <Input value={code} onChange={(e) => setCode(e.target.value)} placeholder="123456" inputMode="numeric" />
+                </div>
+                <Button onClick={enable} loading={busy} disabled={code.length < 6}>Enable 2FA</Button>
+              </div>
+            )}
+
+            {enabled && (
+              <div className="space-y-3">
+                <p className="flex items-center gap-2 text-emerald font-semibold">
+                  <CheckCircle2 className="h-5 w-5" /> Two-factor authentication is enabled.
+                </p>
+                <div>
+                  <Label>Enter a current code to disable</Label>
+                  <Input value={code} onChange={(e) => setCode(e.target.value)} placeholder="123456" inputMode="numeric" />
+                </div>
+                <Button variant="danger" onClick={disable} loading={busy}>Disable 2FA</Button>
+              </div>
+            )}
+          </>
         )}
       </Card>
     </main>

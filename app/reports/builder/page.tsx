@@ -8,11 +8,13 @@
  * - "Download CSV" exports the visible table.
  */
 import { useState, useEffect, useCallback } from 'react';
+import { Wrench } from 'lucide-react';
 import {
   Button,
   Card,
   Input,
   Label,
+  Modal,
   PageHeader,
   Select,
   Table,
@@ -101,6 +103,8 @@ export default function ReportBuilderPage() {
   const [saved, setSaved] = useState<MemorizedReport[]>([]);
   const [savedOpen, setSavedOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [saveOpen, setSaveOpen] = useState(false);
+  const [saveName, setSaveName] = useState('');
 
   // Load saved reports
   const loadSaved = useCallback(async () => {
@@ -151,19 +155,23 @@ export default function ReportBuilderPage() {
     }
   }
 
-  // Save as memorized report
+  // Save as memorized report (name collected via the Save modal)
   async function handleSave() {
-    if (!result) return;
-    const name = window.prompt('Enter a name for this saved report:');
-    if (!name?.trim()) return;
+    const name = saveName.trim();
+    if (!name) {
+      toast('Please enter a name for the saved report.', 'danger');
+      return;
+    }
     setSaving(true);
     try {
       await api.post('/api/memorized-reports', {
-        name: name.trim(),
+        name,
         reportType: 'custom',
         config: buildConfig(),
       });
-      toast(`Report "${name.trim()}" saved.`, 'success');
+      toast(`Report "${name}" saved.`, 'success');
+      setSaveOpen(false);
+      setSaveName('');
       await loadSaved();
     } catch (e) {
       toast(e instanceof ApiError ? e.message : 'Failed to save report.', 'danger');
@@ -206,6 +214,7 @@ export default function ReportBuilderPage() {
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
         title="Custom Report Builder"
+        icon={Wrench}
         action={
           <div className="flex gap-2">
             {saved.length > 0 && (
@@ -216,10 +225,10 @@ export default function ReportBuilderPage() {
             <Button
               variant="secondary"
               size="sm"
-              onClick={handleSave}
-              disabled={!result || saving}
+              onClick={() => setSaveOpen(true)}
+              disabled={!result}
             >
-              {saving ? 'Saving…' : 'Save Report'}
+              Save Report
             </Button>
             <Button
               variant="secondary"
@@ -408,6 +417,39 @@ export default function ReportBuilderPage() {
           </>
         )}
       </Card>
+
+      {/* Save Report modal */}
+      <Modal
+        open={saveOpen}
+        onClose={() => setSaveOpen(false)}
+        title="Save Report"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setSaveOpen(false)} disabled={saving}>
+              Cancel
+            </Button>
+            <Button loading={saving} onClick={handleSave}>
+              Save
+            </Button>
+          </>
+        }
+      >
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleSave();
+          }}
+        >
+          <Label htmlFor="save-report-name">Report Name</Label>
+          <Input
+            id="save-report-name"
+            autoFocus
+            placeholder="e.g. Monthly expense breakdown"
+            value={saveName}
+            onChange={(e) => setSaveName(e.target.value)}
+          />
+        </form>
+      </Modal>
     </main>
   );
 }

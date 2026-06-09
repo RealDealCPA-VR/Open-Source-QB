@@ -1,37 +1,41 @@
 'use client';
 
 /**
- * Bank Review — "Add to register" / "Match" UI for staged bank-feed transactions.
+ * Bank Review — QB Bank Feeds-style review screen for staged bank transactions.
  *
- * Workflow:
- *  1. Pick a bank account from the dropdown.
- *  2. Each unmatched row has an account Select (pre-filled from suggestedAccountId)
- *     and an "Add" button that calls POST /api/bank-transactions/categorize.
- *  3. "Apply Rules" button calls POST /api/bank-transactions/bulk {action:'applyRules'}
- *     to auto-fill suggestions without posting.
- *  4. "Auto-add Suggested" button calls POST /api/bank-transactions/bulk {action:'categorizeSuggested'}
- *     to post all rows that already have a suggestion.
- *  5. Matched rows show a green check and cannot be recategorized from this view.
+ * Per-row mode chooser (QB style):
+ *  - Add:     categorize into a GL account (posts a NEW journal entry).
+ *  - Match:   link to an EXISTING posted journal entry (no new posting) —
+ *             ranked candidates with confidence, one-click confirm.
+ *  - Exclude: drop the row from the review queue (duplicate / personal).
+ *
+ * Filters: To Review (unreviewed) / Matched / Excluded.
+ * Auto-suggest: when exactly one HIGH-confidence match candidate exists for a
+ * row, the row opens in Match mode with that candidate preselected.
+ * Matched rows offer Unmatch (voids the entry only if categorize created it).
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { CheckCircle, CreditCard } from 'lucide-react';
+import Link from 'next/link';
+import { CheckCircle, CreditCard, Inbox, Link2 } from 'lucide-react';
 import {
   Badge,
   Button,
   Card,
+  EmptyState,
   Label,
   PageHeader,
   Select,
+  Spinner,
   Table,
   Td,
   Th,
-  Toaster,
   Tr,
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/dates';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -60,7 +64,39 @@ interface BankTransaction {
   amount: string;
   matched: boolean;
   matchedEntryId: string | null;
+  excluded: boolean;
   suggestedAccountId: string | null;
+}
+
+interface MatchCandidate {
+  entryId: string;
+  entryNumber: number;
+  date: string;
+  description: string;
+  reference: string | null;
+  sourceRef: string | null;
+  amount: string;
+  dateDiffDays: number;
+  referenceMatch: boolean;
+  confidence: 'high' | 'medium' | 'low';
+  score: number;
+}
+
+type ReviewTab = 'unreviewed' | 'matched' | 'excluded';
+type RowMode = 'add' | 'match';
+
+// ---------------------------------------------------------------------------
+// Small bits
+// ---------------------------------------------------------------------------
+
+function ConfidenceBadge({ c }: { c: MatchCandidate }) {
+  const tone = c.confidence === 'high' ? 'success' : c.confidence === 'medium' ? 'info' : 'neutral';
+  return (
+    <Badge tone={tone}>
+      {c.referenceMatch ? `Ref ${c.reference} · ` : ''}
+      {c.confidence} ({c.score})
+    </Badge>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -72,13 +108,17 @@ export default function BankReviewPage() {
   const [allAccounts, setAllAccounts] = useState<Account[]>([]);
   const [selectedBankAccountId, setSelectedBankAccountId] = useState('');
   const [transactions, setTransactions] = useState<BankTransaction[]>([]);
+  const [tab, setTab] = useState<ReviewTab>('unreviewed');
 
-  // Per-row selected account (from user's dropdown choice)
+  // Per-row state
   const [rowAccountId, setRowAccountId] = useState<Record<string, string>>({});
+  const [rowMode, setRowMode] = useState<Record<string, RowMode>>({});
+  const [rowCandidates, setRowCandidates] = useState<Record<string, MatchCandidate[]>>({});
+  const [rowCandidateId, setRowCandidateId] = useState<Record<string, string>>({});
 
   const [loadingBankAccounts, setLoadingBankAccounts] = useState(true);
   const [loadingTxns, setLoadingTxns] = useState(false);
-  const [addingId, setAddingId] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
   const [bulkRunning, setBulkRunning] = useState(false);
 
   // ------------------------------------------------------------------
@@ -90,15 +130,13 @@ export default function BankReviewPage() {
     try {
       const data = await api.get<BankAccount[]>('/api/bank-accounts');
       setBankAccounts(data);
-      if (data.length > 0 && !selectedBankAccountId) {
-        setSelectedBankAccountId(data[0].id);
-      }
+      setSelectedBankAccountId((prev) => prev || data[0]?.id || '');
     } catch {
       toast('Failed to load bank accounts.', 'danger');
     } finally {
       setLoadingBankAccounts(false);
     }
-  }, [selectedBankAccountId]);
+  }, []);
 
   const fetchAccounts = useCallback(async () => {
     try {
@@ -114,15 +152,50 @@ export default function BankReviewPage() {
     setLoadingTxns(true);
     try {
       const data = await api.get<BankTransaction[]>(
-        `/api/bank-transactions?bankAccountId=${bankAccountId}`,
+        `/api/bank-transactions?bankAccountId=${bankAccountId}&filter=all`,
       );
       setTransactions(data);
-      // Pre-fill per-row selections from suggestedAccountId.
-      const initial: Record<string, string> = {};
+
+      // Pre-fill per-row account selections from suggestedAccountId.
+      const initialAccounts: Record<string, string> = {};
       for (const txn of data) {
-        if (txn.suggestedAccountId) initial[txn.id] = txn.suggestedAccountId;
+        if (txn.suggestedAccountId) initialAccounts[txn.id] = txn.suggestedAccountId;
       }
-      setRowAccountId((prev) => ({ ...initial, ...prev }));
+      setRowAccountId((prev) => ({ ...initialAccounts, ...prev }));
+
+      // Fetch match candidates for every unreviewed row (small desktop volumes).
+      const unreviewed = data.filter((t) => !t.matched && !t.excluded);
+      const results = await Promise.all(
+        unreviewed.map(async (t) => {
+          try {
+            const candidates = await api.get<MatchCandidate[]>(
+              `/api/bank-transactions/${t.id}/matches`,
+            );
+            return [t.id, candidates] as const;
+          } catch {
+            return [t.id, [] as MatchCandidate[]] as const;
+          }
+        }),
+      );
+
+      const candMap: Record<string, MatchCandidate[]> = {};
+      const modeMap: Record<string, RowMode> = {};
+      const candSel: Record<string, string> = {};
+      for (const [id, candidates] of results) {
+        candMap[id] = candidates;
+        const high = candidates.filter((c) => c.confidence === 'high');
+        if (high.length === 1) {
+          // Auto-suggest: exactly one high-confidence match → preselect Match.
+          modeMap[id] = 'match';
+          candSel[id] = high[0].entryId;
+        } else {
+          modeMap[id] = 'add';
+          if (candidates.length > 0) candSel[id] = candidates[0].entryId;
+        }
+      }
+      setRowCandidates(candMap);
+      setRowMode(modeMap);
+      setRowCandidateId(candSel);
     } catch {
       toast('Failed to load transactions.', 'danger');
     } finally {
@@ -145,26 +218,68 @@ export default function BankReviewPage() {
   // Handlers
   // ------------------------------------------------------------------
 
-  async function handleAdd(txn: BankTransaction) {
+  async function withBusy(id: string, fn: () => Promise<void>) {
+    setBusyId(id);
+    try {
+      await fn();
+      await fetchTransactions(selectedBankAccountId);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Action failed.', 'danger');
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  const handleAdd = (txn: BankTransaction) => {
     const accountId = rowAccountId[txn.id];
     if (!accountId) {
       toast('Select an account first.', 'danger');
       return;
     }
-    setAddingId(txn.id);
-    try {
+    withBusy(txn.id, async () => {
       await api.post('/api/bank-transactions/categorize', {
         bankTransactionId: txn.id,
         accountId,
       });
       toast('Transaction added to register.', 'success');
-      await fetchTransactions(selectedBankAccountId);
-    } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to categorize.', 'danger');
-    } finally {
-      setAddingId(null);
+    });
+  };
+
+  const handleMatch = (txn: BankTransaction) => {
+    const journalEntryId = rowCandidateId[txn.id];
+    if (!journalEntryId) {
+      toast('Select a match candidate first.', 'danger');
+      return;
     }
-  }
+    withBusy(txn.id, async () => {
+      await api.post('/api/bank-transactions/match', {
+        bankTransactionId: txn.id,
+        journalEntryId,
+      });
+      toast('Matched to existing transaction — nothing new was posted.', 'success');
+    });
+  };
+
+  const handleExclude = (txn: BankTransaction) =>
+    withBusy(txn.id, async () => {
+      await api.post('/api/bank-transactions/exclude', { bankTransactionId: txn.id });
+      toast('Transaction excluded from review.', 'success');
+    });
+
+  const handleRestore = (txn: BankTransaction) =>
+    withBusy(txn.id, async () => {
+      await api.post('/api/bank-transactions/exclude', {
+        bankTransactionId: txn.id,
+        restore: true,
+      });
+      toast('Transaction restored to the review queue.', 'success');
+    });
+
+  const handleUnmatch = (txn: BankTransaction) =>
+    withBusy(txn.id, async () => {
+      await api.post('/api/bank-transactions/unmatch', { bankTransactionId: txn.id });
+      toast('Unmatched.', 'success');
+    });
 
   async function handleBulk(action: 'applyRules' | 'categorizeSuggested') {
     if (!selectedBankAccountId) return;
@@ -188,11 +303,173 @@ export default function BankReviewPage() {
   }
 
   // ------------------------------------------------------------------
-  // Derived stats
+  // Derived
   // ------------------------------------------------------------------
 
-  const unmatchedCount = transactions.filter((t) => !t.matched).length;
-  const matchedCount   = transactions.filter((t) => t.matched).length;
+  const unreviewedRows = transactions.filter((t) => !t.matched && !t.excluded);
+  const matchedRows = transactions.filter((t) => t.matched);
+  const excludedRows = transactions.filter((t) => t.excluded && !t.matched);
+
+  const visible =
+    tab === 'unreviewed' ? unreviewedRows : tab === 'matched' ? matchedRows : excludedRows;
+
+  const tabs: { key: ReviewTab; label: string; count: number }[] = [
+    { key: 'unreviewed', label: 'To Review', count: unreviewedRows.length },
+    { key: 'matched', label: 'Matched / Added', count: matchedRows.length },
+    { key: 'excluded', label: 'Excluded', count: excludedRows.length },
+  ];
+
+  // ------------------------------------------------------------------
+  // Row action cells
+  // ------------------------------------------------------------------
+
+  function renderActionCell(txn: BankTransaction) {
+    if (tab === 'matched') {
+      return (
+        <Button
+          variant="secondary"
+          size="sm"
+          loading={busyId === txn.id}
+          onClick={() => handleUnmatch(txn)}
+        >
+          Unmatch
+        </Button>
+      );
+    }
+    if (tab === 'excluded') {
+      return (
+        <Button
+          variant="secondary"
+          size="sm"
+          loading={busyId === txn.id}
+          onClick={() => handleRestore(txn)}
+        >
+          Restore
+        </Button>
+      );
+    }
+
+    // Unreviewed: mode chooser + mode panel + exclude.
+    const mode = rowMode[txn.id] ?? 'add';
+    const candidates = rowCandidates[txn.id] ?? [];
+    const busy = busyId === txn.id;
+    const selectedCandidate =
+      candidates.find((c) => c.entryId === rowCandidateId[txn.id]) ?? candidates[0];
+
+    return (
+      <div className="flex flex-col gap-2">
+        {/* Mode chooser */}
+        <div className="inline-flex rounded-md border border-navy/20 overflow-hidden w-fit text-xs">
+          <button
+            type="button"
+            className={`px-3 py-1 font-semibold ${
+              mode === 'add' ? 'bg-navy text-white' : 'bg-white text-navy/70 hover:bg-navy/5'
+            }`}
+            onClick={() => setRowMode((p) => ({ ...p, [txn.id]: 'add' }))}
+          >
+            Add
+          </button>
+          <button
+            type="button"
+            className={`px-3 py-1 font-semibold border-l border-navy/20 ${
+              mode === 'match' ? 'bg-navy text-white' : 'bg-white text-navy/70 hover:bg-navy/5'
+            }`}
+            onClick={() => setRowMode((p) => ({ ...p, [txn.id]: 'match' }))}
+          >
+            Match{candidates.length > 0 ? ` (${candidates.length})` : ''}
+          </button>
+        </div>
+
+        {/* Mode panel */}
+        {mode === 'add' ? (
+          <div className="flex items-center gap-2 flex-wrap">
+            <Select
+              className="min-w-[180px]"
+              value={rowAccountId[txn.id] ?? ''}
+              onChange={(e) =>
+                setRowAccountId((prev) => ({ ...prev, [txn.id]: e.target.value }))
+              }
+            >
+              <option value="">Select account…</option>
+              {allAccounts.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.code} — {a.name}
+                </option>
+              ))}
+            </Select>
+            <Button
+              size="sm"
+              loading={busy}
+              disabled={!rowAccountId[txn.id]}
+              onClick={() => handleAdd(txn)}
+            >
+              Add
+            </Button>
+            <Button variant="secondary" size="sm" disabled={busy} onClick={() => handleExclude(txn)}>
+              Exclude
+            </Button>
+          </div>
+        ) : candidates.length === 0 ? (
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-xs text-navy/50">
+              No matching register transactions found (±14 days, same amount).
+            </span>
+            <Button variant="secondary" size="sm" disabled={busy} onClick={() => handleExclude(txn)}>
+              Exclude
+            </Button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 flex-wrap">
+            <Select
+              className="min-w-[260px]"
+              value={rowCandidateId[txn.id] ?? candidates[0].entryId}
+              onChange={(e) =>
+                setRowCandidateId((prev) => ({ ...prev, [txn.id]: e.target.value }))
+              }
+            >
+              {candidates.map((c) => (
+                <option key={c.entryId} value={c.entryId}>
+                  #{c.entryNumber} · {formatDate(c.date)} · {c.description}
+                  {c.reference ? ` · Ref ${c.reference}` : ''} · {c.confidence} match
+                </option>
+              ))}
+            </Select>
+            {selectedCandidate && <ConfidenceBadge c={selectedCandidate} />}
+            <Button size="sm" loading={busy} onClick={() => handleMatch(txn)}>
+              Confirm Match
+            </Button>
+            <Button variant="secondary" size="sm" disabled={busy} onClick={() => handleExclude(txn)}>
+              Exclude
+            </Button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  function renderStatusCell(txn: BankTransaction) {
+    if (txn.matched) {
+      return (
+        <span className="inline-flex items-center gap-1 text-emerald text-sm font-semibold">
+          <CheckCircle className="h-4 w-4" />
+          Matched
+        </span>
+      );
+    }
+    if (txn.excluded) return <Badge tone="neutral">Excluded</Badge>;
+    const candidates = rowCandidates[txn.id] ?? [];
+    const high = candidates.filter((c) => c.confidence === 'high');
+    if (high.length === 1) {
+      return (
+        <span className="inline-flex items-center gap-1 text-sm font-semibold text-electric">
+          <Link2 className="h-4 w-4" />
+          Match found
+        </span>
+      );
+    }
+    if (txn.suggestedAccountId) return <Badge tone="info">Suggested</Badge>;
+    return <Badge tone="warning">Review</Badge>;
+  }
 
   // ------------------------------------------------------------------
   // Render
@@ -200,7 +477,6 @@ export default function BankReviewPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
       <PageHeader title="Bank Review" icon={CreditCard} />
 
       {/* ------------------------------------------------------------------ */}
@@ -211,7 +487,9 @@ export default function BankReviewPage() {
           <div className="flex-1 min-w-[240px]">
             <Label htmlFor="bank-account-select">Bank Account</Label>
             {loadingBankAccounts ? (
-              <p className="text-sm text-navy/50 mt-1">Loading…</p>
+              <div className="py-2 flex">
+                <Spinner className="text-electric" />
+              </div>
             ) : (
               <Select
                 id="bank-account-select"
@@ -219,6 +497,9 @@ export default function BankReviewPage() {
                 onChange={(e) => {
                   setSelectedBankAccountId(e.target.value);
                   setRowAccountId({});
+                  setRowMode({});
+                  setRowCandidates({});
+                  setRowCandidateId({});
                 }}
               >
                 {bankAccounts.length === 0 && (
@@ -254,12 +535,23 @@ export default function BankReviewPage() {
           </div>
         </div>
 
-        {/* Summary badges */}
+        {/* Filter tabs */}
         {transactions.length > 0 && (
-          <div className="flex gap-3 mt-4">
-            <Badge tone="neutral">{transactions.length} total</Badge>
-            <Badge tone="warning">{unmatchedCount} to review</Badge>
-            <Badge tone="success">{matchedCount} added</Badge>
+          <div className="flex gap-2 mt-4">
+            {tabs.map((t) => (
+              <button
+                key={t.key}
+                type="button"
+                onClick={() => setTab(t.key)}
+                className={`px-3 py-1.5 rounded-md text-sm font-semibold border ${
+                  tab === t.key
+                    ? 'bg-navy text-white border-navy'
+                    : 'bg-white text-navy/70 border-navy/20 hover:bg-navy/5'
+                }`}
+              >
+                {t.label} ({t.count})
+              </button>
+            ))}
           </div>
         )}
       </Card>
@@ -268,44 +560,64 @@ export default function BankReviewPage() {
       {/* Transactions table                                                   */}
       {/* ------------------------------------------------------------------ */}
       <Card className="p-6">
-        <h2 className="text-lg font-bold text-navy mb-4">Transactions</h2>
+        <h2 className="text-lg font-bold text-navy mb-4">
+          {tabs.find((t) => t.key === tab)?.label ?? 'Transactions'}
+        </h2>
 
         {loadingTxns ? (
-          <p className="text-sm text-navy/50 py-6 text-center">Loading transactions…</p>
+          <div className="py-10 flex justify-center">
+            <Spinner className="text-electric" />
+          </div>
         ) : !selectedBankAccountId ? (
           <p className="text-sm text-navy/50 py-6 text-center">
             Select a bank account above to review transactions.
           </p>
-        ) : transactions.length === 0 ? (
-          <p className="text-sm text-navy/50 py-6 text-center">
-            No staged transactions. Import a bank file in the Banking page first.
-          </p>
+        ) : visible.length === 0 ? (
+          <EmptyState
+            icon={Inbox}
+            title={
+              tab === 'unreviewed'
+                ? 'Nothing to review'
+                : tab === 'matched'
+                  ? 'No matched or added transactions yet'
+                  : 'No excluded transactions'
+            }
+            message={
+              tab === 'unreviewed'
+                ? 'Import a bank file in the Banking page first.'
+                : undefined
+            }
+            action={
+              tab === 'unreviewed' ? (
+                <Link
+                  href="/banking"
+                  className="inline-flex items-center justify-center gap-2 rounded-lg font-semibold bg-electric text-white hover:bg-electric/90 shadow-sm px-4 py-2 text-sm"
+                >
+                  Import Transactions
+                </Link>
+              ) : undefined
+            }
+          />
         ) : (
           <Table>
             <thead>
               <Tr>
                 <Th>Date</Th>
                 <Th>Description / Payee</Th>
-                <Th className="text-right">Amount</Th>
-                <Th>Category Account</Th>
+                <Th numeric>Amount</Th>
+                <Th>{tab === 'unreviewed' ? 'Action — Add / Match / Exclude' : 'Action'}</Th>
                 <Th className="text-center">Status</Th>
               </Tr>
             </thead>
             <tbody>
-              {transactions.map((txn) => {
-                const isMatched = txn.matched;
+              {visible.map((txn) => {
                 const amt = parseFloat(txn.amount);
                 const amtPositive = amt >= 0;
 
                 return (
-                  <Tr
-                    key={txn.id}
-                    className={isMatched ? 'opacity-60' : undefined}
-                  >
+                  <Tr key={txn.id} className={txn.matched ? 'opacity-70' : undefined}>
                     {/* Date */}
-                    <Td className="whitespace-nowrap text-sm font-mono">
-                      {new Date(txn.date).toLocaleDateString()}
-                    </Td>
+                    <Td className="whitespace-nowrap text-sm">{formatDate(txn.date)}</Td>
 
                     {/* Description */}
                     <Td>
@@ -318,71 +630,24 @@ export default function BankReviewPage() {
                     </Td>
 
                     {/* Amount */}
-                    <Td className="text-right whitespace-nowrap">
+                    <Td numeric className="whitespace-nowrap">
                       <span
-                        className={`font-mono text-sm font-semibold ${
+                        className={`text-sm font-semibold ${
                           amtPositive ? 'text-emerald' : 'text-red-500'
                         }`}
                       >
                         {formatCurrency(Math.abs(amt))}
-                        {amtPositive ? (
-                          <span className="ml-1 text-xs font-normal text-navy/40">IN</span>
-                        ) : (
-                          <span className="ml-1 text-xs font-normal text-navy/40">OUT</span>
-                        )}
+                        <span className="ml-1 text-xs font-normal text-navy/40">
+                          {amtPositive ? 'IN' : 'OUT'}
+                        </span>
                       </span>
                     </Td>
 
-                    {/* Category Select + Add button */}
-                    <Td>
-                      {isMatched ? (
-                        <span className="text-sm text-navy/50">
-                          {allAccounts.find((a) => a.id === txn.suggestedAccountId)?.name ??
-                            'Categorized'}
-                        </span>
-                      ) : (
-                        <div className="flex items-center gap-2">
-                          <Select
-                            className="min-w-[180px]"
-                            value={rowAccountId[txn.id] ?? ''}
-                            onChange={(e) =>
-                              setRowAccountId((prev) => ({
-                                ...prev,
-                                [txn.id]: e.target.value,
-                              }))
-                            }
-                          >
-                            <option value="">Select account…</option>
-                            {allAccounts.map((a) => (
-                              <option key={a.id} value={a.id}>
-                                {a.code} — {a.name}
-                              </option>
-                            ))}
-                          </Select>
-                          <Button
-                            size="sm"
-                            disabled={addingId === txn.id || !rowAccountId[txn.id]}
-                            onClick={() => handleAdd(txn)}
-                          >
-                            {addingId === txn.id ? 'Adding…' : 'Add'}
-                          </Button>
-                        </div>
-                      )}
-                    </Td>
+                    {/* Action */}
+                    <Td>{renderActionCell(txn)}</Td>
 
                     {/* Status */}
-                    <Td className="text-center">
-                      {isMatched ? (
-                        <span className="inline-flex items-center gap-1 text-emerald text-sm font-semibold">
-                          <CheckCircle className="h-4 w-4" />
-                          Added
-                        </span>
-                      ) : txn.suggestedAccountId ? (
-                        <Badge tone="info">Suggested</Badge>
-                      ) : (
-                        <Badge tone="warning">Review</Badge>
-                      )}
-                    </Td>
+                    <Td className="text-center">{renderStatusCell(txn)}</Td>
                   </Tr>
                 );
               })}

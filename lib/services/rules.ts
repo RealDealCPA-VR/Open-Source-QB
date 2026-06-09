@@ -152,29 +152,49 @@ function matchesOperator(value: string, operator: MatchOperator, pattern: string
   }
 }
 
+/** The actionable fields of the highest-priority rule that matched a transaction. */
+export interface MatchedRule {
+  setAccountId: string | null;
+  setPayee: string | null;
+}
+
 /**
- * Run all active rules against a single bank transaction.
- * Returns the setAccountId from the highest-priority matching rule, or null if none match.
+ * Run all active rules against a single bank transaction and return the actionable
+ * fields (setAccountId AND setPayee) of the highest-priority matching rule, or null
+ * if none match.
  *
  * Rules are fetched fresh from the DB on each call so that changes take effect immediately.
  * For bulk imports, prefer loading rules once and passing them in (see importTransactions).
  */
-export async function applyRules(
+export async function matchRule(
   ctx: ServiceContext,
   txn: BankTxnForRules,
   /** Pre-fetched rules (optional — avoids repeated DB queries during bulk import). */
   rules?: Awaited<ReturnType<typeof listRules>>,
-): Promise<string | null> {
+): Promise<MatchedRule | null> {
   const ruleList = rules ?? (await listRules(ctx));
   for (const rule of ruleList) {
     const field = rule.matchField as MatchField;
     const operator = rule.matchOperator as MatchOperator;
     const value = fieldValue(txn, field);
     if (matchesOperator(value, operator, rule.matchValue)) {
-      return rule.setAccountId ?? null;
+      return { setAccountId: rule.setAccountId ?? null, setPayee: rule.setPayee ?? null };
     }
   }
   return null;
+}
+
+/**
+ * Back-compat convenience over `matchRule`: returns only the setAccountId from the
+ * highest-priority matching rule, or null if none match.
+ */
+export async function applyRules(
+  ctx: ServiceContext,
+  txn: BankTxnForRules,
+  rules?: Awaited<ReturnType<typeof listRules>>,
+): Promise<string | null> {
+  const match = await matchRule(ctx, txn, rules);
+  return match?.setAccountId ?? null;
 }
 
 /**
@@ -203,11 +223,19 @@ export async function applyRulesToAccount(
 
   let updated = 0;
   for (const txn of txns) {
-    const accountId = await applyRules(ctx, { description: txn.description, payee: txn.payee, amount: txn.amount }, rules);
-    if (accountId && accountId !== txn.suggestedAccountId) {
+    const match = await matchRule(ctx, { description: txn.description, payee: txn.payee, amount: txn.amount }, rules);
+    if (!match) continue;
+    const set: { suggestedAccountId?: string; payee?: string } = {};
+    if (match.setAccountId && match.setAccountId !== txn.suggestedAccountId) {
+      set.suggestedAccountId = match.setAccountId;
+    }
+    if (match.setPayee && match.setPayee !== txn.payee) {
+      set.payee = match.setPayee;
+    }
+    if (Object.keys(set).length > 0) {
       await ctx.db
         .update(bankTransactions)
-        .set({ suggestedAccountId: accountId })
+        .set(set)
         .where(eq(bankTransactions.id, txn.id));
       updated += 1;
     }

@@ -10,12 +10,13 @@
  *  - All queries are scoped to ctx.companyId.
  *  - Rate fallback: entry.rate → service item salesPrice → 0.
  */
-import { and, eq, isNull } from 'drizzle-orm';
+import { and, eq, inArray, isNull } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
 import { timeEntries, customers, items } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
+  inTransaction,
   notFound,
   validation,
   writeAudit,
@@ -287,20 +288,36 @@ export async function billTimeToInvoice(
     };
   });
 
-  // Create the invoice (posts GL internally).
-  const invoice = await createInvoice(ctx, {
-    customerId,
-    date: new Date(),
-    lines,
-  });
-
-  // Stamp invoicedInvoiceId on all billed entries.
-  for (const e of entries) {
-    await ctx.db
-      .update(timeEntries)
-      .set({ invoicedInvoiceId: invoice.id })
-      .where(and(eq(timeEntries.companyId, ctx.companyId), eq(timeEntries.id, e.id)));
+  // Refuse to bill a fully un-priced batch — it would silently post a $0 invoice. (Mixed
+  // batches still bill; this guards the degenerate all-zero case identified by the audit.)
+  const subtotal = lines.reduce(
+    (sum, l) => sum.plus(Money.mul(l.quantity, l.rate)),
+    Money.zero(),
+  );
+  if (!subtotal.greaterThan(0)) {
+    throw new ServiceError(
+      'VALIDATION',
+      'These time entries have no rate (and no priced service item). Set a rate before billing.',
+    );
   }
 
-  return invoice;
+  // Create the invoice and stamp the billed entries in ONE transaction, so a failure can't
+  // leave a posted invoice with time entries still flagged unbilled (double-billing risk).
+  return inTransaction(ctx, async (tx) => {
+    const invoice = await createInvoice(tx, {
+      customerId,
+      date: new Date(),
+      lines,
+    });
+    await tx.db
+      .update(timeEntries)
+      .set({ invoicedInvoiceId: invoice.id })
+      .where(
+        and(
+          eq(timeEntries.companyId, ctx.companyId),
+          inArray(timeEntries.id, entries.map((e) => e.id)),
+        ),
+      );
+    return invoice;
+  });
 }

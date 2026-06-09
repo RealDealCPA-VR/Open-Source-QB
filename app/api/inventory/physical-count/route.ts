@@ -10,6 +10,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { physicalCount } from '@/lib/services/inventoryOps';
+import { assertPhysicalCountable } from '@/lib/services/inventory';
 import { ServiceError } from '@/lib/services/_base';
 
 function serviceErrorToResponse(err: ServiceError): NextResponse {
@@ -49,6 +50,11 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     if (!date) {
       return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
     }
+
+    // physicalCount is an average-cost operation: reject non-inventory item
+    // types and FIFO-tracked items (their stock lives in inventoryLayers and
+    // must be counted through the FIFO endpoints) before posting anything.
+    await assertPhysicalCountable(ctx, itemId);
 
     const result = await physicalCount(ctx, {
       itemId,

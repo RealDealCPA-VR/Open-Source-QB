@@ -18,6 +18,17 @@ export interface TrialBalanceRow {
 
 const DEBIT_NORMAL = new Set(['asset', 'expense']);
 
+/**
+ * SQL condition excluding year-end closing entries (sourceRef 'fiscal-close:<year>').
+ * Closing entries zero P&L accounts into Retained Earnings; they must be excluded
+ * from income-statement reports (P&L and derivatives) so closed-year history is
+ * preserved, but kept in balance-sheet/trial-balance/GL views so Retained Earnings
+ * stays correct after the close.
+ */
+export function notFiscalCloseEntry() {
+  return sql`(${journalEntries.sourceRef} IS NULL OR ${journalEntries.sourceRef} NOT LIKE 'fiscal-close:%')`;
+}
+
 /** Aggregate posted debits/credits per account up to an optional date. */
 async function accountActivity(ctx: ServiceContext, asOf?: Date) {
   // Only include posted entries — explicitly exclude draft and void.
@@ -104,6 +115,8 @@ export async function profitAndLoss(
   const conds = [
     eq(journalEntries.companyId, ctx.companyId),
     eq(journalEntries.status, 'posted'),
+    // Year-end closing entries must not wipe out closed-year P&L history.
+    notFiscalCloseEntry(),
   ];
   if (range?.from) conds.push(sql`${journalEntries.date} >= ${range.from}`);
   if (range?.to) conds.push(lte(journalEntries.date, range.to));

@@ -66,8 +66,8 @@ export default function LoginPage() {
               />
             </div>
           )}
-          <Button type="submit" className="w-full" disabled={busy}>
-            {busy ? 'Signing in…' : needs2fa ? 'Verify & sign in' : 'Sign in'}
+          <Button type="submit" className="w-full" loading={busy}>
+            {needs2fa ? 'Verify & sign in' : 'Sign in'}
           </Button>
         </form>
         <p className="mt-4 text-center text-sm">

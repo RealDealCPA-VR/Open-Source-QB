@@ -15,8 +15,9 @@ export async function POST(req: NextRequest) {
   for (const emp of matches) {
     if (emp.portalPasswordHash && emp.isActive && (await verifyPassword(password, emp.portalPasswordHash))) {
       const res = NextResponse.json({ id: emp.id, name: `${emp.firstName} ${emp.lastName}` });
-      res.cookies.set(PORTAL_COOKIE, createSessionToken(emp.id), {
+      res.cookies.set(PORTAL_COOKIE, createSessionToken(emp.id, 'portal'), {
         httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
         sameSite: 'lax',
         path: '/',
         maxAge: 60 * 60 * 24 * 30,

@@ -6,7 +6,13 @@
  */
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
-import { accounts, journalEntries, journalEntryLines } from '@/lib/db/schema';
+import {
+  accounts,
+  journalEntries,
+  journalEntryLines,
+  reconciliationItems,
+  reconciliations,
+} from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
@@ -59,8 +65,10 @@ export function assertBalanced(lines: PostingLine[]): { totalDebit: string; tota
   let totalDebit = Money.zero();
   let totalCredit = Money.zero();
   for (const [i, line] of lines.entries()) {
-    const d = Money.of(line.debit);
-    const c = Money.of(line.credit);
+    // Round each line to 2dp BEFORE summing — this is exactly how lines are persisted,
+    // so the balance check matches the stored ledger rather than the raw inputs.
+    const d = Money.round2(line.debit);
+    const c = Money.round2(line.credit);
     if (d.isNegative() || c.isNegative()) {
       throw validation(`Line ${i + 1}: debit/credit cannot be negative.`);
     }
@@ -73,7 +81,9 @@ export function assertBalanced(lines: PostingLine[]): { totalDebit: string; tota
     totalDebit = totalDebit.plus(d);
     totalCredit = totalCredit.plus(c);
   }
-  if (!Money.equalWithinCent(totalDebit, totalCredit)) {
+  // Exact equality of the 2dp totals (no sub-cent tolerance) — a rounded entry that does
+  // not net to zero must never persist. Callers must pre-allocate pennies (see money.allocate).
+  if (!Money.eq(totalDebit, totalCredit)) {
     throw new ServiceError(
       'UNBALANCED',
       `Entry is out of balance: debits ${toAmountString(totalDebit)} ≠ credits ${toAmountString(
@@ -121,23 +131,28 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
         description: input.description,
         reference: input.reference ?? null,
         status,
+        sourceRef: input.sourceRef ?? null,
         createdBy: tx.userId ?? '00000000-0000-0000-0000-000000000000',
       })
       .returning();
 
+    // Canonical 2dp line values. Use this SAME array for the row insert AND the cached
+    // balance deltas, so account.balance is derived from the identical rounded amounts that
+    // are stored on the journal lines (no sub-cent drift between cache and ledger truth).
+    const normalizedLines = input.lines.map((l) => ({
+      accountId: l.accountId,
+      debit: l.debit != null && Money.gt(l.debit, 0) ? toAmountString(l.debit) : null,
+      credit: l.credit != null && Money.gt(l.credit, 0) ? toAmountString(l.credit) : null,
+      memo: l.memo ?? null,
+      classId: l.classId ?? null,
+    }));
+
     await tx.db.insert(journalEntryLines).values(
-      input.lines.map((l) => ({
-        journalEntryId: entry.id,
-        accountId: l.accountId,
-        debit: l.debit != null && Money.gt(l.debit, 0) ? toAmountString(l.debit) : null,
-        credit: l.credit != null && Money.gt(l.credit, 0) ? toAmountString(l.credit) : null,
-        memo: l.memo ?? null,
-        classId: l.classId ?? null,
-      })),
+      normalizedLines.map((l) => ({ journalEntryId: entry.id, ...l })),
     );
 
     if (status === 'posted') {
-      await applyBalanceDeltas(tx, input.lines, typeById, 1);
+      await applyBalanceDeltas(tx, normalizedLines, typeById, 1);
     }
 
     await writeAudit(tx, {
@@ -166,6 +181,35 @@ export async function voidJournalEntry(ctx: ServiceContext, entryId: string) {
       .select()
       .from(journalEntryLines)
       .where(eq(journalEntryLines.journalEntryId, entryId));
+
+    // Guard: a line that was cleared in a COMPLETED reconciliation must not be voided.
+    // The next reconciliation seeds its opening from bankAccounts.lastReconciledBalance,
+    // which still includes the line — voiding it would silently corrupt that opening
+    // balance with no detection or repair path.
+    const lineIds = lines.map((l) => l.id);
+    if (lineIds.length > 0) {
+      const [reconciled] = await tx.db
+        .select({ id: reconciliationItems.id })
+        .from(reconciliationItems)
+        .innerJoin(
+          reconciliations,
+          eq(reconciliationItems.reconciliationId, reconciliations.id),
+        )
+        .where(
+          and(
+            inArray(reconciliationItems.journalEntryLineId, lineIds),
+            eq(reconciliationItems.isCleared, true),
+            eq(reconciliations.status, 'completed'),
+          ),
+        )
+        .limit(1);
+      if (reconciled) {
+        throw new ServiceError(
+          'CONFLICT',
+          'This entry contains lines cleared in a completed bank reconciliation and cannot be voided. Undo the reconciliation first.',
+        );
+      }
+    }
 
     const accountIds = [...new Set(lines.map((l) => l.accountId))];
     const accountRows = await tx.db

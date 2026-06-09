@@ -8,10 +8,12 @@
  * understand exactly how cash income/expenses differ from accrual.
  */
 import * as React from 'react';
-import { formatCurrency } from '@/lib/money';
+import { Wallet } from 'lucide-react';
+import { formatCurrency, Money, toAmountString } from '@/lib/money';
 import { api } from '@/lib/client';
-import { PageHeader, Card } from '@/components/ui';
+import { Button, Card, PageHeader, toast } from '@/components/ui';
 import type { ProfitAndLossCashBasis } from '@/lib/services/cashBasisReports';
+import { RangeControls } from '../_components/shared';
 
 // ---- Section sub-component ----
 function Section({
@@ -60,7 +62,7 @@ function Section({
         </td>
       </tr>
       {/* AR / AP adjustment row */}
-      <tr className={`text-sm ${adjustAmt !== 0 ? 'text-amber-700' : 'text-navy/40'}`}>
+      <tr className={`text-sm ${adjustAmt !== 0 ? 'text-gold' : 'text-navy/40'}`}>
         <td className="py-1 px-3 pl-8 italic">{adjustmentLabel}</td>
         <td className="py-1 px-3 text-right tabular-nums italic">
           {adjustAmt !== 0 ? `(${formatCurrency(Math.abs(adjustAmt))})` : formatCurrency(0)}
@@ -95,7 +97,9 @@ export default function ProfitLossCashPage() {
       const data = await api.get<ProfitAndLossCashBasis>(url);
       setReport(data);
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Failed to load report');
+      const msg = e instanceof Error ? e.message : 'Failed to load report';
+      setError(msg);
+      toast(msg, 'danger');
     } finally {
       setLoading(false);
     }
@@ -109,7 +113,7 @@ export default function ProfitLossCashPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader title="Profit & Loss (Cash Basis)" />
+      <PageHeader title="Profit & Loss (Cash Basis)" icon={Wallet} />
 
       {/* Explainer banner */}
       <Card className="mb-6 p-4 border-l-4 border-electric bg-electric/5 max-w-3xl">
@@ -134,39 +138,27 @@ export default function ProfitLossCashPage() {
       </Card>
 
       {/* Date range controls */}
-      <div className="flex gap-4 items-end mb-6 max-w-3xl">
-        <div>
-          <label className="block text-xs font-medium text-navy/60 mb-1">From</label>
-          <input
-            type="date"
-            value={from}
-            onChange={(e) => setFrom(e.target.value)}
-            className="rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy outline-none focus:border-electric focus:ring-2 focus:ring-electric/30"
-          />
-        </div>
-        <div>
-          <label className="block text-xs font-medium text-navy/60 mb-1">To</label>
-          <input
-            type="date"
-            value={to}
-            onChange={(e) => setTo(e.target.value)}
-            className="rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy outline-none focus:border-electric focus:ring-2 focus:ring-electric/30"
-          />
-        </div>
-        <button
-          onClick={() => void fetchReport()}
-          className="rounded-lg bg-electric text-white px-4 py-2 text-sm font-semibold hover:bg-electric/90 transition-colors"
-        >
-          Refresh
-        </button>
-      </div>
+      <Card className="p-4 mb-6 max-w-3xl">
+        <RangeControls
+          from={from}
+          to={to}
+          onFrom={setFrom}
+          onTo={setTo}
+          onRun={() => void fetchReport()}
+        />
+      </Card>
 
       {/* Report table */}
       {loading && (
         <p className="text-navy/50 text-sm">Loading...</p>
       )}
-      {error && (
-        <p className="text-red-600 text-sm">{error}</p>
+      {error && !loading && (
+        <div className="flex items-center gap-3">
+          <p className="text-red-600 text-sm">{error}</p>
+          <Button variant="secondary" size="sm" onClick={() => void fetchReport()}>
+            Retry
+          </Button>
+        </div>
       )}
       {!loading && !error && report && (
         <Card className="p-6 max-w-3xl">
@@ -175,11 +167,7 @@ export default function ProfitLossCashPage() {
               <Section
                 title="Income"
                 lines={report.income}
-                accrualTotal={
-                  toAmountString(
-                    report.income.reduce((s, l) => s + parseFloat(l.amount), 0),
-                  )
-                }
+                accrualTotal={toAmountString(Money.add(...report.income.map((l) => l.amount)))}
                 adjustment={report.arAdjustment}
                 adjustmentLabel={`AR adjustment (increase in receivables: ${formatCurrency(report.arAdjustment)})`}
                 cashTotal={report.totalIncome}
@@ -190,11 +178,7 @@ export default function ProfitLossCashPage() {
               <Section
                 title="Expenses"
                 lines={report.expenses}
-                accrualTotal={
-                  toAmountString(
-                    report.expenses.reduce((s, l) => s + parseFloat(l.amount), 0),
-                  )
-                }
+                accrualTotal={toAmountString(Money.add(...report.expenses.map((l) => l.amount)))}
                 adjustment={report.apAdjustment}
                 adjustmentLabel={`AP adjustment (increase in payables: ${formatCurrency(report.apAdjustment)})`}
                 cashTotal={report.totalExpenses}
@@ -226,9 +210,4 @@ export default function ProfitLossCashPage() {
       )}
     </main>
   );
-}
-
-// Utility: keeps the amount string calculation in client-side component without importing server-only modules.
-function toAmountString(n: number): string {
-  return n.toFixed(2);
 }

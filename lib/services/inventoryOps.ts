@@ -23,6 +23,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { assertNotFifoTracked } from './inventory';
 import { postJournalEntry } from './posting';
 
 // ---------------------------------------------------------------------------
@@ -201,6 +202,17 @@ export async function physicalCount(
   }
 
   const item = await loadInventoryItem(ctx, input.itemId);
+
+  // Defense-in-depth: the API route already guards via assertPhysicalCountable,
+  // but protect direct programmatic callers too. Physical counts are an
+  // average-cost operation on stock-tracked items only.
+  if (item.type !== 'inventory') {
+    throw validation(
+      `Physical counts can only be recorded for inventory-type items; "${item.name}" is type "${item.type}".`,
+    );
+  }
+  await assertNotFifoTracked(ctx, item.id);
+
   const currentQty = Money.of(item.quantityOnHand ?? '0');
   const avgCost = Money.of(item.averageCost ?? '0');
 

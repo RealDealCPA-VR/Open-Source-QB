@@ -7,12 +7,15 @@
  * - "FX Adjustment" modal: pick a GL account, enter amount, choose gain/loss, pick date.
  */
 import { useState, useEffect, useCallback } from 'react';
+import { Coins } from 'lucide-react';
 import {
   Button,
   Card,
   Input,
   Label,
   Modal,
+  EmptyState,
+  Spinner,
   PageHeader,
   Select,
   Table,
@@ -24,6 +27,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/dates';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -110,8 +114,8 @@ function CurrencyModal({
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
-          <Button onClick={handleSave} disabled={saving}>
-            {saving ? 'Saving…' : 'Save'}
+          <Button onClick={handleSave} loading={saving}>
+            Save
           </Button>
         </>
       }
@@ -123,6 +127,7 @@ function CurrencyModal({
             id="cur-code"
             placeholder="e.g. EUR"
             maxLength={3}
+            autoFocus={!initial}
             value={code}
             onChange={(e) => setCode(e.target.value.toUpperCase())}
             disabled={!!initial}
@@ -134,6 +139,7 @@ function CurrencyModal({
           <Input
             id="cur-name"
             placeholder="e.g. Euro"
+            autoFocus={!!initial}
             value={name}
             onChange={(e) => setName(e.target.value)}
           />
@@ -237,8 +243,8 @@ function FxAdjustmentModal({
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
-          <Button onClick={handleSave} disabled={saving}>
-            {saving ? 'Posting…' : 'Post Entry'}
+          <Button onClick={handleSave} loading={saving}>
+            Post Entry
           </Button>
         </>
       }
@@ -380,6 +386,7 @@ export default function CurrenciesPage() {
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
         title="Currencies"
+        icon={Coins}
         action={
           <div className="flex gap-2">
             <Button
@@ -407,13 +414,18 @@ export default function CurrenciesPage() {
 
       <Card className="p-0 overflow-hidden">
         {loading && (
-          <div className="py-16 text-center text-navy/40">Loading currencies…</div>
+          <div className="py-16 flex justify-center text-electric">
+            <Spinner className="h-6 w-6" />
+          </div>
         )}
 
         {!loading && currencies.length === 0 && (
-          <div className="py-16 text-center text-navy/40">
-            No currencies configured yet. Add a base currency to get started.
-          </div>
+          <EmptyState
+            icon={Coins}
+            title="No currencies configured yet"
+            message="Add a base currency to get started with multi-currency."
+            action={<Button onClick={openAdd}>Add Currency</Button>}
+          />
         )}
 
         {!loading && currencies.length > 0 && (
@@ -422,10 +434,10 @@ export default function CurrenciesPage() {
               <tr>
                 <Th>Code</Th>
                 <Th>Name</Th>
-                <Th className="text-right">Rate to Base</Th>
+                <Th numeric>Rate to Base</Th>
                 <Th>Status</Th>
                 <Th>Last Updated</Th>
-                <Th />
+                <Th className="text-right">Actions</Th>
               </tr>
             </thead>
             <tbody>
@@ -433,7 +445,7 @@ export default function CurrenciesPage() {
                 <Tr key={cur.id}>
                   <Td className="font-mono font-bold text-navy">{cur.code}</Td>
                   <Td>{cur.name}</Td>
-                  <Td className="text-right tabular-nums">
+                  <Td numeric>
                     {cur.isBase ? (
                       <span className="text-navy/40">1.00000000 (base)</span>
                     ) : (
@@ -448,9 +460,9 @@ export default function CurrenciesPage() {
                     )}
                   </Td>
                   <Td className="text-navy/50 text-xs">
-                    {new Date(cur.updatedAt).toLocaleDateString()}
+                    {formatDate(cur.updatedAt)}
                   </Td>
-                  <Td>
+                  <Td className="text-right">
                     <Button
                       variant="ghost"
                       size="sm"

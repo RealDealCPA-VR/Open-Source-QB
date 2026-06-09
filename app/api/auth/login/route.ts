@@ -44,7 +44,7 @@ export async function POST(req: NextRequest) {
   }
 
   const res = NextResponse.json({ id: user.id, name: user.name, email: user.email, companyId });
-  const opts = { httpOnly: true, sameSite: 'lax' as const, path: '/', maxAge: 60 * 60 * 24 * 30 };
+  const opts = { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax' as const, path: '/', maxAge: 60 * 60 * 24 * 30 };
   res.cookies.set(SESSION_COOKIE, createSessionToken(user.id), opts);
   if (companyId) res.cookies.set(COMPANY_COOKIE, companyId, opts);
   return res;

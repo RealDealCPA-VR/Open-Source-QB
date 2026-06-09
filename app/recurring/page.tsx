@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { RefreshCw, Plus, Play, Clock } from 'lucide-react';
+import { Repeat, Plus, Play, Clock } from 'lucide-react';
 import {
   Button,
   Card,
@@ -14,11 +14,14 @@ import {
   Td,
   Tr,
   Modal,
+  ConfirmDialog,
+  EmptyState,
+  Spinner,
   PageHeader,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { formatDate } from '@/lib/dates';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -43,6 +46,22 @@ interface GeneratedDoc {
   templateName: string;
   docType: DocType;
   docId: string;
+}
+
+interface CustomerOption {
+  id: string;
+  name: string;
+}
+
+interface VendorOption {
+  id: string;
+  name: string;
+}
+
+interface AccountOption {
+  id: string;
+  code: string;
+  name: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -72,15 +91,6 @@ const DOC_BADGES: Record<DocType, { label: string; tone: 'neutral' | 'success' |
 // Helpers
 // ---------------------------------------------------------------------------
 
-function formatDate(iso: string | null): string {
-  if (!iso) return '-';
-  return new Date(iso).toLocaleDateString(undefined, {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-  });
-}
-
 function todayIso(): string {
   return new Date().toISOString().split('T')[0];
 }
@@ -99,7 +109,12 @@ interface TemplateFormState {
   lineDesc: string;
   lineQty: string;
   lineRate: string;
-  // Raw JSON for bill / journal_entry
+  // Bill-specific guided fields
+  vendorId: string;
+  billAccountId: string;
+  billLineDesc: string;
+  billAmount: string;
+  // Raw JSON for journal_entry
   rawJson: string;
 }
 
@@ -112,13 +127,17 @@ const EMPTY_FORM: TemplateFormState = {
   lineDesc: 'Services rendered',
   lineQty: '1',
   lineRate: '0.00',
+  vendorId: '',
+  billAccountId: '',
+  billLineDesc: '',
+  billAmount: '0.00',
   rawJson: '{}',
 };
 
 function buildTemplatePayload(form: TemplateFormState): Record<string, unknown> {
   if (form.docType === 'invoice') {
     return {
-      customerId: form.customerId.trim(),
+      customerId: form.customerId,
       date: form.nextRunDate,
       lines: [
         {
@@ -129,7 +148,20 @@ function buildTemplatePayload(form: TemplateFormState): Record<string, unknown> 
       ],
     };
   }
-  // For bill / journal_entry, the user supplies raw JSON
+  if (form.docType === 'bill') {
+    return {
+      vendorId: form.vendorId,
+      date: form.nextRunDate,
+      lines: [
+        {
+          accountId: form.billAccountId,
+          description: form.billLineDesc.trim() || null,
+          amount: form.billAmount || '0.00',
+        },
+      ],
+    };
+  }
+  // For journal_entry, the user supplies raw JSON
   try {
     return JSON.parse(form.rawJson) as Record<string, unknown>;
   } catch {
@@ -144,9 +176,15 @@ function buildTemplatePayload(form: TemplateFormState): Record<string, unknown> 
 function TemplateFormFields({
   form,
   onChange,
+  customers,
+  vendors,
+  accounts,
 }: {
   form: TemplateFormState;
   onChange: (field: keyof TemplateFormState, value: string) => void;
+  customers: CustomerOption[];
+  vendors: VendorOption[];
+  accounts: AccountOption[];
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -155,6 +193,7 @@ function TemplateFormFields({
         <Input
           id="tpl-name"
           placeholder="e.g. Monthly Retainer"
+          autoFocus
           value={form.name}
           onChange={(e) => onChange('name', e.target.value)}
           required
@@ -207,16 +246,24 @@ function TemplateFormFields({
       {form.docType === 'invoice' && (
         <>
           <div>
-            <Label htmlFor="tpl-customerId">Customer ID *</Label>
-            <Input
+            <Label htmlFor="tpl-customerId">Customer *</Label>
+            <Select
               id="tpl-customerId"
-              placeholder="UUID of the customer"
               value={form.customerId}
               onChange={(e) => onChange('customerId', e.target.value)}
-            />
-            <p className="text-xs text-navy/40 mt-1">
-              Paste the customer UUID from the Customers page.
-            </p>
+            >
+              <option value="">— Select customer —</option>
+              {customers.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
+            </Select>
+            {customers.length === 0 && (
+              <p className="text-xs text-navy/40 mt-1">
+                No customers found — create one on the Customers page first.
+              </p>
+            )}
           </div>
           <div>
             <Label htmlFor="tpl-lineDesc">Line Description</Label>
@@ -254,8 +301,69 @@ function TemplateFormFields({
         </>
       )}
 
-      {/* Raw JSON for bill / journal_entry */}
-      {form.docType !== 'invoice' && (
+      {/* Guided bill fields */}
+      {form.docType === 'bill' && (
+        <>
+          <div>
+            <Label htmlFor="tpl-vendorId">Vendor *</Label>
+            <Select
+              id="tpl-vendorId"
+              value={form.vendorId}
+              onChange={(e) => onChange('vendorId', e.target.value)}
+            >
+              <option value="">— Select vendor —</option>
+              {vendors.map((v) => (
+                <option key={v.id} value={v.id}>
+                  {v.name}
+                </option>
+              ))}
+            </Select>
+            {vendors.length === 0 && (
+              <p className="text-xs text-navy/40 mt-1">
+                No vendors found — create one on the Vendors page first.
+              </p>
+            )}
+          </div>
+          <div>
+            <Label htmlFor="tpl-billAccountId">Expense Account *</Label>
+            <Select
+              id="tpl-billAccountId"
+              value={form.billAccountId}
+              onChange={(e) => onChange('billAccountId', e.target.value)}
+            >
+              <option value="">— Select account —</option>
+              {accounts.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.code} · {a.name}
+                </option>
+              ))}
+            </Select>
+          </div>
+          <div>
+            <Label htmlFor="tpl-billLineDesc">Line Description</Label>
+            <Input
+              id="tpl-billLineDesc"
+              placeholder="e.g. Office rent"
+              value={form.billLineDesc}
+              onChange={(e) => onChange('billLineDesc', e.target.value)}
+            />
+          </div>
+          <div>
+            <Label htmlFor="tpl-billAmount">Amount ($) *</Label>
+            <Input
+              id="tpl-billAmount"
+              type="number"
+              min="0.01"
+              step="0.01"
+              value={form.billAmount}
+              onChange={(e) => onChange('billAmount', e.target.value)}
+            />
+          </div>
+        </>
+      )}
+
+      {/* Raw JSON for journal_entry */}
+      {form.docType === 'journal_entry' && (
         <div>
           <Label htmlFor="tpl-rawJson">
             Template Payload (JSON) *
@@ -264,9 +372,7 @@ function TemplateFormFields({
             id="tpl-rawJson"
             rows={6}
             placeholder={
-              form.docType === 'bill'
-                ? '{\n  "vendorId": "...",\n  "lines": [{ "accountId": "...", "amount": "100.00" }]\n}'
-                : '{\n  "description": "Monthly accrual",\n  "lines": [{ "accountId": "...", "debit": "500.00" }, { "accountId": "...", "credit": "500.00" }]\n}'
+              '{\n  "description": "Monthly accrual",\n  "lines": [{ "accountId": "...", "debit": "500.00" }, { "accountId": "...", "credit": "500.00" }]\n}'
             }
             value={form.rawJson}
             onChange={(e) => onChange('rawJson', e.target.value)}
@@ -289,6 +395,11 @@ export default function RecurringPage() {
   const [templates, setTemplates] = useState<RecurringTemplate[]>([]);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
+
+  // Picker data for guided invoice/bill templates
+  const [customers, setCustomers] = useState<CustomerOption[]>([]);
+  const [vendors, setVendors] = useState<VendorOption[]>([]);
+  const [accounts, setAccounts] = useState<AccountOption[]>([]);
 
   // New template modal
   const [addOpen, setAddOpen] = useState(false);
@@ -317,6 +428,10 @@ export default function RecurringPage() {
 
   useEffect(() => {
     fetchTemplates();
+    // Picker data — each is non-fatal if it fails (selects degrade to empty).
+    api.get<CustomerOption[]>('/api/customers').then(setCustomers).catch(() => {});
+    api.get<VendorOption[]>('/api/vendors').then(setVendors).catch(() => {});
+    api.get<AccountOption[]>('/api/accounts').then(setAccounts).catch(() => {});
   }, []);
 
   // ---------------------------------------------------------------------------
@@ -381,14 +496,28 @@ export default function RecurringPage() {
       toast('Template name is required', 'danger');
       return;
     }
-    if (addForm.docType === 'invoice' && !addForm.customerId.trim()) {
-      toast('Customer ID is required for invoice templates', 'danger');
+    if (addForm.docType === 'invoice' && !addForm.customerId) {
+      toast('Select a customer for invoice templates', 'danger');
       return;
+    }
+    if (addForm.docType === 'bill') {
+      if (!addForm.vendorId) {
+        toast('Select a vendor for bill templates', 'danger');
+        return;
+      }
+      if (!addForm.billAccountId) {
+        toast('Select an expense account for bill templates', 'danger');
+        return;
+      }
+      if (!addForm.billAmount || Number(addForm.billAmount) <= 0) {
+        toast('Bill amount must be greater than zero', 'danger');
+        return;
+      }
     }
 
     const payload = buildTemplatePayload(addForm);
 
-    if (addForm.docType !== 'invoice') {
+    if (addForm.docType === 'journal_entry') {
       try {
         JSON.parse(addForm.rawJson);
       } catch {
@@ -424,17 +553,17 @@ export default function RecurringPage() {
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
         title="Recurring / Memorized Transactions"
-        icon={RefreshCw}
+        icon={Repeat}
         action={
           <div className="flex items-center gap-3">
             <Button
               variant="secondary"
               onClick={handleRunDue}
-              disabled={running}
+              loading={running}
               title="Run all templates that are due today"
             >
               <Play className="h-4 w-4" />
-              {running ? 'Running...' : 'Run Due Now'}
+              Run Due Now
             </Button>
             <Button onClick={openAddModal}>
               <Plus className="h-4 w-4" />
@@ -446,14 +575,20 @@ export default function RecurringPage() {
 
       <Card>
         {loading ? (
-          <div className="p-12 text-center text-navy/40 text-sm">Loading templates...</div>
-        ) : templates.length === 0 ? (
-          <div className="p-12 text-center">
-            <RefreshCw className="mx-auto h-10 w-10 text-navy/20 mb-3" />
-            <p className="text-navy/50 text-sm">
-              No recurring templates yet. Click "New Template" to set up an automated transaction.
-            </p>
+          <div className="p-12 flex justify-center text-electric">
+            <Spinner className="h-6 w-6" />
           </div>
+        ) : templates.length === 0 ? (
+          <EmptyState
+            icon={Repeat}
+            title="No recurring templates yet"
+            message="Set up a template to generate invoices, bills, or journal entries automatically."
+            action={
+              <Button onClick={openAddModal}>
+                <Plus className="h-4 w-4" /> New Template
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -482,7 +617,7 @@ export default function RecurringPage() {
                       <span
                         className={
                           isPastDue && tpl.isActive
-                            ? 'text-amber-600 font-semibold'
+                            ? 'text-gold font-semibold'
                             : 'text-navy/70'
                         }
                       >
@@ -528,47 +663,41 @@ export default function RecurringPage() {
             <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addSaving}>
               Cancel
             </Button>
-            <Button onClick={handleAdd} disabled={addSaving}>
-              {addSaving ? 'Saving...' : 'Create Template'}
+            <Button onClick={handleAdd} loading={addSaving}>
+              Create Template
             </Button>
           </>
         }
       >
-        <TemplateFormFields form={addForm} onChange={updateAddForm} />
+        <TemplateFormFields
+          form={addForm}
+          onChange={updateAddForm}
+          customers={customers}
+          vendors={vendors}
+          accounts={accounts}
+        />
       </Modal>
 
-      {/* ---- Run Now confirm modal ---- */}
-      <Modal
+      {/* ---- Run Now confirm dialog ---- */}
+      <ConfirmDialog
         open={!!runNowTarget}
-        onClose={() => setRunNowTarget(null)}
         title="Run Template Now"
-        footer={
+        message={
           <>
-            <Button
-              variant="secondary"
-              onClick={() => setRunNowTarget(null)}
-              disabled={runNowLoading}
-            >
-              Cancel
-            </Button>
-            <Button onClick={handleRunNow} disabled={runNowLoading}>
-              {runNowLoading ? 'Generating...' : 'Yes, Generate Now'}
-            </Button>
+            Generate one{' '}
+            <strong className="text-navy">
+              {runNowTarget?.docType.replace('_', ' ')}
+            </strong>{' '}
+            from template{' '}
+            <strong className="text-navy">&quot;{runNowTarget?.name}&quot;</strong> immediately?
+            The next run date will be advanced by one {runNowTarget?.frequency} period.
           </>
         }
-      >
-        <p className="text-navy/70 text-sm">
-          Generate one{' '}
-          <strong className="text-navy">
-            {runNowTarget?.docType.replace('_', ' ')}
-          </strong>{' '}
-          from template{' '}
-          <strong className="text-navy">"{runNowTarget?.name}"</strong> immediately?
-          The next run date will be advanced by one {runNowTarget?.frequency} period.
-        </p>
-      </Modal>
-
-      <Toaster />
+        confirmLabel="Yes, Generate Now"
+        loading={runNowLoading}
+        onConfirm={handleRunNow}
+        onClose={() => setRunNowTarget(null)}
+      />
     </main>
   );
 }

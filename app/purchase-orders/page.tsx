@@ -1,14 +1,26 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { ShoppingCart, Plus, PlusCircle, MinusCircle, ArrowRight, Download } from 'lucide-react';
+import {
+  ShoppingCart,
+  Plus,
+  PlusCircle,
+  MinusCircle,
+  ArrowRight,
+  Download,
+  Ban,
+  CheckSquare,
+} from 'lucide-react';
 import {
   Button,
   Card,
+  ConfirmDialog,
+  EmptyState,
   Input,
   Select,
   Label,
   Badge,
+  Spinner,
   Table,
   Th,
   Td,
@@ -19,6 +31,7 @@ import {
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -36,6 +49,14 @@ interface Account {
   type: string;
 }
 
+interface Item {
+  id: string;
+  name: string;
+  type: string;
+}
+
+type PoStatus = 'open' | 'partial' | 'closed' | 'void';
+
 interface PurchaseOrder {
   id: string;
   poNumber: number;
@@ -43,12 +64,29 @@ interface PurchaseOrder {
   date: string;
   expectedDate: string | null;
   total: string;
-  status: 'open' | 'closed' | 'void';
+  status: PoStatus;
   convertedBillId: string | null;
   memo: string | null;
 }
 
+interface PoLine {
+  id: string;
+  itemId: string | null;
+  accountId: string | null;
+  description: string | null;
+  quantity: string;
+  rate: string;
+  amount: string;
+  quantityBilled: string;
+  lineOrder: number;
+}
+
+interface PoDetail extends PurchaseOrder {
+  lines: PoLine[];
+}
+
 interface LineRow {
+  itemId: string;
   accountId: string;
   description: string;
   quantity: string;
@@ -59,15 +97,17 @@ interface LineRow {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function statusTone(status: PurchaseOrder['status']): 'info' | 'success' | 'neutral' {
+function statusTone(status: PoStatus): 'info' | 'success' | 'warning' | 'neutral' {
   if (status === 'open') return 'info';
+  if (status === 'partial') return 'warning';
   if (status === 'closed') return 'success';
   return 'neutral';
 }
 
-function statusLabel(status: PurchaseOrder['status']): string {
+function statusLabel(status: PoStatus): string {
   if (status === 'open') return 'Open';
-  if (status === 'closed') return 'Converted';
+  if (status === 'partial') return 'Partially Billed';
+  if (status === 'closed') return 'Closed';
   return 'Void';
 }
 
@@ -81,7 +121,11 @@ function computeTotal(lines: LineRow[]): number {
   return lines.reduce((sum, l) => sum + computeLineAmount(l), 0);
 }
 
-const EMPTY_LINE: LineRow = { accountId: '', description: '', quantity: '', rate: '' };
+function lineRemaining(line: PoLine): number {
+  return Math.max(0, (parseFloat(line.quantity) || 0) - (parseFloat(line.quantityBilled) || 0));
+}
+
+const EMPTY_LINE: LineRow = { itemId: '', accountId: '', description: '', quantity: '', rate: '' };
 
 // ---------------------------------------------------------------------------
 // New PO Modal
@@ -92,10 +136,11 @@ interface NewPoModalProps {
   onClose: () => void;
   vendors: Vendor[];
   accounts: Account[];
+  items: Item[];
   onCreated: () => void;
 }
 
-function NewPoModal({ open, onClose, vendors, accounts, onCreated }: NewPoModalProps) {
+function NewPoModal({ open, onClose, vendors, accounts, items, onCreated }: NewPoModalProps) {
   const [vendorId, setVendorId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [expectedDate, setExpectedDate] = useState('');
@@ -140,12 +185,14 @@ function NewPoModal({ open, onClose, vendors, accounts, onCreated }: NewPoModalP
   async function handleSubmit() {
     if (!vendorId) { toast('Please select a vendor.', 'danger'); return; }
     if (!date) { toast('Please enter a PO date.', 'danger'); return; }
-    const validLines = lines.filter((l) => l.accountId || l.description || l.quantity || l.rate);
+    const validLines = lines.filter(
+      (l) => l.itemId || l.accountId || l.description || l.quantity || l.rate,
+    );
     if (validLines.length === 0) { toast('Add at least one line item.', 'danger'); return; }
     for (let i = 0; i < validLines.length; i++) {
       const l = validLines[i];
-      if (!l.accountId) {
-        toast(`Line ${i + 1}: please select an account.`, 'danger'); return;
+      if (!l.accountId && !l.itemId) {
+        toast(`Line ${i + 1}: please select an item or an account.`, 'danger'); return;
       }
       if (!l.quantity || parseFloat(l.quantity) <= 0) {
         toast(`Line ${i + 1}: quantity must be a positive number.`, 'danger'); return;
@@ -163,7 +210,8 @@ function NewPoModal({ open, onClose, vendors, accounts, onCreated }: NewPoModalP
         expectedDate: expectedDate || undefined,
         memo: memo || undefined,
         lines: validLines.map((l) => ({
-          accountId: l.accountId,
+          itemId: l.itemId || null,
+          accountId: l.accountId || null,
           description: l.description || null,
           quantity: l.quantity,
           rate: l.rate,
@@ -185,13 +233,14 @@ function NewPoModal({ open, onClose, vendors, accounts, onCreated }: NewPoModalP
       open={open}
       onClose={onClose}
       title="New Purchase Order"
+      size="lg"
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
-          <Button onClick={handleSubmit} disabled={saving}>
-            {saving ? 'Saving…' : 'Create PO'}
+          <Button onClick={handleSubmit} loading={saving}>
+            Create PO
           </Button>
         </>
       }
@@ -202,6 +251,7 @@ function NewPoModal({ open, onClose, vendors, accounts, onCreated }: NewPoModalP
           <Label htmlFor="po-vendor">Vendor *</Label>
           <Select
             id="po-vendor"
+            autoFocus
             value={vendorId}
             onChange={(e) => setVendorId(e.target.value)}
           >
@@ -240,18 +290,15 @@ function NewPoModal({ open, onClose, vendors, accounts, onCreated }: NewPoModalP
         <div>
           <div className="flex items-center justify-between mb-2">
             <Label className="mb-0">Line Items</Label>
-            <button
-              type="button"
-              onClick={addLine}
-              className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
-            >
+            <Button type="button" variant="ghost" size="sm" onClick={addLine}>
               <PlusCircle className="h-4 w-4" /> Add line
-            </button>
+            </Button>
           </div>
 
           <div className="rounded-lg border border-slate-200 overflow-hidden">
             {/* Header row */}
-            <div className="grid grid-cols-[1.4fr_1fr_70px_80px_28px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
+            <div className="grid grid-cols-[1.1fr_1.1fr_1fr_70px_80px_28px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
+              <span>Item</span>
               <span>Account</span>
               <span>Description</span>
               <span>Qty</span>
@@ -262,13 +309,24 @@ function NewPoModal({ open, onClose, vendors, accounts, onCreated }: NewPoModalP
             {lines.map((line, idx) => (
               <div
                 key={idx}
-                className="grid grid-cols-[1.4fr_1fr_70px_80px_28px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
+                className="grid grid-cols-[1.1fr_1.1fr_1fr_70px_80px_28px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
               >
+                <Select
+                  value={line.itemId}
+                  onChange={(e) => updateLine(idx, 'itemId', e.target.value)}
+                >
+                  <option value="">Item…</option>
+                  {items.map((it) => (
+                    <option key={it.id} value={it.id}>
+                      {it.name}
+                    </option>
+                  ))}
+                </Select>
                 <Select
                   value={line.accountId}
                   onChange={(e) => updateLine(idx, 'accountId', e.target.value)}
                 >
-                  <option value="">Account…</option>
+                  <option value="">{line.itemId ? 'Account (optional)…' : 'Account…'}</option>
                   {eligibleAccounts.map((a) => (
                     <option key={a.id} value={a.id}>
                       {a.code} — {a.name}
@@ -334,38 +392,204 @@ function NewPoModal({ open, onClose, vendors, accounts, onCreated }: NewPoModalP
 }
 
 // ---------------------------------------------------------------------------
-// Convert confirmation modal
+// Receive & Bill modal — per-line billed/remaining with quantity inputs
 // ---------------------------------------------------------------------------
 
-interface ConvertModalProps {
-  open: boolean;
-  poNumber: number | null;
-  onConfirm: () => void;
+interface ReceiveBillModalProps {
+  po: PurchaseOrder | null;
   onClose: () => void;
-  converting: boolean;
+  onBilled: () => void;
+  accounts: Account[];
+  items: Item[];
 }
 
-function ConvertModal({ open, poNumber, onConfirm, onClose, converting }: ConvertModalProps) {
+function ReceiveBillModal({ po, onClose, onBilled, accounts, items }: ReceiveBillModalProps) {
+  const [detail, setDetail] = useState<PoDetail | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [billing, setBilling] = useState(false);
+  /** lineId → quantity-to-bill input value */
+  const [qtyInputs, setQtyInputs] = useState<Record<string, string>>({});
+
+  const accountMap = Object.fromEntries(accounts.map((a) => [a.id, `${a.code} — ${a.name}`]));
+  const itemMap = Object.fromEntries(items.map((it) => [it.id, it.name]));
+
+  // Load PO detail (lines with quantityBilled) when the modal opens.
+  useEffect(() => {
+    if (!po) {
+      setDetail(null);
+      setQtyInputs({});
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    api
+      .get<PoDetail>(`/api/purchase-orders/${po.id}`)
+      .then((d) => {
+        if (cancelled) return;
+        setDetail(d);
+        // Default each line's "bill now" quantity to its remaining quantity.
+        setQtyInputs(
+          Object.fromEntries(
+            d.lines.map((l) => [l.id, String(lineRemaining(l))]),
+          ),
+        );
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : 'Failed to load purchase order.';
+        toast(msg, 'danger');
+        onClose();
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [po?.id]);
+
+  const billTotal = detail
+    ? detail.lines.reduce((sum, l) => {
+        const qty = parseFloat(qtyInputs[l.id] ?? '') || 0;
+        return sum + qty * (parseFloat(l.rate) || 0);
+      }, 0)
+    : 0;
+
+  async function handleBill() {
+    if (!po || !detail) return;
+
+    const billLines: { lineId: string; quantity: string }[] = [];
+    for (const [i, l] of detail.lines.entries()) {
+      const raw = qtyInputs[l.id] ?? '';
+      const qty = parseFloat(raw) || 0;
+      if (qty < 0) {
+        toast(`Line ${i + 1}: quantity cannot be negative.`, 'danger');
+        return;
+      }
+      if (qty === 0) continue;
+      const remaining = lineRemaining(l);
+      if (qty > remaining + 1e-9) {
+        toast(`Line ${i + 1}: only ${remaining} remaining to bill.`, 'danger');
+        return;
+      }
+      billLines.push({ lineId: l.id, quantity: raw });
+    }
+    if (billLines.length === 0) {
+      toast('Enter a quantity to bill on at least one line.', 'danger');
+      return;
+    }
+
+    setBilling(true);
+    try {
+      await api.post(`/api/purchase-orders/${po.id}`, {
+        action: 'convert',
+        lines: billLines,
+      });
+      toast(`Bill created from PO #${po.poNumber}.`, 'success');
+      onBilled();
+      onClose();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to create bill.';
+      toast(msg, 'danger');
+    } finally {
+      setBilling(false);
+    }
+  }
+
   return (
     <Modal
-      open={open}
+      open={!!po}
       onClose={onClose}
-      title="Convert to Bill"
+      title={po ? `Receive & Bill — PO #${po.poNumber}` : 'Receive & Bill'}
+      size="lg"
       footer={
         <>
-          <Button variant="secondary" onClick={onClose} disabled={converting}>
+          <Button variant="secondary" onClick={onClose} disabled={billing}>
             Cancel
           </Button>
-          <Button onClick={onConfirm} disabled={converting}>
-            {converting ? 'Converting…' : 'Convert to Bill'}
+          <Button onClick={handleBill} loading={billing} disabled={loading || !detail}>
+            Create Bill
           </Button>
         </>
       }
     >
-      <p className="text-navy/80 text-sm">
-        Convert <strong>PO #{poNumber}</strong> to a Bill? This will create an Accounts Payable
-        entry in the GL. The PO will be marked as converted and cannot be modified.
-      </p>
+      {loading || !detail ? (
+        <div className="py-10 flex items-center justify-center gap-2 text-sm text-navy/40">
+          <Spinner className="h-4 w-4" /> Loading purchase order…
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <p className="text-sm text-navy/70">
+            Enter the quantities received to bill now. Anything left unbilled keeps the PO open
+            as <strong>Partially Billed</strong>; billing every remaining quantity closes it.
+            Inventory items are received into stock when the bill posts.
+          </p>
+
+          <div className="rounded-lg border border-slate-200 overflow-hidden">
+            <div className="grid grid-cols-[1.4fr_70px_70px_80px_90px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
+              <span>Item / Account</span>
+              <span className="text-right">Ordered</span>
+              <span className="text-right">Billed</span>
+              <span className="text-right">Remaining</span>
+              <span className="text-right">Bill Now</span>
+            </div>
+
+            {detail.lines.map((l) => {
+              const remaining = lineRemaining(l);
+              const label = l.itemId
+                ? itemMap[l.itemId] ?? 'Item'
+                : l.accountId
+                  ? accountMap[l.accountId] ?? 'Account'
+                  : '—';
+              return (
+                <div
+                  key={l.id}
+                  className="grid grid-cols-[1.4fr_70px_70px_80px_90px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
+                >
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium text-navy">{label}</div>
+                    {l.description && (
+                      <div className="truncate text-xs text-navy/50">{l.description}</div>
+                    )}
+                  </div>
+                  <span className="text-right text-sm tabular-nums text-navy/70">
+                    {parseFloat(l.quantity) || 0}
+                  </span>
+                  <span className="text-right text-sm tabular-nums text-navy/70">
+                    {parseFloat(l.quantityBilled) || 0}
+                  </span>
+                  <span
+                    className={`text-right text-sm tabular-nums font-medium ${
+                      remaining > 0 ? 'text-navy' : 'text-navy/30'
+                    }`}
+                  >
+                    {remaining}
+                  </span>
+                  <Input
+                    type="number"
+                    min="0"
+                    max={remaining}
+                    step="any"
+                    disabled={remaining <= 0}
+                    value={qtyInputs[l.id] ?? ''}
+                    onChange={(e) =>
+                      setQtyInputs((prev) => ({ ...prev, [l.id]: e.target.value }))
+                    }
+                    className="text-right"
+                  />
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="flex items-center justify-between rounded-lg bg-navy/5 px-4 py-3">
+            <span className="text-sm font-semibold text-navy/70">Bill Total</span>
+            <span className="text-lg font-bold text-navy tabular-nums">
+              {formatCurrency(billTotal.toFixed(2))}
+            </span>
+          </div>
+        </div>
+      )}
     </Modal>
   );
 }
@@ -378,26 +602,33 @@ export default function PurchaseOrdersPage() {
   const [pos, setPos] = useState<PurchaseOrder[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [items, setItems] = useState<Item[]>([]);
   const [loading, setLoading] = useState(true);
   const [showNew, setShowNew] = useState(false);
 
-  // Convert state
-  const [convertTarget, setConvertTarget] = useState<PurchaseOrder | null>(null);
-  const [converting, setConverting] = useState(false);
+  // Receive & Bill state
+  const [billTarget, setBillTarget] = useState<PurchaseOrder | null>(null);
+
+  // Void / Close state
+  const [voidTarget, setVoidTarget] = useState<PurchaseOrder | null>(null);
+  const [voiding, setVoiding] = useState(false);
+  const [closingId, setClosingId] = useState<string | null>(null);
 
   const vendorMap = Object.fromEntries(vendors.map((v) => [v.id, v.displayName]));
 
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
-      const [poList, vendorList, accountList] = await Promise.all([
+      const [poList, vendorList, accountList, itemRes] = await Promise.all([
         api.get<PurchaseOrder[]>('/api/purchase-orders'),
         api.get<Vendor[]>('/api/vendors'),
         api.get<Account[]>('/api/accounts'),
+        api.get<{ items: Item[] }>('/api/items'),
       ]);
       setPos(poList);
       setVendors(vendorList);
       setAccounts(accountList);
+      setItems(itemRes.items ?? []);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to load purchase orders.';
       toast(msg, 'danger');
@@ -410,19 +641,33 @@ export default function PurchaseOrdersPage() {
     fetchData();
   }, [fetchData]);
 
-  async function handleConvert() {
-    if (!convertTarget) return;
-    setConverting(true);
+  async function handleVoid() {
+    if (!voidTarget) return;
+    setVoiding(true);
     try {
-      await api.post(`/api/purchase-orders/${convertTarget.id}`, { action: 'convert' });
-      toast(`PO #${convertTarget.poNumber} converted to bill.`, 'success');
-      setConvertTarget(null);
-      fetchData();
+      await api.post(`/api/purchase-orders/${voidTarget.id}`, { action: 'void' });
+      toast(`PO #${voidTarget.poNumber} voided.`, 'success');
+      setVoidTarget(null);
+      await fetchData();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to convert purchase order.';
+      const msg = err instanceof Error ? err.message : 'Failed to void purchase order.';
       toast(msg, 'danger');
     } finally {
-      setConverting(false);
+      setVoiding(false);
+    }
+  }
+
+  async function handleClose(po: PurchaseOrder) {
+    setClosingId(po.id);
+    try {
+      await api.post(`/api/purchase-orders/${po.id}`, { action: 'close' });
+      toast(`PO #${po.poNumber} closed.`, 'success');
+      await fetchData();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to close purchase order.';
+      toast(msg, 'danger');
+    } finally {
+      setClosingId(null);
     }
   }
 
@@ -440,14 +685,20 @@ export default function PurchaseOrdersPage() {
 
       <Card className="p-0 overflow-hidden">
         {loading ? (
-          <div className="flex items-center justify-center py-20 text-navy/40 text-sm">
-            Loading purchase orders…
+          <div className="flex items-center justify-center gap-2 py-20 text-navy/40 text-sm">
+            <Spinner className="h-4 w-4" /> Loading purchase orders…
           </div>
         ) : pos.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-20 gap-3 text-navy/40">
-            <ShoppingCart className="h-10 w-10 opacity-30" />
-            <p className="text-sm">No purchase orders yet. Create one to get started.</p>
-          </div>
+          <EmptyState
+            icon={ShoppingCart}
+            title="No purchase orders yet"
+            message="Create your first purchase order to start tracking what you've ordered from vendors."
+            action={
+              <Button onClick={() => setShowNew(true)}>
+                <Plus className="h-4 w-4" /> New PO
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -456,7 +707,7 @@ export default function PurchaseOrdersPage() {
                 <Th>Vendor</Th>
                 <Th>Date</Th>
                 <Th>Expected</Th>
-                <Th className="text-right">Total</Th>
+                <Th numeric>Total</Th>
                 <Th>Status</Th>
                 <Th className="text-right">Actions</Th>
               </Tr>
@@ -465,35 +716,57 @@ export default function PurchaseOrdersPage() {
               {pos.map((po) => (
                 <Tr key={po.id}>
                   <Td className="font-semibold text-navy">#{po.poNumber}</Td>
-                  <Td>{vendorMap[po.vendorId] ?? po.vendorId}</Td>
-                  <Td className="text-navy/70">{po.date ? po.date.slice(0, 10) : '—'}</Td>
+                  <Td>{vendorMap[po.vendorId] ?? '—'}</Td>
+                  <Td className="text-navy/70">{po.date ? formatDate(po.date, 'MMM d, yyyy') : '—'}</Td>
                   <Td className="text-navy/70">
-                    {po.expectedDate ? po.expectedDate.slice(0, 10) : '—'}
+                    {po.expectedDate ? formatDate(po.expectedDate, 'MMM d, yyyy') : '—'}
                   </Td>
-                  <Td className="text-right tabular-nums font-medium">
+                  <Td numeric className="font-medium">
                     {formatCurrency(po.total)}
                   </Td>
                   <Td>
                     <Badge tone={statusTone(po.status)}>{statusLabel(po.status)}</Badge>
                   </Td>
                   <Td className="text-right">
-                    <div className="flex items-center justify-end gap-2">
+                    <div className="flex items-center justify-end gap-1">
                       {/* PDF download */}
-                      <button
+                      <Button
+                        variant="ghost"
+                        size="sm"
                         onClick={() => window.open(`/api/purchase-orders/${po.id}/pdf`, '_blank')}
-                        className="inline-flex items-center gap-1 text-xs text-navy/40 hover:text-electric transition-colors font-medium"
                         title="Download PDF"
                       >
                         <Download className="h-3.5 w-3.5" /> PDF
-                      </button>
-                      {po.status === 'open' && (
-                        <button
-                          onClick={() => setConvertTarget(po)}
-                          className="inline-flex items-center gap-1 text-xs text-navy/40 hover:text-electric transition-colors font-medium"
-                          title="Convert to bill"
-                        >
-                          <ArrowRight className="h-3.5 w-3.5" /> Convert to Bill
-                        </button>
+                      </Button>
+                      {(po.status === 'open' || po.status === 'partial') && (
+                        <>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setBillTarget(po)}
+                            title="Receive items and create a bill"
+                          >
+                            <ArrowRight className="h-3.5 w-3.5" /> Receive &amp; Bill
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            loading={closingId === po.id}
+                            onClick={() => handleClose(po)}
+                            title="Close the PO — no further billing"
+                          >
+                            <CheckSquare className="h-3.5 w-3.5" /> Close
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="text-red-500 hover:text-red-700 hover:bg-red-50"
+                            onClick={() => setVoidTarget(po)}
+                            title="Void the PO"
+                          >
+                            <Ban className="h-3.5 w-3.5" /> Void
+                          </Button>
+                        </>
                       )}
                       {po.status === 'closed' && po.convertedBillId && (
                         <span className="text-xs text-navy/30 italic">Bill created</span>
@@ -520,11 +793,17 @@ export default function PurchaseOrdersPage() {
             </span>
           </span>
           <span>
+            Partially billed:{' '}
+            <span className="font-semibold text-navy/70">
+              {pos.filter((p) => p.status === 'partial').length}
+            </span>
+          </span>
+          <span>
             Open value:{' '}
             <span className="font-semibold text-navy/70">
               {formatCurrency(
                 pos
-                  .filter((p) => p.status === 'open')
+                  .filter((p) => p.status === 'open' || p.status === 'partial')
                   .reduce((s, p) => s + Number(p.total), 0)
                   .toFixed(2),
               )}
@@ -538,15 +817,27 @@ export default function PurchaseOrdersPage() {
         onClose={() => setShowNew(false)}
         vendors={vendors}
         accounts={accounts}
+        items={items}
         onCreated={fetchData}
       />
 
-      <ConvertModal
-        open={!!convertTarget}
-        poNumber={convertTarget?.poNumber ?? null}
-        onConfirm={handleConvert}
-        onClose={() => setConvertTarget(null)}
-        converting={converting}
+      <ReceiveBillModal
+        po={billTarget}
+        onClose={() => setBillTarget(null)}
+        onBilled={fetchData}
+        accounts={accounts}
+        items={items}
+      />
+
+      <ConfirmDialog
+        open={!!voidTarget}
+        title="Void purchase order?"
+        message={`Void PO #${voidTarget?.poNumber ?? ''} (${formatCurrency(voidTarget?.total ?? '0')})? The PO can no longer be billed. This cannot be undone.`}
+        confirmLabel="Void"
+        tone="danger"
+        loading={voiding}
+        onConfirm={handleVoid}
+        onClose={() => setVoidTarget(null)}
       />
     </main>
   );

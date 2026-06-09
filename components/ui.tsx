@@ -6,12 +6,41 @@
 import * as React from 'react';
 import { cn } from '@/lib/utils';
 
+// ---- Spinner ----
+export function Spinner({ className }: { className?: string }) {
+  return (
+    <svg
+      className={cn('h-5 w-5 animate-spin text-current', className)}
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden="true"
+    >
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path
+        className="opacity-75"
+        fill="currentColor"
+        d="M4 12a8 8 0 0 1 8-8v4a4 4 0 0 0-4 4H4z"
+      />
+    </svg>
+  );
+}
+
 // ---- Button ----
 type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: 'primary' | 'secondary' | 'ghost' | 'danger';
   size?: 'sm' | 'md';
+  /** Shows a spinner and disables the button while a request is in flight. */
+  loading?: boolean;
 };
-export function Button({ className, variant = 'primary', size = 'md', ...props }: ButtonProps) {
+export function Button({
+  className,
+  variant = 'primary',
+  size = 'md',
+  loading = false,
+  disabled,
+  children,
+  ...props
+}: ButtonProps) {
   const variants = {
     primary: 'bg-electric text-white hover:bg-electric/90 shadow-sm',
     secondary: 'bg-white text-navy border border-slate-200 hover:bg-slate-50',
@@ -22,13 +51,17 @@ export function Button({ className, variant = 'primary', size = 'md', ...props }
   return (
     <button
       className={cn(
-        'inline-flex items-center justify-center gap-2 rounded-lg font-semibold transition-colors disabled:opacity-50 disabled:pointer-events-none outline-none focus:ring-2 focus:ring-electric/40',
+        'inline-flex items-center justify-center gap-2 rounded-lg font-semibold transition-colors disabled:opacity-50 disabled:pointer-events-none outline-none focus-visible:ring-2 focus-visible:ring-electric/50 focus-visible:ring-offset-1',
         variants[variant],
         sizes[size],
         className,
       )}
+      disabled={disabled || loading}
       {...props}
-    />
+    >
+      {loading && <Spinner className="h-4 w-4" />}
+      {children}
+    </button>
   );
 }
 
@@ -79,22 +112,44 @@ export function Label({ className, ...props }: React.LabelHTMLAttributes<HTMLLab
 }
 
 // ---- Badge ----
+export type BadgeTone =
+  | 'neutral'
+  | 'success'
+  | 'warning'
+  | 'danger'
+  | 'info'
+  // Document-status aliases so pages can pass a status string directly:
+  | 'open'
+  | 'partial'
+  | 'paid'
+  | 'void'
+  | 'overdue';
 export function Badge({
   children,
   tone = 'neutral',
+  className,
 }: {
   children: React.ReactNode;
-  tone?: 'neutral' | 'success' | 'warning' | 'danger' | 'info';
+  tone?: BadgeTone;
+  className?: string;
 }) {
-  const tones = {
+  const tones: Record<BadgeTone, string> = {
     neutral: 'bg-slate-100 text-slate-600',
     success: 'bg-emerald/15 text-emerald',
-    warning: 'bg-gold/20 text-gold',
+    warning: 'bg-gold/20 text-yellow-800',
     danger: 'bg-red-100 text-red-600',
     info: 'bg-electric/10 text-electric',
+    // Status aliases
+    open: 'bg-electric/10 text-electric',
+    partial: 'bg-gold/20 text-yellow-800',
+    paid: 'bg-emerald/15 text-emerald',
+    void: 'bg-slate-100 text-slate-500 line-through decoration-slate-400',
+    overdue: 'bg-red-100 text-red-600',
   };
   return (
-    <span className={cn('px-2.5 py-0.5 rounded-full text-xs font-semibold', tones[tone])}>
+    <span
+      className={cn('px-2.5 py-0.5 rounded-full text-xs font-semibold whitespace-nowrap', tones[tone], className)}
+    >
       {children}
     </span>
   );
@@ -108,49 +163,222 @@ export function Table({ children }: { children: React.ReactNode }) {
     </div>
   );
 }
-export function Th({ className, ...props }: React.ThHTMLAttributes<HTMLTableCellElement>) {
+export function Th({
+  className,
+  numeric,
+  ...props
+}: React.ThHTMLAttributes<HTMLTableCellElement> & { numeric?: boolean }) {
   return (
     <th
-      className={cn('py-2.5 px-4 text-left font-semibold text-navy/70 text-sm border-b-2 border-navy/10', className)}
+      className={cn(
+        'py-2.5 px-4 text-left font-semibold text-navy/70 text-sm border-b-2 border-navy/10',
+        numeric && 'text-right tabular-nums',
+        className,
+      )}
       {...props}
     />
   );
 }
-export function Td({ className, ...props }: React.TdHTMLAttributes<HTMLTableCellElement>) {
-  return <td className={cn('py-2.5 px-4 text-navy border-b border-slate-100', className)} {...props} />;
+export function Td({
+  className,
+  numeric,
+  ...props
+}: React.TdHTMLAttributes<HTMLTableCellElement> & { numeric?: boolean }) {
+  return (
+    <td
+      className={cn(
+        'py-2.5 px-4 text-navy border-b border-slate-100',
+        numeric && 'text-right tabular-nums',
+        className,
+      )}
+      {...props}
+    />
+  );
 }
 export function Tr({ className, ...props }: React.HTMLAttributes<HTMLTableRowElement>) {
   return <tr className={cn('hover:bg-electric/5', className)} {...props} />;
 }
 
 // ---- Modal ----
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+const MODAL_SIZES = {
+  md: 'max-w-lg',
+  lg: 'max-w-3xl',
+  xl: 'max-w-5xl',
+} as const;
+
 export function Modal({
   open,
   onClose,
   title,
   children,
   footer,
+  size = 'md',
 }: {
   open: boolean;
   onClose: () => void;
   title: string;
   children: React.ReactNode;
   footer?: React.ReactNode;
+  /** md = forms (default), lg = transaction modals with line grids, xl = wide editors. */
+  size?: 'md' | 'lg' | 'xl';
 }) {
+  const titleId = React.useId();
+  const dialogRef = React.useRef<HTMLDivElement>(null);
+  const restoreRef = React.useRef<HTMLElement | null>(null);
+
+  // Escape-to-close + focus management (trap inside the dialog, restore on close).
+  React.useEffect(() => {
+    if (!open) return;
+    restoreRef.current = document.activeElement as HTMLElement | null;
+    dialogRef.current?.focus();
+
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onClose();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+      const dialog = dialogRef.current;
+      if (!dialog) return;
+      const focusables = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE));
+      if (focusables.length === 0) {
+        e.preventDefault();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      if (e.shiftKey && (active === first || active === dialog || !dialog.contains(active))) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (active === last || !dialog.contains(active))) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      restoreRef.current?.focus?.();
+    };
+  }, [open, onClose]);
+
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-navy/40 backdrop-blur-sm" onClick={onClose} />
-      <Card className="relative z-10 w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        className={cn(
+          'relative z-10 w-full p-6 max-h-[90vh] overflow-y-auto rounded-2xl bg-white shadow-xl border border-slate-100 outline-none',
+          MODAL_SIZES[size],
+        )}
+      >
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-xl font-bold text-navy">{title}</h2>
-          <button onClick={onClose} className="text-navy/40 hover:text-navy text-2xl leading-none">
+          <h2 id={titleId} className="text-xl font-bold text-navy">{title}</h2>
+          <button onClick={onClose} aria-label="Close" className="text-navy/40 hover:text-navy text-2xl leading-none">
             &times;
           </button>
         </div>
         {children}
         {footer && <div className="mt-6 flex justify-end gap-2">{footer}</div>}
-      </Card>
+      </div>
+    </div>
+  );
+}
+
+// ---- ConfirmDialog (replaces window.confirm) ----
+export function ConfirmDialog({
+  open,
+  title,
+  message,
+  confirmLabel = 'Confirm',
+  tone,
+  loading,
+  onConfirm,
+  onClose,
+}: {
+  open: boolean;
+  title: string;
+  message?: React.ReactNode;
+  confirmLabel?: string;
+  /** 'danger' renders a red confirm button for destructive actions (delete/void). */
+  tone?: 'danger';
+  /** Optional: show a spinner on the confirm button while the action runs. */
+  loading?: boolean;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={title}
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            variant={tone === 'danger' ? 'danger' : 'primary'}
+            loading={loading}
+            onClick={onConfirm}
+          >
+            {confirmLabel}
+          </Button>
+        </>
+      }
+    >
+      {message ? <p className="text-sm text-navy/70">{message}</p> : null}
+    </Modal>
+  );
+}
+
+// ---- EmptyState ----
+export function EmptyState({
+  icon: Icon,
+  title,
+  message,
+  action,
+}: {
+  icon?: React.ComponentType<{ className?: string }>;
+  title: string;
+  message?: string;
+  action?: React.ReactNode;
+}) {
+  return (
+    <div className="flex flex-col items-center justify-center text-center py-14 px-6">
+      {Icon && (
+        <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-electric/10 text-electric">
+          <Icon className="h-6 w-6" />
+        </div>
+      )}
+      <h3 className="text-base font-semibold text-navy">{title}</h3>
+      {message && <p className="mt-1 max-w-sm text-sm text-navy/50">{message}</p>}
+      {action && <div className="mt-4">{action}</div>}
+    </div>
+  );
+}
+
+// ---- PageSkeleton (loading placeholder for full pages) ----
+export function PageSkeleton({ rows = 6 }: { rows?: number }) {
+  return (
+    <div className="p-8 animate-pulse" role="status" aria-label="Loading">
+      <div className="mb-6 h-8 w-64 rounded-lg bg-navy/10" />
+      <div className="space-y-4 rounded-2xl border border-slate-100 bg-white p-6 shadow-xl">
+        {Array.from({ length: rows }).map((_, i) => (
+          <div key={i} className="h-4 rounded bg-navy/5" style={{ width: `${85 - (i % 3) * 15}%` }} />
+        ))}
+      </div>
+      <span className="sr-only">Loading…</span>
     </div>
   );
 }

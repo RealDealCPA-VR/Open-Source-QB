@@ -1,11 +1,20 @@
 /**
  * GET    /api/vendor-credits/:id                      — fetch a credit with its lines
- * POST   /api/vendor-credits/:id  { action: 'apply', billId, amount }  — apply to a bill
+ * POST   /api/vendor-credits/:id  { action: 'apply', billId, amount }    — apply to a bill
+ * POST   /api/vendor-credits/:id  { action: 'unapply', billId, amount }  — reverse an application
+ * POST   /api/vendor-credits/:id  { action: 'refund', bankAccountId, amount, date?, memo? }
+ *                                                     — record a vendor refund (cash back)
  * DELETE /api/vendor-credits/:id                      — void the credit
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { getVendorCredit, applyToBill, voidVendorCredit } from '@/lib/services/vendorCredits';
+import {
+  getVendorCredit,
+  applyToBill,
+  unapplyFromBill,
+  refundVendorCredit,
+  voidVendorCredit,
+} from '@/lib/services/vendorCredits';
 import { ServiceError } from '@/lib/services/_base';
 
 function errorResponse(err: unknown) {
@@ -45,9 +54,26 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const ctx = await getServerContext();
     const body = await req.json();
 
-    if (body.action !== 'apply') {
+    if (body.action === 'refund') {
+      if (!body.bankAccountId) {
+        return NextResponse.json({ error: 'bankAccountId is required', code: 'VALIDATION' }, { status: 400 });
+      }
+      if (!body.amount) {
+        return NextResponse.json({ error: 'amount is required', code: 'VALIDATION' }, { status: 400 });
+      }
+      const result = await refundVendorCredit(ctx, {
+        vendorCreditId: id,
+        bankAccountId: body.bankAccountId,
+        amount: body.amount,
+        date: body.date ? new Date(body.date) : null,
+        memo: body.memo ?? null,
+      });
+      return NextResponse.json(result);
+    }
+
+    if (body.action !== 'apply' && body.action !== 'unapply') {
       return NextResponse.json(
-        { error: 'Unknown action. Expected action: "apply".', code: 'VALIDATION' },
+        { error: 'Unknown action. Expected action: "apply", "unapply" or "refund".', code: 'VALIDATION' },
         { status: 400 },
       );
     }
@@ -58,7 +84,8 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       return NextResponse.json({ error: 'amount is required', code: 'VALIDATION' }, { status: 400 });
     }
 
-    const result = await applyToBill(ctx, {
+    const fn = body.action === 'apply' ? applyToBill : unapplyFromBill;
+    const result = await fn(ctx, {
       vendorCreditId: id,
       billId: body.billId,
       amount: body.amount,

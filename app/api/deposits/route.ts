@@ -1,6 +1,15 @@
 /**
  * GET  /api/deposits      — list all deposits for the company
  * POST /api/deposits      — create a new deposit (Undeposited Funds -> bank)
+ *   Body: {
+ *     depositAccountId: string,
+ *     date: string (ISO),
+ *     paymentIds?: string[],        // paymentsReceived rows in UF
+ *     salesReceiptIds?: string[],   // salesReceipts rows in UF
+ *     extraLines?: Array<{ accountId, amount, description? }>, // e.g. owner contribution
+ *     cashBack?: { accountId, amount, memo? },                 // QB "Cash back goes to"
+ *     memo?: string
+ *   }
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -52,9 +61,18 @@ export async function POST(req: NextRequest) {
         { status: 400 },
       );
     }
-    if (!Array.isArray(body.paymentIds) || body.paymentIds.length === 0) {
+    const paymentIds = Array.isArray(body.paymentIds) ? (body.paymentIds as string[]) : [];
+    const salesReceiptIds = Array.isArray(body.salesReceiptIds)
+      ? (body.salesReceiptIds as string[])
+      : [];
+    const extraLines = Array.isArray(body.extraLines) ? body.extraLines : [];
+
+    if (paymentIds.length === 0 && salesReceiptIds.length === 0 && extraLines.length === 0) {
       return NextResponse.json(
-        { error: 'paymentIds must be a non-empty array', code: 'VALIDATION' },
+        {
+          error: 'Provide at least one of paymentIds, salesReceiptIds, or extraLines.',
+          code: 'VALIDATION',
+        },
         { status: 400 },
       );
     }
@@ -62,7 +80,10 @@ export async function POST(req: NextRequest) {
     const deposit = await createDeposit(ctx, {
       depositAccountId: body.depositAccountId as string,
       date: new Date(body.date as string),
-      paymentIds: body.paymentIds as string[],
+      paymentIds,
+      salesReceiptIds,
+      extraLines,
+      cashBack: body.cashBack ?? null,
       memo: (body.memo as string | undefined) ?? null,
     });
 

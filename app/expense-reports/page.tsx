@@ -1,14 +1,18 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { Receipt, Plus, Trash2, Send, CheckCircle } from 'lucide-react';
+import Link from 'next/link';
+import { FileSpreadsheet, Plus, Trash2, Send, CheckCircle } from 'lucide-react';
 import {
   Button,
   Card,
+  ConfirmDialog,
+  EmptyState,
   Input,
   Select,
   Label,
   Badge,
+  Spinner,
   Table,
   Th,
   Td,
@@ -16,10 +20,10 @@ import {
   Modal,
   PageHeader,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -187,13 +191,14 @@ function NewReportModal({
       open={open}
       onClose={handleClose}
       title="New Expense Report"
+      size="lg"
       footer={
         <>
           <Button variant="secondary" onClick={handleClose} disabled={saving}>
             Cancel
           </Button>
-          <Button onClick={handleSave} disabled={saving}>
-            {saving ? 'Creating...' : 'Create Report'}
+          <Button onClick={handleSave} loading={saving}>
+            Create Report
           </Button>
         </>
       }
@@ -204,6 +209,7 @@ function NewReportModal({
           <Label htmlFor="nr-employee">Employee *</Label>
           <Select
             id="nr-employee"
+            autoFocus
             value={employeeId}
             onChange={(e) => setEmployeeId(e.target.value)}
           >
@@ -243,7 +249,7 @@ function NewReportModal({
             {lines.map((line, idx) => (
               <div
                 key={idx}
-                className="grid grid-cols-[1fr_1fr_1fr_auto] gap-2 items-start rounded-lg border border-slate-100 bg-slate-50 p-2"
+                className="grid grid-cols-[1.4fr_140px_1.4fr_110px_auto] gap-2 items-start rounded-lg border border-slate-100 bg-slate-50 p-2"
               >
                 {/* Account */}
                 <div>
@@ -262,6 +268,18 @@ function NewReportModal({
                       </option>
                     ))}
                   </Select>
+                </div>
+                {/* Date */}
+                <div>
+                  <Label htmlFor={`nr-date-${idx}`} className="text-xs">
+                    Date
+                  </Label>
+                  <Input
+                    id={`nr-date-${idx}`}
+                    type="date"
+                    value={line.date}
+                    onChange={(e) => updateLine(idx, 'date', e.target.value)}
+                  />
                 </div>
                 {/* Description */}
                 <div>
@@ -353,7 +371,7 @@ function ReportDetailModal({
             </Badge>
           </span>
           {report.submittedAt && (
-            <span>Submitted: {new Date(report.submittedAt).toLocaleDateString()}</span>
+            <span>Submitted: {formatDate(report.submittedAt, 'MMM d, yyyy')}</span>
           )}
         </div>
 
@@ -361,8 +379,9 @@ function ReportDetailModal({
           <thead>
             <tr>
               <Th>Account</Th>
+              <Th>Date</Th>
               <Th>Description</Th>
-              <Th className="text-right">Amount</Th>
+              <Th numeric>Amount</Th>
             </tr>
           </thead>
           <tbody>
@@ -371,10 +390,13 @@ function ReportDetailModal({
               return (
                 <Tr key={line.id}>
                   <Td className="text-sm">
-                    {acc ? `${acc.code} ${acc.name}` : line.accountId}
+                    {acc ? `${acc.code} ${acc.name}` : '—'}
+                  </Td>
+                  <Td className="text-sm text-navy/70">
+                    {line.date ? formatDate(line.date, 'MMM d, yyyy') : '—'}
                   </Td>
                   <Td className="text-sm text-navy/70">{line.description ?? '-'}</Td>
-                  <Td className="text-right font-mono text-sm">{formatCurrency(line.amount)}</Td>
+                  <Td numeric className="text-sm">{formatCurrency(line.amount)}</Td>
                 </Tr>
               );
             })}
@@ -382,12 +404,12 @@ function ReportDetailModal({
           <tfoot>
             <tr>
               <td
-                colSpan={2}
+                colSpan={3}
                 className="py-2.5 px-4 text-right font-semibold text-navy/70 text-sm border-t-2 border-navy/10"
               >
                 Total
               </td>
-              <td className="py-2.5 px-4 text-right font-bold text-navy font-mono border-t-2 border-navy/10">
+              <td className="py-2.5 px-4 text-right font-bold text-navy tabular-nums border-t-2 border-navy/10">
                 {formatCurrency(report.total)}
               </td>
             </tr>
@@ -395,7 +417,12 @@ function ReportDetailModal({
         </Table>
 
         {report.postedEntryId && (
-          <p className="text-xs text-navy/40 font-mono">GL Entry: {report.postedEntryId}</p>
+          <p className="text-xs text-navy/40">
+            Posted to the general ledger —{' '}
+            <Link href="/journal" className="text-electric hover:underline">
+              view in Journal
+            </Link>
+          </p>
         )}
       </div>
     </Modal>
@@ -421,6 +448,9 @@ export default function ExpenseReportsPage() {
 
   // Action loading ids
   const [actionId, setActionId] = useState<string | null>(null);
+
+  // Reimburse confirm
+  const [pendingReimburse, setPendingReimburse] = useState<ExpenseReport | null>(null);
 
   // ---------------------------------------------------------------------------
   // Data fetching
@@ -486,6 +516,7 @@ export default function ExpenseReportsPage() {
     try {
       await api.post(`/api/expense-reports/${report.id}`, { action: 'reimburse' });
       toast('Report approved and reimbursed. GL entry posted.', 'success');
+      setPendingReimburse(null);
       await fetchReports();
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to reimburse report.', 'danger');
@@ -502,7 +533,7 @@ export default function ExpenseReportsPage() {
 
   function employeeName(id: string) {
     const e = employeeById.get(id);
-    return e ? `${e.firstName} ${e.lastName}` : id;
+    return e ? `${e.firstName} ${e.lastName}` : '—';
   }
 
   // ---------------------------------------------------------------------------
@@ -513,7 +544,7 @@ export default function ExpenseReportsPage() {
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
         title="Expense Reports"
-        icon={Receipt}
+        icon={FileSpreadsheet}
         action={
           <Button onClick={() => setNewOpen(true)}>
             <Plus className="h-4 w-4" />
@@ -524,14 +555,20 @@ export default function ExpenseReportsPage() {
 
       <Card>
         {loading ? (
-          <div className="p-12 text-center text-navy/40 text-sm">Loading expense reports...</div>
-        ) : reports.length === 0 ? (
-          <div className="p-12 text-center">
-            <Receipt className="mx-auto h-10 w-10 text-navy/20 mb-3" />
-            <p className="text-navy/50 text-sm">
-              No expense reports yet. Click "New Report" to get started.
-            </p>
+          <div className="p-12 flex items-center justify-center gap-2 text-navy/40 text-sm">
+            <Spinner className="h-4 w-4" /> Loading expense reports...
           </div>
+        ) : reports.length === 0 ? (
+          <EmptyState
+            icon={FileSpreadsheet}
+            title="No expense reports yet"
+            message="Create a report to track and reimburse employee expenses."
+            action={
+              <Button onClick={() => setNewOpen(true)}>
+                <Plus className="h-4 w-4" /> New Report
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -539,7 +576,7 @@ export default function ExpenseReportsPage() {
                 <Th>Employee</Th>
                 <Th>Title</Th>
                 <Th>Status</Th>
-                <Th className="text-right">Total</Th>
+                <Th numeric>Total</Th>
                 <Th>Created</Th>
                 <Th className="text-right">Actions</Th>
               </tr>
@@ -556,11 +593,11 @@ export default function ExpenseReportsPage() {
                         {statusLabel(r.status)}
                       </Badge>
                     </Td>
-                    <Td className="text-right font-mono font-semibold text-navy">
+                    <Td numeric className="font-semibold text-navy">
                       {formatCurrency(r.total)}
                     </Td>
                     <Td className="text-navy/60 text-sm">
-                      {new Date(r.createdAt).toLocaleDateString()}
+                      {formatDate(r.createdAt, 'MMM d, yyyy')}
                     </Td>
                     <Td className="text-right">
                       <div className="flex items-center justify-end gap-1">
@@ -593,7 +630,7 @@ export default function ExpenseReportsPage() {
                           <Button
                             variant="ghost"
                             size="sm"
-                            onClick={() => handleReimburse(r)}
+                            onClick={() => setPendingReimburse(r)}
                             disabled={busy}
                             className="text-emerald hover:bg-emerald/10"
                             title="Approve and reimburse"
@@ -631,7 +668,16 @@ export default function ExpenseReportsPage() {
         onClose={() => setDetailReport(null)}
       />
 
-      <Toaster />
+      {/* Reimburse confirm */}
+      <ConfirmDialog
+        open={!!pendingReimburse}
+        title="Reimburse report?"
+        message={`Reimburse ${pendingReimburse ? employeeName(pendingReimburse.employeeId) : ''} for ${formatCurrency(pendingReimburse?.total ?? '0')}? This posts a journal entry and cannot be undone.`}
+        confirmLabel="Reimburse"
+        loading={!!pendingReimburse && actionId === pendingReimburse.id}
+        onConfirm={() => pendingReimburse && handleReimburse(pendingReimburse)}
+        onClose={() => setPendingReimburse(null)}
+      />
     </main>
   );
 }

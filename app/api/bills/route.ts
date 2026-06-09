@@ -60,11 +60,17 @@ export async function POST(req: NextRequest) {
       date: new Date(body.date),
       dueDate: body.dueDate ? new Date(body.dueDate) : null,
       memo: body.memo ?? null,
+      classId: (body.classId as string | undefined) ?? null,
       lines: body.lines.map((l: Record<string, unknown>) => ({
-        accountId: l.accountId as string,
+        accountId: (l.accountId as string | undefined) ?? null,
+        itemId: (l.itemId as string | undefined) ?? null,
         description: (l.description as string | undefined) ?? null,
         quantity: l.quantity as string | number | undefined,
-        amount: l.amount as string | number,
+        unitCost: (l.unitCost as string | number | undefined) ?? null,
+        amount: (l.amount as string | number | undefined) ?? null,
+        classId: (l.classId as string | undefined) ?? null,
+        customerId: (l.customerId as string | undefined) ?? null,
+        jobId: (l.jobId as string | undefined) ?? null,
       })),
     });
 

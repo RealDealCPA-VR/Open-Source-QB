@@ -4,10 +4,38 @@
  *
  * POST /api/recurring/run    — also supports { id: string } to run a single template immediately
  */
+import { timingSafeEqual } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
+import { asc } from 'drizzle-orm';
 import { getServerContext } from '@/lib/context';
+import { getDb } from '@/lib/db';
+import { companies } from '@/lib/db/schema';
 import { runDue, runTemplateNow } from '@/lib/services/recurring';
-import { ServiceError } from '@/lib/services/_base';
+import { ServiceError, type ServiceContext } from '@/lib/services/_base';
+
+/**
+ * Trusted local-system path. The Electron main process has no session cookie, so it
+ * authenticates its launch-time recurring run with a per-launch random token it generated
+ * itself and passed to this server as BKA_INTERNAL_TOKEN (see electron/main.js). The server
+ * is bound to 127.0.0.1 and the token never leaves the machine, so this does not reopen the
+ * unauthenticated-impersonation hole closed in lib/context.ts.
+ */
+async function internalContext(req: NextRequest): Promise<ServiceContext | null> {
+  const token = process.env.BKA_INTERNAL_TOKEN;
+  const header = req.headers.get('x-bka-internal');
+  if (!token || !header) return null;
+  const a = Buffer.from(header);
+  const b = Buffer.from(token);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+  const db = await getDb();
+  const [company] = await db
+    .select({ id: companies.id, ownerId: companies.ownerId })
+    .from(companies)
+    .orderBy(asc(companies.createdAt))
+    .limit(1);
+  if (!company) return null;
+  return { db, companyId: company.id, userId: company.ownerId };
+}
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -31,7 +59,7 @@ function errorResponse(err: unknown) {
 
 export async function POST(req: NextRequest) {
   try {
-    const ctx = await getServerContext();
+    const ctx = (await internalContext(req)) ?? (await getServerContext());
     const body = await req.json().catch(() => ({}));
 
     // If an explicit template id is provided, run just that one immediately.

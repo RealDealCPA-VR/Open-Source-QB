@@ -10,7 +10,7 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { BookOpen, Building2, CheckCircle2, ChevronRight, ChevronLeft } from 'lucide-react';
-import { Button, Card, Input, Select, Label, toast, Toaster } from '@/components/ui';
+import { Button, Card, Input, Select, Label, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 
 // ---------------------------------------------------------------------------
@@ -174,7 +174,8 @@ function StepDetails({
       toast('Company name is required', 'danger');
       return false;
     }
-    if (form.fiscalYearEnd && !/^\d{2}-\d{2}$/.test(form.fiscalYearEnd)) {
+    // Same pattern the Settings page uses — rejects impossible dates like 13-45.
+    if (form.fiscalYearEnd && !/^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/.test(form.fiscalYearEnd)) {
       toast('Fiscal year end must be in MM-DD format (e.g. 12-31)', 'danger');
       return false;
     }
@@ -293,10 +294,11 @@ function StepCreate({
       // 2. Select / activate it
       await api.post('/api/companies/select', { companyId: company.id });
 
-      // 3. Patch settings (currency + fiscal year end)
+      // 3. Patch settings (currency + fiscal year end + industry)
       const patch: Record<string, string> = {};
       if (form.currency) patch.currency = form.currency;
       if (form.fiscalYearEnd.trim()) patch.fiscalYearEnd = form.fiscalYearEnd.trim();
+      if (form.industry) patch.industry = form.industry;
       if (Object.keys(patch).length > 0) {
         await api.patch('/api/company', patch);
       }
@@ -379,18 +381,9 @@ function StepCreate({
           <ChevronLeft className="h-4 w-4" />
           Back
         </Button>
-        <Button onClick={handleCreate} disabled={status === 'loading'} className="flex-1">
-          {status === 'loading' ? (
-            <>
-              <span className="animate-spin inline-block h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
-              Creating...
-            </>
-          ) : (
-            <>
-              Create Company
-              <ChevronRight className="h-4 w-4" />
-            </>
-          )}
+        <Button onClick={handleCreate} loading={status === 'loading'} className="flex-1">
+          Create Company
+          <ChevronRight className="h-4 w-4" />
         </Button>
       </div>
     </div>
@@ -451,8 +444,6 @@ export default function OnboardingPage() {
           Step {step} of {TOTAL_STEPS}
         </p>
       </div>
-
-      <Toaster />
     </main>
   );
 }

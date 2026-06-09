@@ -22,15 +22,26 @@
  * ('percent'). The stored `discount` column always holds the resolved dollar amount.
  *
  * Voiding calls `voidJournalEntry` which reverses all balance deltas.
+ *
+ * Editing (`updateInvoice`) is allowed while the invoice has no payments/credits
+ * applied (amountPaid == 0) and the period is open. The implementation voids the
+ * existing journal entries (including COGS entries tagged `invoice-cogs:<id>`,
+ * restoring stock), re-creates the lines, and re-posts — all inside ONE
+ * transaction — preserving invoiceNumber and createdAt.
  */
-import { and, eq, inArray, sql } from 'drizzle-orm';
-import { Money, toAmountString } from '@/lib/money';
+import { and, eq, inArray, ne, sql } from 'drizzle-orm';
+import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   accounts,
+  classes,
   customers,
+  inventoryLayers,
   invoices,
   invoiceLines,
   items,
+  jobs,
+  journalEntries,
+  journalEntryLines,
   taxRates,
 } from '@/lib/db/schema';
 import {
@@ -42,6 +53,8 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry } from './posting';
+import { recordCOGS } from './inventory';
+import { consumeStock } from './fifo';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -60,6 +73,10 @@ export interface InvoiceLineInput {
   /** Per-line tax rate override (UUID of a taxRates row). When set, this line is taxed at this
    *  rate instead of the invoice-level rate (supports mixed-jurisdiction invoices). */
   taxRateId?: string | null;
+  /** Class/department dimension for this line; falls back to the invoice-level classId. */
+  classId?: string | null;
+  /** Customer:Job for this line (job costing); falls back to the invoice-level jobId. */
+  jobId?: string | null;
 }
 
 export interface CreateInvoiceInput {
@@ -69,6 +86,10 @@ export interface CreateInvoiceInput {
   lines: InvoiceLineInput[];
   /** UUID of a taxRates row; if absent no tax is charged. */
   taxRateId?: string | null;
+  /** Invoice-level class dimension (P&L by Class); inherited by lines without their own classId. */
+  classId?: string | null;
+  /** Invoice-level Customer:Job (job costing); inherited by lines without their own jobId. */
+  jobId?: string | null;
   /**
    * Discount value. Interpretation depends on discountType:
    *   'amount'  (default) — flat dollar subtracted from subtotal.
@@ -136,10 +157,57 @@ async function nextInvoiceNumber(ctx: ServiceContext): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
-// createInvoice
+// prepareInvoice — shared validation + computation for create/update
 // ---------------------------------------------------------------------------
 
-export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInput) {
+type ComputedLine = {
+  itemId: string | null;
+  accountId: string;         // resolved income account id
+  description: string | null;
+  quantity: string;
+  rate: string;
+  amount: string;            // quantity * rate, 2dp (in transaction currency)
+  taxable: boolean;
+  taxRateId: string | null;
+  classId: string | null;
+  jobId: string | null;
+  lineOrder: number;
+};
+
+interface PreparedInvoice {
+  exchangeRate: ReturnType<typeof Money.zero>;
+  arAccountId: string;
+  defaultIncomeId: string;
+  taxPayableId: string;
+  retainageAcctId: string | null;
+  headerClassId: string | null;
+  headerJobId: string | null;
+  computedLines: ComputedLine[];
+  subtotal: ReturnType<typeof Money.zero>;
+  discount: ReturnType<typeof Money.zero>;
+  discountType: 'amount' | 'percent';
+  taxAmount: ReturnType<typeof Money.zero>;
+  total: ReturnType<typeof Money.zero>;
+  usesRetainage: boolean;
+  retainagePct: ReturnType<typeof Money.zero>;
+  retainageAmount: ReturnType<typeof Money.zero>;
+  dueNow: ReturnType<typeof Money.zero>;
+  itemMap: Map<string, { incomeAccountId: string | null; type: string; name: string }>;
+}
+
+/**
+ * Validate a CreateInvoiceInput and compute every derived amount/account needed
+ * to persist + post the invoice. Pure read-only (no writes). Used by both
+ * `createInvoice` and `updateInvoice` so edits go through the exact same math.
+ *
+ * `opts.excludeInvoiceId` removes one invoice from the credit-limit exposure
+ * (the invoice being edited — its old balance is replaced by the new total).
+ */
+async function prepareInvoice(
+  ctx: ServiceContext,
+  input: CreateInvoiceInput,
+  opts?: { excludeInvoiceId?: string },
+): Promise<PreparedInvoice> {
   // --- Validate inputs ---
   if (!input.lines || input.lines.length === 0) {
     throw validation('An invoice must have at least one line.');
@@ -182,17 +250,59 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
       })
     : null;
 
-  // Pre-load item income account ids for lines that reference an item.
-  const itemIds = input.lines
-    .filter((l) => l.itemId)
-    .map((l) => l.itemId as string);
-  const itemMap = new Map<string, string | null>();
+  // Pre-load items referenced by lines (income account routing + inventory typing).
+  const itemIds = [
+    ...new Set(input.lines.filter((l) => l.itemId).map((l) => l.itemId as string)),
+  ];
+  const itemMap = new Map<
+    string,
+    { incomeAccountId: string | null; type: string; name: string }
+  >();
   if (itemIds.length > 0) {
     const itemRows = await ctx.db
-      .select({ id: items.id, incomeAccountId: items.incomeAccountId })
+      .select({
+        id: items.id,
+        incomeAccountId: items.incomeAccountId,
+        type: items.type,
+        name: items.name,
+      })
       .from(items)
-      .where(and(eq(items.companyId, ctx.companyId), sql`${items.id} = ANY(${itemIds})`));
-    for (const r of itemRows) itemMap.set(r.id, r.incomeAccountId);
+      .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, itemIds)));
+    for (const r of itemRows)
+      itemMap.set(r.id, { incomeAccountId: r.incomeAccountId, type: r.type, name: r.name });
+    for (const id of itemIds) {
+      if (!itemMap.has(id)) throw notFound(`Item ${id}`);
+    }
+  }
+
+  // Validate class/job dimensions (header + per-line) belong to this company.
+  const headerClassId = input.classId ?? null;
+  const headerJobId = input.jobId ?? null;
+  const classIds = [
+    ...new Set(
+      [headerClassId, ...input.lines.map((l) => l.classId ?? null)].filter(Boolean) as string[],
+    ),
+  ];
+  if (classIds.length > 0) {
+    const rows = await ctx.db
+      .select({ id: classes.id })
+      .from(classes)
+      .where(and(eq(classes.companyId, ctx.companyId), inArray(classes.id, classIds)));
+    const found = new Set(rows.map((r) => r.id));
+    for (const id of classIds) if (!found.has(id)) throw notFound(`Class ${id}`);
+  }
+  const jobIds = [
+    ...new Set(
+      [headerJobId, ...input.lines.map((l) => l.jobId ?? null)].filter(Boolean) as string[],
+    ),
+  ];
+  if (jobIds.length > 0) {
+    const rows = await ctx.db
+      .select({ id: jobs.id })
+      .from(jobs)
+      .where(and(eq(jobs.companyId, ctx.companyId), inArray(jobs.id, jobIds)));
+    const found = new Set(rows.map((r) => r.id));
+    for (const id of jobIds) if (!found.has(id)) throw notFound(`Job ${id}`);
   }
 
   // Pre-load any per-line tax-rate overrides into a rate map.
@@ -212,18 +322,6 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
   let perLineTax = Money.zero();
 
   // --- Compute per-line amounts and subtotal ---
-  type ComputedLine = {
-    itemId: string | null;
-    accountId: string;         // resolved income account id
-    description: string | null;
-    quantity: string;
-    rate: string;
-    amount: string;            // quantity * rate, 2dp (in transaction currency)
-    taxable: boolean;
-    taxRateId: string | null;
-    lineOrder: number;
-  };
-
   let subtotal = Money.zero();
   let taxableSubtotal = Money.zero();
   const computedLines: ComputedLine[] = [];
@@ -248,7 +346,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
       if (!acctRow) throw notFound(`Account ${l.accountId} (line ${i + 1})`);
       resolvedAccountId = acctRow.id;
     } else if (l.itemId) {
-      const itemIncomeId = itemMap.get(l.itemId) ?? null;
+      const itemIncomeId = itemMap.get(l.itemId)?.incomeAccountId ?? null;
       if (itemIncomeId) resolvedAccountId = itemIncomeId;
     }
 
@@ -272,13 +370,15 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
       amount: toAmountString(amount),
       taxable,
       taxRateId: l.taxRateId ?? null,
+      classId: l.classId ?? headerClassId,
+      jobId: l.jobId ?? headerJobId,
       lineOrder: i,
     });
   }
 
   // --- Resolve discount (flat or percent of subtotal) ---
   const discountType: 'amount' | 'percent' = input.discountType === 'percent' ? 'percent' : 'amount';
-  let discountRaw = Money.round2(input.discount ?? 0);
+  const discountRaw = Money.round2(input.discount ?? 0);
   if (discountRaw.lessThan(0)) throw validation('Discount cannot be negative.');
   let discount: ReturnType<typeof Money.zero>;
   if (discountType === 'percent') {
@@ -311,26 +411,414 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
   if (customer.creditLimit != null) {
     const creditLimit = Money.of(customer.creditLimit);
     if (creditLimit.greaterThan(0)) {
-      // Sum balanceDue on all open/partial invoices for this customer.
+      // Compare in BASE currency: creditLimit and GL postings are base, but each invoice's
+      // balanceDue (and this invoice's `total`) are stored in their own transaction currency.
+      const openConds = [
+        eq(invoices.companyId, ctx.companyId),
+        eq(invoices.customerId, input.customerId),
+        inArray(invoices.status, ['open', 'partial']),
+      ];
+      if (opts?.excludeInvoiceId) openConds.push(ne(invoices.id, opts.excludeInvoiceId));
       const openInvoiceRows = await ctx.db
-        .select({ balanceDue: invoices.balanceDue })
+        .select({ balanceDue: invoices.balanceDue, exchangeRate: invoices.exchangeRate })
         .from(invoices)
-        .where(
-          and(
-            eq(invoices.companyId, ctx.companyId),
-            eq(invoices.customerId, input.customerId),
-            inArray(invoices.status, ['open', 'partial']),
-          ),
-        );
-      const outstandingBalance = openInvoiceRows.reduce(
-        (sum, row) => sum.plus(Money.of(row.balanceDue)),
+        .where(and(...openConds));
+      const outstandingBase = openInvoiceRows.reduce(
+        (sum, row) =>
+          sum.plus(Money.round2(Money.mul(Money.of(row.balanceDue), Money.of(row.exchangeRate ?? 1)))),
         Money.zero(),
       );
-      if (outstandingBalance.plus(total).greaterThan(creditLimit)) {
+      const newExposureBase = Money.round2(Money.mul(total, exchangeRate));
+      if (outstandingBase.plus(newExposureBase).greaterThan(creditLimit)) {
         throw new ServiceError('VALIDATION', 'Credit limit exceeded');
       }
     }
   }
+
+  return {
+    exchangeRate,
+    arAccountId,
+    defaultIncomeId,
+    taxPayableId,
+    retainageAcctId,
+    headerClassId,
+    headerJobId,
+    computedLines,
+    subtotal,
+    discount,
+    discountType,
+    taxAmount,
+    total,
+    usesRetainage,
+    retainagePct,
+    retainageAmount,
+    dueNow,
+    itemMap,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// postInvoiceGL — build + post the balanced A/R journal entry
+// ---------------------------------------------------------------------------
+
+/**
+ * Build and post the journal entry for a prepared invoice.
+ *
+ * All GL amounts are in BASE currency = transaction-currency amount * exchangeRate.
+ *
+ * The scheme is designed so debits == credits:
+ *   Dr 1200 A/R              = total * fx
+ *   Cr <income accounts>     = subtotal * fx   (gross line amounts)
+ *   Cr 2200 Tax Payable      = taxAmount * fx  (0 if no tax)
+ *   Dr 4000 Sales contra     = discount * fx   (0 if no discount)
+ *
+ *   Debit  total*fx + discount*fx  = (subtotal - discount + taxAmount)*fx + discount*fx
+ *                                  = (subtotal + taxAmount)*fx
+ *   Total credits: subtotal*fx + taxAmount*fx  ✓
+ *
+ * Rounding each converted line independently can leave debits ≠ credits by a cent
+ * (sum of rounded products ≠ rounded sum). Instead, pick ONE base-currency anchor —
+ * entryBase = round2((subtotal + taxAmount) * fx) — and penny-allocate it across each
+ * side of the entry with allocate() (largest-remainder), so both sides always sum to
+ * exactly entryBase and assertBalanced passes. For exchangeRate = 1 the allocation is
+ * exact (weights already sum to the anchor), so base-currency entries are unchanged.
+ */
+async function postInvoiceGL(
+  tx: ServiceContext,
+  prep: PreparedInvoice,
+  invoiceId: string,
+  invoiceNumber: number,
+  date: Date,
+) {
+  const {
+    subtotal, taxAmount, discount, dueNow, retainageAmount, exchangeRate,
+    arAccountId, defaultIncomeId, taxPayableId, retainageAcctId, headerClassId,
+    computedLines,
+  } = prep;
+
+  const entryBase = Money.round2(Money.mul(subtotal.plus(taxAmount), exchangeRate));
+
+  // Aggregate per income account + class (multiple lines may share an account, and
+  // class must flow onto the GL line so P&L-by-Class sees invoice revenue).
+  const incomeCredits = new Map<
+    string,
+    { accountId: string; classId: string | null; amount: ReturnType<typeof Money.zero> }
+  >();
+  for (const cl of computedLines) {
+    const key = `${cl.accountId}|${cl.classId ?? ''}`;
+    const prev = incomeCredits.get(key);
+    if (prev) {
+      prev.amount = prev.amount.plus(Money.of(cl.amount));
+    } else {
+      incomeCredits.set(key, {
+        accountId: cl.accountId,
+        classId: cl.classId,
+        amount: Money.of(cl.amount),
+      });
+    }
+  }
+
+  // Debit side: A/R for the amount due now, Retainage Receivable for any held-back
+  // portion, and the discount contra. Weights sum to dueNow + retainage + discount
+  // = total + discount = subtotal + taxAmount, matching the credit side.
+  const debitSpecs: Array<{
+    accountId: string;
+    weight: ReturnType<typeof Money.zero>;
+    memo: string;
+    classId?: string | null;
+  }> = [{ accountId: arAccountId, weight: dueNow, memo: `Invoice #${invoiceNumber}` }];
+  if (retainageAmount.greaterThan(0) && retainageAcctId) {
+    debitSpecs.push({
+      accountId: retainageAcctId,
+      weight: retainageAmount,
+      memo: `Invoice #${invoiceNumber} — retainage`,
+    });
+  }
+  if (discount.greaterThan(0)) {
+    debitSpecs.push({
+      accountId: defaultIncomeId,
+      weight: discount,
+      memo: `Invoice #${invoiceNumber} — discount`,
+      classId: headerClassId,
+    });
+  }
+
+  // Credit side: each income account for its gross line amounts, plus sales tax.
+  const creditSpecs: Array<{
+    accountId: string;
+    weight: ReturnType<typeof Money.zero>;
+    memo: string;
+    classId?: string | null;
+  }> = [];
+  for (const spec of incomeCredits.values()) {
+    creditSpecs.push({
+      accountId: spec.accountId,
+      weight: spec.amount,
+      memo: `Invoice #${invoiceNumber} — income`,
+      classId: spec.classId,
+    });
+  }
+  if (taxAmount.greaterThan(0)) {
+    creditSpecs.push({
+      accountId: taxPayableId,
+      weight: taxAmount,
+      memo: `Invoice #${invoiceNumber} — sales tax`,
+    });
+  }
+
+  const debitAlloc = allocate(entryBase, debitSpecs.map((s) => s.weight));
+  const creditAlloc = allocate(entryBase, creditSpecs.map((s) => s.weight));
+
+  const postingLines: Array<{
+    accountId: string;
+    debit?: string;
+    credit?: string;
+    memo?: string;
+    classId?: string | null;
+  }> = [];
+  debitSpecs.forEach((s, i) => {
+    if (debitAlloc[i].greaterThan(0)) {
+      postingLines.push({
+        accountId: s.accountId,
+        debit: toAmountString(debitAlloc[i]),
+        memo: s.memo,
+        classId: s.classId ?? null,
+      });
+    }
+  });
+  creditSpecs.forEach((s, i) => {
+    if (creditAlloc[i].greaterThan(0)) {
+      postingLines.push({
+        accountId: s.accountId,
+        credit: toAmountString(creditAlloc[i]),
+        memo: s.memo,
+        classId: s.classId ?? null,
+      });
+    }
+  });
+
+  return postJournalEntry(tx, {
+    date,
+    description: `Invoice #${invoiceNumber}`,
+    reference: String(invoiceNumber),
+    sourceRef: `invoice:${invoiceId}`,
+    lines: postingLines,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// postInvoiceCOGS — perpetual inventory effects for inventory-item lines
+// ---------------------------------------------------------------------------
+
+/**
+ * Perpetual inventory: every line that sells an inventory-type item relieves
+ * stock and posts COGS inside the caller's transaction.
+ *   - FIFO-tracked items (any inventoryLayers rows) consume layers via fifo.ts,
+ *     which posts Dr 5000 COGS / Cr Inventory Asset at exact layer cost.
+ *   - Average-cost items go through inventory.recordCOGS (Dr COGS / Cr Inventory
+ *     at averageCost) and quantityOnHand is decremented.
+ * Each COGS entry is then tagged with sourceRef `invoice-cogs:<invoiceId>` and
+ * reference `cogs:<lineOrder>` so voidInvoice/updateInvoice can reverse it and
+ * restore stock.
+ */
+async function postInvoiceCOGS(
+  tx: ServiceContext,
+  prep: PreparedInvoice,
+  invoiceId: string,
+  invoiceNumber: number,
+  date: Date,
+) {
+  const { computedLines, itemMap } = prep;
+  const fifoTracked = new Map<string, boolean>();
+  for (const cl of computedLines) {
+    if (!cl.itemId) continue;
+    const info = itemMap.get(cl.itemId);
+    if (!info || info.type !== 'inventory') continue;
+
+    let isFifo = fifoTracked.get(cl.itemId);
+    if (isFifo === undefined) {
+      const [layerRow] = await tx.db
+        .select({ id: inventoryLayers.id })
+        .from(inventoryLayers)
+        .where(
+          and(
+            eq(inventoryLayers.companyId, tx.companyId),
+            eq(inventoryLayers.itemId, cl.itemId),
+          ),
+        )
+        .limit(1);
+      isFifo = Boolean(layerRow);
+      fifoTracked.set(cl.itemId, isFifo);
+    }
+
+    const cogsMemo = `Invoice #${invoiceNumber} — COGS (${info.name})`;
+    let cogsEntryId: string;
+    if (isFifo) {
+      const res = await consumeStock(tx, {
+        itemId: cl.itemId,
+        quantity: cl.quantity,
+        date,
+        memo: cogsMemo,
+      });
+      cogsEntryId = res.entryId;
+    } else {
+      // Guard: a zero-average-cost sale would produce a $0 (unpostable) COGS entry
+      // and an irreversible stock decrement — block it with a clear message.
+      const [itemRow] = await tx.db
+        .select({ averageCost: items.averageCost })
+        .from(items)
+        .where(and(eq(items.companyId, tx.companyId), eq(items.id, cl.itemId)));
+      if (!itemRow || Money.of(itemRow.averageCost ?? '0').lessThanOrEqualTo(0)) {
+        throw validation(
+          `Inventory item "${info.name}" has no average cost. Receive stock with a unit cost (bill or inventory adjustment) before selling it.`,
+        );
+      }
+      const res = await recordCOGS(tx, {
+        itemId: cl.itemId,
+        quantity: cl.quantity,
+        date,
+        memo: cogsMemo,
+      });
+      cogsEntryId = res.entry.id;
+    }
+
+    await tx.db
+      .update(journalEntries)
+      .set({
+        sourceRef: `invoice-cogs:${invoiceId}`,
+        reference: `cogs:${cl.lineOrder}`,
+        updatedAt: new Date(),
+      })
+      .where(eq(journalEntries.id, cogsEntryId));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// reverseInvoiceCOGS — void COGS entries and restore stock
+// ---------------------------------------------------------------------------
+
+/**
+ * Reverse perpetual-inventory effects of an invoice: void each COGS entry
+ * tagged `invoice-cogs:<id>` and put the relieved stock back on hand.
+ * Must run BEFORE the invoice's lines are deleted/replaced (it reads them to
+ * know which item/quantity each COGS entry belongs to).
+ */
+async function reverseInvoiceCOGS(
+  tx: ServiceContext,
+  invoice: { id: string; date: Date },
+) {
+  const id = invoice.id;
+  const cogsEntries = await tx.db
+    .select()
+    .from(journalEntries)
+    .where(
+      and(
+        eq(journalEntries.companyId, tx.companyId),
+        eq(journalEntries.sourceRef, `invoice-cogs:${id}`),
+        eq(journalEntries.status, 'posted'),
+      ),
+    );
+  if (cogsEntries.length === 0) return;
+
+  const lines = await tx.db
+    .select()
+    .from(invoiceLines)
+    .where(eq(invoiceLines.invoiceId, id));
+  const lineByOrder = new Map(lines.map((l) => [l.lineOrder, l]));
+
+  for (const cogsEntry of cogsEntries) {
+    // COGS amount = total debits on the entry (Dr COGS / Cr Inventory Asset).
+    const entryLines = await tx.db
+      .select()
+      .from(journalEntryLines)
+      .where(eq(journalEntryLines.journalEntryId, cogsEntry.id));
+    const cogsAmount = entryLines.reduce(
+      (sum, l) => sum.plus(Money.of(l.debit ?? '0')),
+      Money.zero(),
+    );
+
+    // Reverse the GL impact.
+    await voidJournalEntry(tx, cogsEntry.id);
+
+    // Restore stock for the invoice line this entry belongs to.
+    const match = /^cogs:(\d+)$/.exec(cogsEntry.reference ?? '');
+    const line = match ? lineByOrder.get(Number(match[1])) : undefined;
+    if (!line?.itemId) continue;
+    const qty = Money.of(line.quantity);
+    if (qty.lessThanOrEqualTo(0)) continue;
+
+    const [item] = await tx.db
+      .select()
+      .from(items)
+      .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
+    if (!item) continue;
+
+    const currentQty = Money.of(item.quantityOnHand ?? '0');
+    const newQty = currentQty.plus(qty);
+
+    const [layerRow] = await tx.db
+      .select({ id: inventoryLayers.id })
+      .from(inventoryLayers)
+      .where(
+        and(
+          eq(inventoryLayers.companyId, tx.companyId),
+          eq(inventoryLayers.itemId, line.itemId),
+        ),
+      )
+      .limit(1);
+
+    if (layerRow) {
+      // FIFO-tracked: post a compensating layer at the blended consumed cost
+      // (the JE void already restored the Inventory Asset GL balance).
+      const unitCost = cogsAmount.dividedBy(qty);
+      await tx.db.insert(inventoryLayers).values({
+        companyId: tx.companyId,
+        itemId: line.itemId,
+        date: invoice.date,
+        quantityRemaining: qty.toFixed(4),
+        unitCost: unitCost.toFixed(4),
+      });
+      await tx.db
+        .update(items)
+        .set({ quantityOnHand: newQty.toFixed(4), updatedAt: new Date() })
+        .where(eq(items.id, line.itemId));
+    } else {
+      // Average-cost: weight the restored value back into averageCost so the
+      // item valuation stays tied to the restored GL balance.
+      const currentAvg = Money.of(item.averageCost ?? '0');
+      const newAvg = newQty.isZero()
+        ? currentAvg
+        : currentQty.times(currentAvg).plus(cogsAmount).dividedBy(newQty);
+      await tx.db
+        .update(items)
+        .set({
+          quantityOnHand: newQty.toFixed(4),
+          averageCost: newAvg.toFixed(4),
+          updatedAt: new Date(),
+        })
+        .where(eq(items.id, line.itemId));
+    }
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'item',
+      entityId: line.itemId,
+      oldValues: { quantityOnHand: item.quantityOnHand },
+      newValues: {
+        quantityOnHand: newQty.toFixed(4),
+        reason: `invoice_void:${id}`,
+        restoredCOGS: toAmountString(cogsAmount),
+      },
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// createInvoice
+// ---------------------------------------------------------------------------
+
+export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInput) {
+  const prep = await prepareInvoice(ctx, input);
 
   // ---------------------------------------------------------------------------
   // Persist everything in a single transaction.
@@ -340,8 +828,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
 
     // Resolve currency fields.
     const currency = input.currency ?? null;
-    // exchangeRate was computed above (defaults to 1).
-    const exchangeRateStr = toAmountString(exchangeRate);
+    const exchangeRateStr = toAmountString(prep.exchangeRate);
 
     // 1) Insert invoice header.
     //    subtotal / discount / taxAmount / total / balanceDue are stored in TRANSACTION currency.
@@ -355,17 +842,19 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         dueDate: input.dueDate ?? null,
         status: 'open',
         taxRateId: input.taxRateId ?? null,
+        classId: prep.headerClassId,
+        jobId: prep.headerJobId,
         currency,
         exchangeRate: exchangeRateStr,
-        discountType,
-        subtotal: toAmountString(subtotal),
-        discount: toAmountString(discount),
-        taxAmount: toAmountString(taxAmount),
-        total: toAmountString(total),
+        discountType: prep.discountType,
+        subtotal: toAmountString(prep.subtotal),
+        discount: toAmountString(prep.discount),
+        taxAmount: toAmountString(prep.taxAmount),
+        total: toAmountString(prep.total),
         amountPaid: '0.00',
-        balanceDue: toAmountString(dueNow),
-        retainagePercent: usesRetainage ? retainagePct.toFixed(2) : null,
-        retainageAmount: toAmountString(retainageAmount),
+        balanceDue: toAmountString(prep.dueNow),
+        retainagePercent: prep.usesRetainage ? prep.retainagePct.toFixed(2) : null,
+        retainageAmount: toAmountString(prep.retainageAmount),
         memo: input.memo ?? null,
         // postedEntryId filled below after posting
       })
@@ -373,7 +862,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
 
     // 2) Insert invoice lines.
     await tx.db.insert(invoiceLines).values(
-      computedLines.map((cl) => ({
+      prep.computedLines.map((cl) => ({
         invoiceId: invoice.id,
         itemId: cl.itemId,
         accountId: cl.accountId,
@@ -383,92 +872,14 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         amount: cl.amount,
         taxable: cl.taxable,
         taxRateId: cl.taxRateId,
+        classId: cl.classId,
+        jobId: cl.jobId,
         lineOrder: cl.lineOrder,
       })),
     );
 
     // 3) Build and post the journal entry.
-    //
-    // All GL amounts are in BASE currency = transaction-currency amount * exchangeRate.
-    //
-    // The scheme is designed so debits == credits:
-    //   Dr 1200 A/R              = total * fx
-    //   Cr <income accounts>     = subtotal * fx   (gross line amounts)
-    //   Cr 2200 Tax Payable      = taxAmount * fx  (0 if no tax)
-    //   Dr 4000 Sales contra     = discount * fx   (0 if no discount)
-    //
-    //   Debit  total*fx + discount*fx  = (subtotal - discount + taxAmount)*fx + discount*fx
-    //                                  = (subtotal + taxAmount)*fx
-    //   Total credits: subtotal*fx + taxAmount*fx  ✓
-
-    /** Convert transaction-currency amount to base currency, rounded to 2dp. */
-    function toBase(txAmount: ReturnType<typeof Money.zero>): string {
-      return toAmountString(Money.round2(Money.mul(txAmount, exchangeRate)));
-    }
-
-    // Aggregate per income account (multiple lines may share an account).
-    const incomeCredits = new Map<string, ReturnType<typeof Money.zero>>();
-    for (const cl of computedLines) {
-      const prev = incomeCredits.get(cl.accountId) ?? Money.zero();
-      incomeCredits.set(cl.accountId, prev.plus(Money.of(cl.amount)));
-    }
-
-    const postingLines: Array<{
-      accountId: string;
-      debit?: string;
-      credit?: string;
-      memo?: string;
-    }> = [];
-
-    // Debit A/R for the amount due now; debit Retainage Receivable for any held-back portion.
-    // (AR debit + retainage debit == total, so the entry still balances.)
-    postingLines.push({
-      accountId: arAccountId,
-      debit: toBase(dueNow),
-      memo: `Invoice #${invoiceNumber}`,
-    });
-    if (retainageAmount.greaterThan(0) && retainageAcctId) {
-      postingLines.push({
-        accountId: retainageAcctId,
-        debit: toBase(retainageAmount),
-        memo: `Invoice #${invoiceNumber} — retainage`,
-      });
-    }
-
-    // Credit each income account for the gross line amount (in BASE currency).
-    for (const [acctId, amount] of incomeCredits) {
-      postingLines.push({
-        accountId: acctId,
-        credit: toBase(amount),
-        memo: `Invoice #${invoiceNumber} — income`,
-      });
-    }
-
-    // Credit Sales Tax Payable (only if there is tax) — in BASE currency.
-    if (taxAmount.greaterThan(0)) {
-      postingLines.push({
-        accountId: taxPayableId,
-        credit: toBase(taxAmount),
-        memo: `Invoice #${invoiceNumber} — sales tax`,
-      });
-    }
-
-    // Debit contra (discount reduces income) — only if discount > 0 — in BASE currency.
-    if (discount.greaterThan(0)) {
-      postingLines.push({
-        accountId: defaultIncomeId,
-        debit: toBase(discount),
-        memo: `Invoice #${invoiceNumber} — discount`,
-      });
-    }
-
-    const entry = await postJournalEntry(tx, {
-      date: input.date,
-      description: `Invoice #${invoiceNumber}`,
-      reference: String(invoiceNumber),
-      sourceRef: `invoice:${invoice.id}`,
-      lines: postingLines,
-    });
+    const entry = await postInvoiceGL(tx, prep, invoice.id, invoiceNumber, input.date);
 
     // 4) Stamp postedEntryId on the invoice.
     const [updated] = await tx.db
@@ -477,7 +888,10 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
       .where(eq(invoices.id, invoice.id))
       .returning();
 
-    // 5) Audit trail.
+    // 5) Perpetual inventory: relieve stock + post COGS for inventory-item lines.
+    await postInvoiceCOGS(tx, prep, invoice.id, invoiceNumber, input.date);
+
+    // 6) Audit trail.
     await writeAudit(tx, {
       action: 'create',
       entityType: 'invoice',
@@ -485,12 +899,185 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
       newValues: {
         invoiceNumber,
         customerId: input.customerId,
-        total: toAmountString(total),
+        total: toAmountString(prep.total),
         postedEntryId: entry.id,
       },
     });
 
-    return { ...updated, lines: computedLines };
+    return { ...updated, lines: prep.computedLines };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// updateInvoice
+// ---------------------------------------------------------------------------
+
+/**
+ * Edit a saved invoice in place (QB Desktop "edit any saved transaction").
+ *
+ * Allowed only while NO payments/credits have been applied (amountPaid == 0)
+ * and the accounting period is open (enforced by voidJournalEntry on the old
+ * entry's date and postJournalEntry on the new date).
+ *
+ * Implementation — all inside ONE transaction:
+ *   1. Void the existing journal entry.
+ *   2. Void all COGS entries tagged `invoice-cogs:<id>`, restoring stock.
+ *   3. Replace the invoice lines and update the header in place,
+ *      preserving invoiceNumber and createdAt (the document keeps its identity).
+ *   4. Re-post the GL entry and COGS from the new lines.
+ *   5. Audit trail records old and new values.
+ */
+export async function updateInvoice(ctx: ServiceContext, id: string, input: CreateInvoiceInput) {
+  // Pre-check outside the transaction for a fast, friendly error.
+  const [existing] = await ctx.db
+    .select()
+    .from(invoices)
+    .where(and(eq(invoices.companyId, ctx.companyId), eq(invoices.id, id)));
+  if (!existing) throw notFound('Invoice');
+  if (existing.status === 'void') {
+    throw new ServiceError('CONFLICT', 'Cannot edit a voided invoice.');
+  }
+  if (existing.amountPaid && Money.gt(existing.amountPaid, 0)) {
+    throw new ServiceError(
+      'CONFLICT',
+      'Cannot edit an invoice that has payments or credits applied. Unapply them first.',
+    );
+  }
+
+  // Validate + compute the new document (read-only). Exclude this invoice's own
+  // current balance from the credit-limit exposure — it is being replaced.
+  const prep = await prepareInvoice(ctx, input, { excludeInvoiceId: id });
+
+  return inTransaction(ctx, async (tx) => {
+    // Re-load inside the transaction to close the read-then-write race.
+    const [invoice] = await tx.db
+      .select()
+      .from(invoices)
+      .where(and(eq(invoices.companyId, tx.companyId), eq(invoices.id, id)));
+    if (!invoice) throw notFound('Invoice');
+    if (invoice.status === 'void') {
+      throw new ServiceError('CONFLICT', 'Cannot edit a voided invoice.');
+    }
+    if (invoice.amountPaid && Money.gt(invoice.amountPaid, 0)) {
+      throw new ServiceError(
+        'CONFLICT',
+        'Cannot edit an invoice that has payments or credits applied. Unapply them first.',
+      );
+    }
+
+    // Snapshot old lines for the audit trail BEFORE replacing them.
+    const oldLines = await tx.db
+      .select()
+      .from(invoiceLines)
+      .where(eq(invoiceLines.invoiceId, id))
+      .orderBy(invoiceLines.lineOrder);
+
+    // 1) Void the original A/R journal entry (assertPeriodOpen runs on its date).
+    if (invoice.postedEntryId) {
+      await voidJournalEntry(tx, invoice.postedEntryId);
+    }
+
+    // 2) Void COGS entries + restore stock (reads old lines — must precede delete).
+    await reverseInvoiceCOGS(tx, { id, date: invoice.date });
+
+    // 3) Replace lines.
+    await tx.db.delete(invoiceLines).where(eq(invoiceLines.invoiceId, id));
+    await tx.db.insert(invoiceLines).values(
+      prep.computedLines.map((cl) => ({
+        invoiceId: id,
+        itemId: cl.itemId,
+        accountId: cl.accountId,
+        description: cl.description,
+        quantity: cl.quantity,
+        rate: cl.rate,
+        amount: cl.amount,
+        taxable: cl.taxable,
+        taxRateId: cl.taxRateId,
+        classId: cl.classId,
+        jobId: cl.jobId,
+        lineOrder: cl.lineOrder,
+      })),
+    );
+
+    // 4) Re-post the GL entry from the new document, then update the header in
+    //    place — invoiceNumber and createdAt are intentionally NOT touched.
+    const entry = await postInvoiceGL(tx, prep, id, invoice.invoiceNumber, input.date);
+
+    const [updated] = await tx.db
+      .update(invoices)
+      .set({
+        customerId: input.customerId,
+        date: input.date,
+        dueDate: input.dueDate ?? null,
+        status: 'open',
+        taxRateId: input.taxRateId ?? null,
+        classId: prep.headerClassId,
+        jobId: prep.headerJobId,
+        currency: input.currency ?? null,
+        exchangeRate: toAmountString(prep.exchangeRate),
+        discountType: prep.discountType,
+        subtotal: toAmountString(prep.subtotal),
+        discount: toAmountString(prep.discount),
+        taxAmount: toAmountString(prep.taxAmount),
+        total: toAmountString(prep.total),
+        amountPaid: '0.00',
+        balanceDue: toAmountString(prep.dueNow),
+        retainagePercent: prep.usesRetainage ? prep.retainagePct.toFixed(2) : null,
+        retainageAmount: toAmountString(prep.retainageAmount),
+        memo: input.memo ?? null,
+        postedEntryId: entry.id,
+        updatedAt: new Date(),
+      })
+      .where(eq(invoices.id, id))
+      .returning();
+
+    // 5) Re-post perpetual inventory COGS for the new lines.
+    await postInvoiceCOGS(tx, prep, id, invoice.invoiceNumber, input.date);
+
+    // 6) Audit trail with old + new values.
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'invoice',
+      entityId: id,
+      oldValues: {
+        customerId: invoice.customerId,
+        date: invoice.date,
+        dueDate: invoice.dueDate,
+        subtotal: invoice.subtotal,
+        discount: invoice.discount,
+        taxAmount: invoice.taxAmount,
+        total: invoice.total,
+        memo: invoice.memo,
+        postedEntryId: invoice.postedEntryId,
+        lines: oldLines.map((l) => ({
+          itemId: l.itemId,
+          description: l.description,
+          quantity: l.quantity,
+          rate: l.rate,
+          amount: l.amount,
+        })),
+      },
+      newValues: {
+        customerId: input.customerId,
+        date: input.date,
+        dueDate: input.dueDate ?? null,
+        subtotal: toAmountString(prep.subtotal),
+        discount: toAmountString(prep.discount),
+        taxAmount: toAmountString(prep.taxAmount),
+        total: toAmountString(prep.total),
+        memo: input.memo ?? null,
+        postedEntryId: entry.id,
+        lines: prep.computedLines.map((cl) => ({
+          itemId: cl.itemId,
+          description: cl.description,
+          quantity: cl.quantity,
+          rate: cl.rate,
+          amount: cl.amount,
+        })),
+      },
+    });
+
+    return { ...updated, lines: prep.computedLines };
   });
 }
 
@@ -502,19 +1089,16 @@ export async function listInvoices(
   ctx: ServiceContext,
   opts?: { customerId?: string; status?: string },
 ) {
-  let query = ctx.db
+  // Filter in SQL, not in JS — fetching the whole table is O(table size) per request.
+  const conds = [eq(invoices.companyId, ctx.companyId)];
+  if (opts?.customerId) conds.push(eq(invoices.customerId, opts.customerId));
+  if (opts?.status) conds.push(eq(invoices.status, opts.status as never));
+
+  return ctx.db
     .select()
     .from(invoices)
-    .where(eq(invoices.companyId, ctx.companyId));
-
-  // Drizzle doesn't support dynamic .where chaining easily without sql helper;
-  // build a records-based filter instead.
-  const rows = await query.orderBy(invoices.invoiceNumber);
-  return rows.filter((r) => {
-    if (opts?.customerId && r.customerId !== opts.customerId) return false;
-    if (opts?.status && r.status !== opts.status) return false;
-    return true;
-  });
+    .where(and(...conds))
+    .orderBy(invoices.invoiceNumber);
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +1150,10 @@ export async function voidInvoice(ctx: ServiceContext, id: string) {
       await voidJournalEntry(tx, invoice.postedEntryId);
     }
 
+    // Reverse perpetual-inventory effects: void each COGS entry created by
+    // createInvoice and put the relieved stock back on hand.
+    await reverseInvoiceCOGS(tx, { id, date: invoice.date });
+
     // Mark invoice void.
     const [updated] = await tx.db
       .update(invoices)
@@ -614,7 +1202,13 @@ export async function markPaidAmount(
     throw validation('Payment amount would make amountPaid negative.');
   }
 
-  const newBalance = Money.round2(Money.of(invoice.total).minus(newAmountPaid));
+  // Balance due is computed against the billed base (total minus any retainage holdback),
+  // matching how balanceDue is set at creation. Otherwise the held-back amount would be
+  // re-introduced into what is due.
+  const billedBase = Money.round2(
+    Money.of(invoice.total).minus(Money.of(invoice.retainageAmount ?? '0')),
+  );
+  const newBalance = Money.round2(billedBase.minus(newAmountPaid));
   const newStatus = newBalance.lessThanOrEqualTo(0)
     ? 'paid'
     : newAmountPaid.greaterThan(0)

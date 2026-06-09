@@ -1,0 +1,77 @@
+/**
+ * GET   /api/employees/[id]  — fetch a single employee (SSN masked to last 4).
+ * PATCH /api/employees/[id]  — update employee master data / payroll info, and
+ *                              deactivate (isActive:false) / reactivate (true).
+ *
+ * PATCH body (all fields optional):
+ *   { firstName, lastName, email, payType, payRate, ssn, w4, address, isActive }
+ */
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerContext } from '@/lib/context';
+import { getEmployee, updateEmployee } from '@/lib/services/payroll';
+import { ServiceError } from '@/lib/services/_base';
+
+function errorResponse(err: unknown) {
+  if (err instanceof ServiceError) {
+    const status =
+      err.code === 'NOT_FOUND' ? 404
+      : err.code === 'VALIDATION' || err.code === 'UNBALANCED' ? 400
+      : err.code === 'FORBIDDEN' ? 403
+      : err.code === 'CONFLICT' ? 409
+      : 500;
+    return NextResponse.json({ error: err.message, code: err.code }, { status });
+  }
+  console.error('[employees/[id]] unexpected error:', err);
+  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+}
+
+/** Never send the full SSN to the browser — mask to the last 4 digits. */
+function maskEmployee<T extends { ssn?: string | null }>(emp: T) {
+  const digits = (emp.ssn ?? '').replace(/\D/g, '');
+  return {
+    ...emp,
+    ssn: undefined,
+    ssnLast4: digits.length >= 4 ? digits.slice(-4) : null,
+  };
+}
+
+export async function GET(
+  _req: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  try {
+    const ctx = await getServerContext();
+    const { id } = await params;
+    const employee = await getEmployee(ctx, id);
+    return NextResponse.json(maskEmployee(employee));
+  } catch (err) {
+    return errorResponse(err);
+  }
+}
+
+export async function PATCH(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  try {
+    const ctx = await getServerContext();
+    const { id } = await params;
+    const body = await req.json();
+
+    const updated = await updateEmployee(ctx, id, {
+      firstName: body.firstName,
+      lastName: body.lastName,
+      email: body.email,
+      payType: body.payType,
+      payRate: body.payRate,
+      ssn: body.ssn,
+      w4: body.w4,
+      address: body.address,
+      isActive: body.isActive,
+    });
+
+    return NextResponse.json(maskEmployee(updated));
+  } catch (err) {
+    return errorResponse(err);
+  }
+}

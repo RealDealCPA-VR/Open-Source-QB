@@ -1,30 +1,18 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { api } from '@/lib/client';
+import { paletteDestinations } from '@/lib/nav';
 
 interface Dest { label: string; href: string; group: string }
 interface SearchResult { type: string; label: string; href: string }
 
-// Flat list of navigable destinations (kept in sync with the sidebar).
-const DESTINATIONS: Dest[] = [
-  ['Dashboard', '/dashboard'], ['Invoices', '/invoices'], ['Estimates', '/estimates'],
-  ['Sales Orders', '/sales-orders'], ['Receive Payments', '/payments'], ['Credit Memos', '/credit-memos'],
-  ['Customers', '/customers'], ['Items', '/items'], ['Bills', '/bills'], ['Vendor Credits', '/vendor-credits'],
-  ['Print Checks', '/print-checks'], ['Vendors', '/vendors'], ['Purchase Orders', '/purchase-orders'],
-  ['Banking', '/banking'], ['Bank Feeds', '/bank-feeds'], ['Bank Review', '/bank-review'], ['Deposits', '/deposits'],
-  ['Reconcile', '/reconcile'], ['Transfers', '/transfers'], ['Journal', '/journal'], ['Chart of Accounts', '/accounts'],
-  ['Pay Liabilities', '/pay-liabilities'], ['Payroll', '/employees'], ['Pay Stubs', '/pay-stubs'],
-  ['Payroll Forms', '/payroll-forms'], ['Payroll Tax', '/payroll-tax'], ['Tracking', '/tracking'],
-  ['Tax Components', '/sales-tax-components'], ['Recurring', '/recurring'], ['Currencies', '/currencies'],
-  ['Year-End Close', '/year-end'], ['Reports', '/reports'], ['Report Builder', '/reports/builder'],
-  ['P&L (Cash Basis)', '/reports/profit-loss-cash'], ['Consolidated', '/reports/consolidated'], ['AI Review', '/errors'],
-  ['Jobs', '/jobs'], ['Time Tracking', '/time-tracking'], ['Fixed Assets', '/fixed-assets'], ['Assemblies', '/assemblies'],
-  ['FIFO Inventory', '/fifo'], ['Customer Pricing', '/customer-pricing'], ['Expense Reports', '/expense-reports'],
-  ['Audit Trail', '/audit-trail'], ['Attachments', '/attachments'], ['Data Integrity', '/integrity'],
-  ['Merge Records', '/merge'], ['Companies', '/companies'], ['Security (2FA)', '/security'], ['Settings', '/settings'],
-].map(([label, href]) => ({ label, href, group: 'Go to' }));
+// Flat list of navigable destinations, derived from the sidebar's nav data (lib/nav.ts)
+// so the palette can never drift out of sync with the sidebar.
+const DESTINATIONS: Dest[] = paletteDestinations.map(({ label, href }) => ({ label, href, group: 'Go to' }));
 
 export default function CommandPalette() {
+  const router = useRouter();
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
   const [results, setResults] = useState<SearchResult[]>([]);
@@ -81,7 +69,7 @@ export default function CommandPalette() {
 
   function go(href: string) {
     setOpen(false);
-    window.location.href = href;
+    router.push(href);
   }
 
   if (!open) return null;

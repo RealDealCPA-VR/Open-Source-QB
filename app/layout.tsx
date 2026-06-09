@@ -1,6 +1,16 @@
 import "./globals.css";
+import { Inter } from "next/font/google";
 import { Toaster } from "@/components/ui";
 import AppShell from "@/components/AppShell";
+import DesktopBridge from "@/components/DesktopBridge";
+
+// Self-hosted via next/font: the woff2 is downloaded at BUILD time and served from the app
+// bundle, so the offline desktop app never phones Google Fonts at runtime.
+const inter = Inter({
+  subsets: ["latin"],
+  weight: ["400", "600", "700", "900"],
+  variable: "--font-inter",
+});
 
 export const metadata = {
   title: "BookKeeper AI",
@@ -9,15 +19,13 @@ export const metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="en" className={inter.variable}>
       <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap" rel="stylesheet" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta charSet="UTF-8" />
       </head>
       <body className="bg-offwhite font-sans antialiased min-h-screen">
+        <DesktopBridge />
         <AppShell>{children}</AppShell>
         <Toaster />
       </body>

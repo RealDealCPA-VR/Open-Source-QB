@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState } from 'react';
-import { UserSquare, Download, LogOut } from 'lucide-react';
-import { Button, Card, Badge } from '@/components/ui';
+import { UserSquare, Download, LogOut, FileText } from 'lucide-react';
+import { Button, Card, Badge, EmptyState, Spinner, Table, Th, Td, Tr } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
@@ -41,7 +41,14 @@ export default function PortalPage() {
     }
   }
 
-  if (loading) return <main className="min-h-screen grid place-items-center text-navy/40">Loading…</main>;
+  if (loading)
+    return (
+      <main className="min-h-screen grid place-items-center text-navy/40">
+        <span className="inline-flex items-center gap-2">
+          <Spinner className="h-5 w-5" /> Loading…
+        </span>
+      </main>
+    );
   if (!me) return null;
 
   return (
@@ -64,41 +71,45 @@ export default function PortalPage() {
       <Card className="p-6 max-w-3xl">
         <h2 className="text-lg font-bold text-navy mb-4">My Pay Stubs</h2>
         {me.paychecks.length === 0 ? (
-          <p className="text-navy/40">No paychecks yet.</p>
+          <EmptyState
+            icon={FileText}
+            title="No paychecks yet"
+            message="Your pay stubs will appear here after your first payroll run."
+          />
         ) : (
-          <table className="w-full border-collapse">
+          <Table>
             <thead>
-              <tr className="border-b-2 border-navy/10 text-navy/70 text-sm">
-                <th className="py-2 px-3 text-left font-semibold">Pay Date</th>
-                <th className="py-2 px-3 text-left font-semibold">Period</th>
-                <th className="py-2 px-3 text-right font-semibold">Gross</th>
-                <th className="py-2 px-3 text-right font-semibold">Net</th>
-                <th className="py-2 px-3 text-right font-semibold">Stub</th>
+              <tr>
+                <Th>Pay Date</Th>
+                <Th>Period</Th>
+                <Th numeric>Gross</Th>
+                <Th numeric>Net</Th>
+                <Th numeric>Stub</Th>
               </tr>
             </thead>
             <tbody>
               {me.paychecks.map((p) => (
-                <tr key={p.id} className="border-b border-slate-100 hover:bg-emerald/5">
-                  <td className="py-2 px-3 text-navy whitespace-nowrap">{formatDate(p.payDate)}</td>
-                  <td className="py-2 px-3 text-navy/60 text-sm">
+                <Tr key={p.id} className="hover:bg-emerald/5">
+                  <Td className="whitespace-nowrap">{formatDate(p.payDate)}</Td>
+                  <Td className="text-navy/60 text-sm">
                     {p.periodStart ? `${formatDate(p.periodStart)} – ${formatDate(p.periodEnd)}` : '—'}
-                  </td>
-                  <td className="py-2 px-3 text-right tabular-nums">{formatCurrency(p.grossPay)}</td>
-                  <td className="py-2 px-3 text-right tabular-nums font-semibold text-emerald">
+                  </Td>
+                  <Td numeric>{formatCurrency(p.grossPay)}</Td>
+                  <Td numeric className="font-semibold text-emerald">
                     {formatCurrency(p.netPay)}
-                  </td>
-                  <td className="py-2 px-3 text-right">
+                  </Td>
+                  <Td numeric>
                     <button
                       onClick={() => window.open(`/api/payroll/paystub?paycheckId=${p.id}`, '_blank')}
                       className="text-electric hover:underline inline-flex items-center gap-1 text-sm"
                     >
                       <Download className="h-3.5 w-3.5" /> PDF
                     </button>
-                  </td>
-                </tr>
+                  </Td>
+                </Tr>
               ))}
             </tbody>
-          </table>
+          </Table>
         )}
         <div className="mt-4">
           <Badge tone="info">Read-only employee view</Badge>

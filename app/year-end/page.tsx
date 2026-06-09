@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { CalendarCheck, AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { CalendarClock, AlertTriangle, CheckCircle2 } from 'lucide-react';
 import {
   Button,
   Card,
@@ -13,6 +13,7 @@ import {
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/dates';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -51,8 +52,8 @@ function ConfirmModal({ open, fiscalYear, running, onConfirm, onClose }: Confirm
           <Button variant="secondary" onClick={onClose} disabled={running}>
             Cancel
           </Button>
-          <Button variant="danger" onClick={onConfirm} disabled={running}>
-            {running ? 'Processing…' : `Close FY ${fiscalYear}`}
+          <Button variant="danger" onClick={onConfirm} loading={running}>
+            Close FY {fiscalYear}
           </Button>
         </>
       }
@@ -92,19 +93,19 @@ function ResultCard({ result }: ResultCardProps) {
   return (
     <Card className="p-6 mt-6">
       <div className="flex items-center gap-3 mb-5">
-        <CheckCircle2 className="h-6 w-6 text-emerald-500 flex-shrink-0" />
+        <CheckCircle2 className="h-6 w-6 text-emerald flex-shrink-0" />
         <div>
           <p className="font-bold text-navy text-lg">Year-End Close Completed</p>
           <p className="text-sm text-navy/50">Journal Entry #{result.entryNumber}</p>
         </div>
       </div>
 
-      <div className="grid grid-cols-3 gap-4 mb-5">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-5">
         <div className="rounded-xl bg-navy/5 px-4 py-3">
           <p className="text-xs font-semibold text-navy/50 uppercase tracking-wide mb-1">
             Total Revenue
           </p>
-          <p className="text-xl font-bold text-emerald-600 tabular-nums">
+          <p className="text-xl font-bold text-emerald tabular-nums">
             {formatCurrency(result.totalRevenue)}
           </p>
         </div>
@@ -122,7 +123,7 @@ function ResultCard({ result }: ResultCardProps) {
           </p>
           <p
             className={`text-xl font-bold tabular-nums ${
-              netPositive ? 'text-emerald-600' : 'text-red-500'
+              netPositive ? 'text-emerald' : 'text-red-500'
             }`}
           >
             {formatCurrency(result.netIncome)}
@@ -134,7 +135,7 @@ function ResultCard({ result }: ResultCardProps) {
         <span className="font-semibold text-navy">Closing Entry: </span>
         {result.description}
         <span className="ml-3 text-navy/40 text-xs">
-          {result.date ? new Date(result.date).toLocaleDateString() : ''}
+          {result.date ? formatDate(result.date) : ''}
         </span>
       </div>
 
@@ -185,7 +186,7 @@ export default function YearEndPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader title="Year-End Close" icon={CalendarCheck} />
+      <PageHeader title="Year-End Close" icon={CalendarClock} />
 
       <div className="max-w-xl">
         <Card className="p-6">
@@ -230,7 +231,7 @@ export default function YearEndPage() {
             onClick={() => setShowConfirm(true)}
             disabled={!yearValid || running}
           >
-            <CalendarCheck className="h-4 w-4" />
+            <CalendarClock className="h-4 w-4" />
             Run Year-End Close for FY {yearValid ? yearNum : '—'}
           </Button>
         </Card>

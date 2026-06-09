@@ -4,7 +4,7 @@
  * Monthly Profit & Loss — 12-column calendar-year view with CSV download.
  * Users pick a year; each account gets a column per month + a row total.
  */
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { BarChart2, Download } from 'lucide-react';
 import {
   Button,
@@ -179,6 +179,12 @@ export default function PLMonthlyPage() {
     }
   }, [year]);
 
+  // Auto-load the pre-filled default year on mount.
+  useEffect(() => {
+    run();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const net = report ? parseFloat(report.netIncome) : 0;
 
   return (
@@ -208,8 +214,8 @@ export default function PLMonthlyPage() {
               ))}
             </Select>
           </div>
-          <Button onClick={run} disabled={loading}>
-            {loading ? 'Loading…' : 'Run'}
+          <Button onClick={run} loading={loading}>
+            Run Report
           </Button>
         </div>
       </Card>
@@ -258,7 +264,7 @@ export default function PLMonthlyPage() {
                       <td
                         key={i}
                         className={`py-3 px-4 text-right tabular-nums text-sm font-extrabold ${
-                          n < 0 ? 'text-red-600' : n > 0 ? 'text-emerald-600' : 'text-navy/30'
+                          n < 0 ? 'text-red-600' : n > 0 ? 'text-emerald' : 'text-navy/30'
                         }`}
                       >
                         {n === 0 ? '—' : formatCurrency(amt)}
@@ -267,7 +273,7 @@ export default function PLMonthlyPage() {
                   })}
                   <td
                     className={`py-3 px-4 text-right tabular-nums text-base font-extrabold ${
-                      net >= 0 ? 'text-emerald-600' : 'text-red-600'
+                      net >= 0 ? 'text-emerald' : 'text-red-600'
                     }`}
                   >
                     {formatCurrency(report.netIncome)}

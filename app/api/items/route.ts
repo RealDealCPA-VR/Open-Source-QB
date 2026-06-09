@@ -5,6 +5,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listItems, createItem } from '@/lib/services/items';
+import { setReorderPoint } from '@/lib/services/inventory';
 import { ServiceError } from '@/lib/services/_base';
 import type { ItemType } from '@/lib/services/items';
 
@@ -52,7 +53,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const ctx = await getServerContext();
     const body = await req.json();
 
-    const item = await createItem(ctx, {
+    let item = await createItem(ctx, {
       name: body.name,
       sku: body.sku ?? null,
       type: body.type ?? 'service',
@@ -64,6 +65,12 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       assetAccountId: body.assetAccountId ?? null,
       taxable: body.taxable ?? true,
     });
+
+    // Reorder point is managed by the inventory service (it drives the
+    // reorder report and low-stock alerts) rather than the item master data.
+    if (body.reorderPoint != null && body.reorderPoint !== '') {
+      item = await setReorderPoint(ctx, item.id, body.reorderPoint);
+    }
 
     return NextResponse.json({ item }, { status: 201 });
   } catch (err) {

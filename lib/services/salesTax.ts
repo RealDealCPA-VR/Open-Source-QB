@@ -4,7 +4,7 @@
  * and a sales-tax liability summary.
  */
 import { and, eq, sql } from 'drizzle-orm';
-import { taxAgencies, taxRates, invoices } from '@/lib/db/schema';
+import { creditMemos, taxAgencies, taxRates, invoices } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 
@@ -72,9 +72,42 @@ export async function salesTaxLiability(ctx: ServiceContext, range?: { from?: Da
   const conds = [eq(invoices.companyId, ctx.companyId)];
   if (range?.from) conds.push(sql`${invoices.date} >= ${range.from}`);
   if (range?.to) conds.push(sql`${invoices.date} <= ${range.to}`);
+  // Only live, issued invoices owe tax to agencies. Void invoices have had their
+  // tax reversed in the GL; drafts have never been issued.
+  conds.push(sql`${invoices.status} NOT IN ('void', 'draft')`);
   const [row] = await ctx.db
     .select({ total: sql<string>`COALESCE(SUM(${invoices.taxAmount}), 0)` })
     .from(invoices)
     .where(and(...conds));
   return { taxCollected: toAmountString(row?.total ?? 0) };
+}
+
+/**
+ * Net sales-tax liability for a date range: tax charged on live invoices MINUS
+ * tax credited back on live credit memos (credit memos post Dr Sales Tax
+ * Payable, reversing the invoice's tax direction). This is the figure that
+ * matches the 2200 GL movement once credit memos carry tax.
+ */
+export async function salesTaxLiabilityNet(
+  ctx: ServiceContext,
+  range?: { from?: Date; to?: Date },
+) {
+  const { taxCollected } = await salesTaxLiability(ctx, range);
+
+  const conds = [eq(creditMemos.companyId, ctx.companyId)];
+  if (range?.from) conds.push(sql`${creditMemos.date} >= ${range.from}`);
+  if (range?.to) conds.push(sql`${creditMemos.date} <= ${range.to}`);
+  // Void memos have had their tax reversal reversed in the GL.
+  conds.push(sql`${creditMemos.status} <> 'void'`);
+  const [row] = await ctx.db
+    .select({ total: sql<string>`COALESCE(SUM(${creditMemos.taxAmount}), 0)` })
+    .from(creditMemos)
+    .where(and(...conds));
+  const taxCredited = toAmountString(row?.total ?? 0);
+
+  return {
+    taxCollected,
+    taxCredited,
+    netLiability: toAmountString(Money.of(taxCollected).minus(Money.of(taxCredited))),
+  };
 }

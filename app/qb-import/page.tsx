@@ -4,8 +4,14 @@
  * QuickBooks Import page.
  *
  * Supports two import paths:
- *   IIF  — paste (or open-file) the raw IIF text; imports accounts, customers, vendors.
- *   CSV  — paste CSV, choose kind (customers | vendors), map columns.
+ *   IIF  — paste (or open-file) the raw IIF text; imports accounts, customers,
+ *          vendors, classes, items, employees, and TRNS/SPL transactions
+ *          (posted as balanced journal entries).
+ *   CSV  — paste CSV, choose kind (customers | vendors | items | accounts),
+ *          map columns.
+ *
+ * Every import returns per-row issues (skips, duplicates, code remaps,
+ * auto-created accounts) which are rendered in a detail table below the counts.
  *
  * Uses window.bookkeeper?.openFile?.() when running inside the Electron shell,
  * with a plain <textarea> fallback for browser use.
@@ -15,13 +21,15 @@ import { Upload } from 'lucide-react';
 import {
   Button,
   Card,
-  Input,
   Select,
   Label,
   Badge,
   PageHeader,
+  Table,
+  Th,
+  Td,
+  Tr,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 
@@ -30,39 +38,79 @@ import { api, ApiError } from '@/lib/client';
 // ---------------------------------------------------------------------------
 
 type Format = 'iif' | 'csv';
-type CsvKind = 'customers' | 'vendors';
+type CsvKind = 'customers' | 'vendors' | 'items' | 'accounts';
+
+interface ImportIssue {
+  entity: string;
+  name: string;
+  code?: string;
+  reason: string;
+  message: string;
+}
 
 interface ImportCounts {
   accounts: number;
   customers: number;
   vendors: number;
+  classes: number;
+  items: number;
+  employees: number;
+  transactions: number;
   skipped: number;
+  issues: ImportIssue[];
 }
 
-/** CSV column-mapping fields shown in the UI */
-const CSV_CUSTOMER_FIELDS: Array<{ key: string; label: string }> = [
-  { key: 'displayName', label: 'Display Name *' },
-  { key: 'companyName', label: 'Company Name' },
-  { key: 'email', label: 'Email' },
-  { key: 'phone', label: 'Phone' },
-  { key: 'billingAddress_line1', label: 'Billing Address Line 1' },
-  { key: 'billingAddress_city', label: 'Billing City' },
-  { key: 'billingAddress_state', label: 'Billing State' },
-  { key: 'billingAddress_zip', label: 'Billing Zip' },
-  { key: 'notes', label: 'Notes' },
-];
+/** CSV column-mapping fields shown in the UI, per kind. */
+const CSV_FIELDS: Record<CsvKind, Array<{ key: string; label: string }>> = {
+  customers: [
+    { key: 'displayName', label: 'Display Name *' },
+    { key: 'companyName', label: 'Company Name' },
+    { key: 'email', label: 'Email' },
+    { key: 'phone', label: 'Phone' },
+    { key: 'billingAddress_line1', label: 'Billing Address Line 1' },
+    { key: 'billingAddress_city', label: 'Billing City' },
+    { key: 'billingAddress_state', label: 'Billing State' },
+    { key: 'billingAddress_zip', label: 'Billing Zip' },
+    { key: 'notes', label: 'Notes' },
+  ],
+  vendors: [
+    { key: 'displayName', label: 'Display Name *' },
+    { key: 'companyName', label: 'Company Name' },
+    { key: 'email', label: 'Email' },
+    { key: 'phone', label: 'Phone' },
+    { key: 'address_line1', label: 'Address Line 1' },
+    { key: 'address_city', label: 'City' },
+    { key: 'address_state', label: 'State' },
+    { key: 'address_zip', label: 'Zip' },
+    { key: 'notes', label: 'Notes' },
+  ],
+  items: [
+    { key: 'name', label: 'Item Name *' },
+    { key: 'sku', label: 'SKU' },
+    { key: 'type', label: 'Type (service / inventory / non-inventory)' },
+    { key: 'description', label: 'Description' },
+    { key: 'salesPrice', label: 'Sales Price' },
+    { key: 'purchaseCost', label: 'Purchase Cost' },
+    { key: 'incomeAccount', label: 'Income Account (name or code)' },
+    { key: 'expenseAccount', label: 'Expense/COGS Account (name or code)' },
+    { key: 'assetAccount', label: 'Inventory Asset Account (name or code)' },
+  ],
+  accounts: [
+    { key: 'name', label: 'Account Name *' },
+    { key: 'code', label: 'Account Code / Number' },
+    { key: 'type', label: 'Type (asset / liability / … or QB type like BANK)' },
+    { key: 'subtype', label: 'Subtype' },
+    { key: 'description', label: 'Description' },
+  ],
+};
 
-const CSV_VENDOR_FIELDS: Array<{ key: string; label: string }> = [
-  { key: 'displayName', label: 'Display Name *' },
-  { key: 'companyName', label: 'Company Name' },
-  { key: 'email', label: 'Email' },
-  { key: 'phone', label: 'Phone' },
-  { key: 'address_line1', label: 'Address Line 1' },
-  { key: 'address_city', label: 'City' },
-  { key: 'address_state', label: 'State' },
-  { key: 'address_zip', label: 'Zip' },
-  { key: 'notes', label: 'Notes' },
-];
+/** The field that must be mapped before a CSV import can run, per kind. */
+const REQUIRED_FIELD: Record<CsvKind, string> = {
+  customers: 'displayName',
+  vendors: 'displayName',
+  items: 'name',
+  accounts: 'name',
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -93,7 +141,7 @@ export default function QbImportPage() {
     typeof (window as unknown as Record<string, unknown>).bookkeeper === 'object' &&
     typeof ((window as unknown as Record<string, unknown>).bookkeeper as Record<string, unknown>)?.openFile === 'function';
 
-  const csvFields = csvKind === 'customers' ? CSV_CUSTOMER_FIELDS : CSV_VENDOR_FIELDS;
+  const csvFields = CSV_FIELDS[csvKind];
   const csvHeaders = parseCsvHeaders(content);
 
   // ---- Open file via Electron bridge ----
@@ -118,8 +166,8 @@ export default function QbImportPage() {
       toast('Please paste or open a file first.', 'danger');
       return;
     }
-    if (format === 'csv' && !mapping.displayName) {
-      toast('Please map the Display Name column.', 'danger');
+    if (format === 'csv' && !mapping[REQUIRED_FIELD[csvKind]]) {
+      toast(`Please map the ${csvKind === 'customers' || csvKind === 'vendors' ? 'Display Name' : 'Name'} column.`, 'danger');
       return;
     }
 
@@ -131,9 +179,11 @@ export default function QbImportPage() {
           ? { format: 'iif', content }
           : { format: 'csv', kind: csvKind, content, mapping };
 
-      const counts = await api.post<ImportCounts>('/api/qb-import', body);
+      const counts = await api.post<ImportCounts>('/api/import/qb', body);
       setResult(counts);
-      const total = counts.accounts + counts.customers + counts.vendors;
+      const total =
+        counts.accounts + counts.customers + counts.vendors + counts.classes +
+        counts.items + counts.employees + counts.transactions;
       toast(
         `Import complete: ${total} created, ${counts.skipped} skipped.`,
         total > 0 ? 'success' : 'info',
@@ -159,7 +209,6 @@ export default function QbImportPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
       <PageHeader title="Import from QuickBooks" icon={Upload} />
 
       <div className="max-w-3xl mx-auto space-y-6">
@@ -169,21 +218,18 @@ export default function QbImportPage() {
           <h2 className="text-lg font-bold text-navy">1. Choose import format</h2>
           <div className="flex gap-3">
             {(['iif', 'csv'] as Format[]).map((f) => (
-              <button
+              <Button
                 key={f}
+                variant={format === f ? 'primary' : 'secondary'}
                 onClick={() => { setFormat(f); handleReset(); }}
-                className={[
-                  'px-5 py-2 rounded-lg font-semibold text-sm border transition-colors',
-                  format === f
-                    ? 'bg-electric text-white border-electric'
-                    : 'bg-white text-navy border-slate-200 hover:bg-slate-50',
-                ].join(' ')}
               >
                 {f.toUpperCase()}
                 {f === 'iif' && (
-                  <span className="ml-1 text-xs opacity-70">(accounts + customers + vendors)</span>
+                  <span className="ml-1 text-xs opacity-70">
+                    (accounts, lists, items, employees + transactions)
+                  </span>
                 )}
-              </button>
+              </Button>
             ))}
           </div>
 
@@ -197,6 +243,8 @@ export default function QbImportPage() {
               >
                 <option value="customers">Customers</option>
                 <option value="vendors">Vendors</option>
+                <option value="items">Items (Products & Services)</option>
+                <option value="accounts">Chart of Accounts</option>
               </Select>
             </div>
           )}
@@ -237,7 +285,7 @@ export default function QbImportPage() {
           <Card className="p-6 space-y-4">
             <h2 className="text-lg font-bold text-navy">3. Map columns</h2>
             <p className="text-sm text-navy/60">
-              Match each field to the column in your CSV. Only Display Name is required.
+              Match each field to the column in your CSV. Only the * field is required.
             </p>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-3">
               {csvFields.map(({ key, label }) => (
@@ -262,10 +310,11 @@ export default function QbImportPage() {
         <div className="flex items-center gap-4">
           <Button
             onClick={handleImport}
-            disabled={loading || !content.trim()}
+            loading={loading}
+            disabled={!content.trim()}
             className="min-w-[140px]"
           >
-            {loading ? 'Importing…' : 'Run Import'}
+            Run Import
           </Button>
           {content && (
             <Button variant="ghost" onClick={handleReset} disabled={loading}>
@@ -280,16 +329,75 @@ export default function QbImportPage() {
             <h2 className="text-lg font-bold text-navy">Import results</h2>
             <div className="flex flex-wrap gap-3">
               {format === 'iif' && (
+                <>
+                  <ResultBadge label="Accounts" count={result.accounts} />
+                  <ResultBadge label="Classes" count={result.classes} />
+                  <ResultBadge label="Items" count={result.items} />
+                  <ResultBadge label="Employees" count={result.employees} />
+                  <ResultBadge label="Transactions" count={result.transactions} />
+                </>
+              )}
+              {format === 'csv' && csvKind === 'accounts' && (
                 <ResultBadge label="Accounts" count={result.accounts} />
+              )}
+              {format === 'csv' && csvKind === 'items' && (
+                <ResultBadge label="Items" count={result.items} />
               )}
               <ResultBadge label="Customers" count={result.customers} />
               <ResultBadge label="Vendors" count={result.vendors} />
               <ResultBadge label="Skipped" count={result.skipped} tone="neutral" />
             </div>
-            <p className="text-sm text-navy/60">
-              {result.skipped > 0 &&
-                'Skipped rows already exist in this company or had invalid/missing data.'}
-            </p>
+
+            {/* Per-row issues detail */}
+            {result.issues.length > 0 ? (
+              <div className="space-y-2">
+                <h3 className="text-sm font-bold text-navy">
+                  Row details ({result.issues.length})
+                </h3>
+                <p className="text-xs text-navy/50">
+                  Every skipped row, duplicate, code remap, and auto-created account is listed
+                  below so nothing is silently dropped.
+                </p>
+                <div className="max-h-96 overflow-y-auto rounded-lg border border-slate-100">
+                  <Table>
+                    <thead>
+                      <tr>
+                        <Th>Entity</Th>
+                        <Th>Name</Th>
+                        <Th>Code</Th>
+                        <Th>Reason</Th>
+                        <Th>Detail</Th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {result.issues.map((issue, i) => (
+                        <Tr key={i}>
+                          <Td className="capitalize">{issue.entity}</Td>
+                          <Td className="font-medium">{issue.name}</Td>
+                          <Td className="font-mono text-xs">{issue.code ?? '—'}</Td>
+                          <Td>
+                            <Badge
+                              tone={
+                                issue.reason === 'duplicate'
+                                  ? 'neutral'
+                                  : issue.reason === 'validation'
+                                    ? 'danger'
+                                    : 'warning'
+                              }
+                            >
+                              {issue.reason}
+                            </Badge>
+                          </Td>
+                          <Td className="text-navy/70 text-xs">{issue.message}</Td>
+                        </Tr>
+                      ))}
+                    </tbody>
+                  </Table>
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-navy/60">All rows imported cleanly — no issues.</p>
+            )}
           </Card>
         )}
       </div>

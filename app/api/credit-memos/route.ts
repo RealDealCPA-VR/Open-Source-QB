@@ -1,6 +1,11 @@
 /**
  * GET  /api/credit-memos          — list credit memos (optional ?customerId=&status=)
  * POST /api/credit-memos          — create a credit memo and post to the GL
+ *
+ * POST body supports sales tax + inventory restocking:
+ *   { customerId, date, taxRateId?, memo?,
+ *     lines: [{ itemId?, accountId?, description?, quantity, rate,
+ *               taxable? (default true), restock? (default true; false = damaged write-off) }] }
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -57,11 +62,15 @@ export async function POST(req: NextRequest) {
       customerId: body.customerId,
       date: new Date(body.date),
       memo: body.memo ?? null,
+      taxRateId: (body.taxRateId as string | undefined) ?? null,
       lines: body.lines.map((l: Record<string, unknown>) => ({
+        itemId: (l.itemId as string | undefined) ?? null,
         description: (l.description as string | undefined) ?? null,
         quantity: l.quantity as string | number,
         rate: l.rate as string | number,
         accountId: (l.accountId as string | undefined) ?? null,
+        taxable: l.taxable === undefined ? undefined : l.taxable !== false,
+        restock: l.restock === undefined ? undefined : l.restock !== false,
       })),
     });
 

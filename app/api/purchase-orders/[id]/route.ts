@@ -1,8 +1,16 @@
 /**
  * GET  /api/purchase-orders/:id              — fetch a purchase order with its lines
+ *   (lines include quantityBilled for billed/remaining display)
  * POST /api/purchase-orders/:id  { action }  — dispatch actions on a PO
- *   action = 'convert'  → convertToBill (creates bill, posts A/P, closes PO)
+ *   action = 'convert'  → convertToBill (creates bill, posts A/P)
+ *     Optional body fields for partial billing:
+ *       lines:      [{ lineId, quantity }]  — per-line quantities to bill
+ *                   (omitted → bill the full remaining quantity of every line)
+ *       date:       bill date (defaults to the PO date)
+ *       billNumber: vendor bill / reference number
+ *     PO status moves open → partial → closed as quantities are billed.
  *   action = 'void'     → updateStatus to 'void'
+ *   action = 'close'    → updateStatus to 'closed' (stop further billing)
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -55,7 +63,33 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const action = body?.action as string | undefined;
 
     if (action === 'convert') {
-      const bill = await convertToBill(ctx, id);
+      let lines: { lineId: string; quantity: string | number }[] | undefined;
+      if (body.lines !== undefined) {
+        if (!Array.isArray(body.lines) || body.lines.length === 0) {
+          return NextResponse.json(
+            { error: 'lines must be a non-empty array of { lineId, quantity }', code: 'VALIDATION' },
+            { status: 400 },
+          );
+        }
+        for (const l of body.lines) {
+          if (!l || typeof l.lineId !== 'string' || l.quantity == null) {
+            return NextResponse.json(
+              { error: 'Each billing line requires lineId and quantity', code: 'VALIDATION' },
+              { status: 400 },
+            );
+          }
+        }
+        lines = body.lines.map((l: { lineId: string; quantity: string | number }) => ({
+          lineId: l.lineId,
+          quantity: l.quantity,
+        }));
+      }
+
+      const bill = await convertToBill(ctx, id, {
+        lines,
+        date: body.date ? new Date(body.date) : undefined,
+        billNumber: body.billNumber ?? null,
+      });
       return NextResponse.json(bill);
     }
 
@@ -64,8 +98,16 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       return NextResponse.json(po);
     }
 
+    if (action === 'close') {
+      const po = await updateStatus(ctx, id, 'closed');
+      return NextResponse.json(po);
+    }
+
     return NextResponse.json(
-      { error: `Unknown action: ${action}. Expected 'convert' or 'void'.`, code: 'VALIDATION' },
+      {
+        error: `Unknown action: ${action}. Expected 'convert', 'void', or 'close'.`,
+        code: 'VALIDATION',
+      },
       { status: 400 },
     );
   } catch (err) {

@@ -7,6 +7,7 @@
  * - "Download CSV" exports the visible table as a Blob download.
  */
 import { useState, useEffect, useCallback } from 'react';
+import { List } from 'lucide-react';
 import {
   Button,
   Card,
@@ -22,6 +23,8 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import EntryDetailModal from '@/components/EntryDetailModal';
+import { fmtDate } from '../_components/shared';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -51,6 +54,9 @@ interface GLResult {
   accountCode: string;
   accountName: string;
   accountType: string;
+  isActive: boolean;
+  /** Balance brought forward from before the 'from' date ('0.00' when unfiltered). */
+  openingBalance: string;
   lines: GLRow[];
   closingBalance: string;
 }
@@ -74,11 +80,14 @@ function toCsvRow(...cells: (string | number | null | undefined)[]): string {
   return cells.map(toCsvCell).join(',');
 }
 
-function buildCsv(result: GLResult): string {
+function buildCsv(result: GLResult, hasFromFilter: boolean): string {
   const header = toCsvRow('Date', 'Entry #', 'Description', 'Reference', 'Debit', 'Credit', 'Running Balance');
+  const opening = hasFromFilter
+    ? [toCsvRow('', '', 'Beginning Balance', '', '', '', result.openingBalance)]
+    : [];
   const dataRows = result.lines.map((l) =>
     toCsvRow(
-      new Date(l.date).toLocaleDateString(),
+      fmtDate(l.date),
       l.entryNumber,
       l.description,
       l.reference ?? '',
@@ -88,7 +97,7 @@ function buildCsv(result: GLResult): string {
     ),
   );
   const footer = toCsvRow('', '', '', 'Closing Balance', '', '', result.closingBalance);
-  return [header, ...dataRows, footer].join('\n');
+  return [header, ...opening, ...dataRows, footer].join('\n');
 }
 
 function downloadCsv(csv: string, filename: string) {
@@ -114,7 +123,11 @@ export default function GeneralLedgerPage() {
   const [to, setTo] = useState('');
 
   const [result, setResult] = useState<GLResult | null>(null);
+  /** The 'from' filter the current result was loaded with (drives the Beginning Balance row). */
+  const [resultFrom, setResultFrom] = useState('');
   const [loading, setLoading] = useState(false);
+  /** QuickZoom: journal entry opened from a clicked GL row. */
+  const [detailId, setDetailId] = useState<string | null>(null);
 
   // Load account list on mount
   useEffect(() => {
@@ -142,6 +155,7 @@ export default function GeneralLedgerPage() {
       const data = await api.get<GLResponse>(`/api/reports/general-ledger?${params}`);
       // Response is { ledger: GLResult[] }. We requested a single account so take first.
       setResult(data.ledger[0] ?? null);
+      setResultFrom(fromDate);
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to load general ledger.', 'danger');
     } finally {
@@ -162,7 +176,7 @@ export default function GeneralLedgerPage() {
   function handleDownload() {
     if (!result) return;
     const acctLabel = `${result.accountCode}-${result.accountName}`.replace(/\s+/g, '_');
-    downloadCsv(buildCsv(result), `GL_${acctLabel}.csv`);
+    downloadCsv(buildCsv(result, Boolean(resultFrom)), `GL_${acctLabel}.csv`);
     toast('CSV downloaded.', 'success');
   }
 
@@ -172,6 +186,7 @@ export default function GeneralLedgerPage() {
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
         title="General Ledger"
+        icon={List}
         action={
           <Button
             variant="secondary"
@@ -269,6 +284,25 @@ export default function GeneralLedgerPage() {
                 </tr>
               </thead>
               <tbody>
+                {resultFrom && (
+                  <Tr>
+                    <Td className="whitespace-nowrap text-navy/60">
+                      {new Date(`${resultFrom}T00:00:00`).toLocaleDateString('en-US')}
+                    </Td>
+                    <Td />
+                    <Td className="italic text-navy/60">Beginning Balance</Td>
+                    <Td />
+                    <Td />
+                    <Td />
+                    <Td
+                      className={`text-right tabular-nums font-semibold ${
+                        Number(result.openingBalance) < 0 ? 'text-red-600' : 'text-navy'
+                      }`}
+                    >
+                      {formatCurrency(result.openingBalance)}
+                    </Td>
+                  </Tr>
+                )}
                 {result.lines.length === 0 && (
                   <Tr>
                     <Td colSpan={7} className="py-10 text-center text-navy/40">
@@ -279,10 +313,13 @@ export default function GeneralLedgerPage() {
                 {result.lines.map((line) => {
                   const bal = Number(line.runningBalance);
                   return (
-                    <Tr key={line.lineId}>
-                      <Td className="whitespace-nowrap">
-                        {new Date(line.date).toLocaleDateString()}
-                      </Td>
+                    <Tr
+                      key={line.lineId}
+                      onClick={() => setDetailId(line.journalEntryId)}
+                      className="cursor-pointer"
+                      title="View journal entry (QuickZoom)"
+                    >
+                      <Td className="whitespace-nowrap">{fmtDate(line.date)}</Td>
                       <Td className="tabular-nums text-navy/60">#{line.entryNumber}</Td>
                       <Td>{line.description}</Td>
                       <Td className="text-navy/50 text-xs">{line.reference ?? ''}</Td>
@@ -322,6 +359,8 @@ export default function GeneralLedgerPage() {
           </>
         )}
       </Card>
+
+      <EntryDetailModal entryId={detailId} onClose={() => setDetailId(null)} />
     </main>
   );
 }

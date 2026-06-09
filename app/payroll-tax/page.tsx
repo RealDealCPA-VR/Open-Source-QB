@@ -7,6 +7,7 @@
  * Results are for estimation purposes only; verify before filing.
  */
 import { useState } from 'react';
+import { Calculator } from 'lucide-react';
 import {
   Button,
   Card,
@@ -202,10 +203,10 @@ export default function PayrollTaxPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader title="Payroll Tax Calculator" />
+      <PageHeader title="Payroll Tax Calculator" icon={Calculator} />
 
       {/* Disclaimer banner */}
-      <div className="mb-6 rounded-xl border border-amber-300 bg-amber-50 px-5 py-4 text-sm text-amber-900 leading-relaxed">
+      <div className="mb-6 rounded-xl border border-gold/30 bg-gold/10 px-5 py-4 text-sm text-navy/80 leading-relaxed">
         <span className="font-bold">Disclaimer:</span> This calculator uses approximated 2024 IRS
         Publication 15-T percentage-method withholding brackets. It is provided for estimation
         purposes only. Results may differ from actual withholding depending on W-4 elections,
@@ -285,8 +286,8 @@ export default function PayrollTaxPage() {
 
           {/* Actions */}
           <div className="flex gap-3 pt-1">
-            <Button onClick={handleCalculate} disabled={loading || !grossPerPeriod}>
-              {loading ? 'Calculating…' : 'Calculate'}
+            <Button onClick={handleCalculate} disabled={!grossPerPeriod} loading={loading}>
+              Calculate
             </Button>
             <Button variant="secondary" onClick={handleReset} disabled={loading}>
               Reset
@@ -355,9 +356,9 @@ export default function PayrollTaxPage() {
                     </div>
 
                     {/* Net pay */}
-                    <div className="flex justify-between items-center py-3 rounded-lg bg-emerald-50 px-4 mt-1">
-                      <span className="font-bold text-emerald-800">Estimated Net Pay</span>
-                      <span className="font-bold tabular-nums text-emerald-700 text-lg">
+                    <div className="flex justify-between items-center py-3 rounded-lg bg-emerald/10 px-4 mt-1">
+                      <span className="font-bold text-emerald">Estimated Net Pay</span>
+                      <span className="font-bold tabular-nums text-emerald text-lg">
                         {formatCurrency(combinedNet)}
                       </span>
                     </div>
@@ -370,7 +371,7 @@ export default function PayrollTaxPage() {
                 Social Security capped at $168,600 annual wages (2024).
               </p>
 
-              <p className="mt-3 text-xs text-amber-700 leading-relaxed font-medium">
+              <p className="mt-3 text-xs text-gold leading-relaxed font-semibold">
                 Approximation only — progressive states (CA, NY, NJ, OR, MN, DC, HI, VT, ME, CT,
                 WI, SC, NE, MT, IA, MO, AR, NM, MD, DE, AL, VA, RI, KS, OK, WV, ND, OH, LA) use
                 a single flat mid-range effective rate, not graduated brackets. Does not include

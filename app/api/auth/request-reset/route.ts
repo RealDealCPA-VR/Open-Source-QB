@@ -24,6 +24,14 @@ export async function POST(req: NextRequest) {
     .set({ resetToken: token, resetExpires: new Date(Date.now() + 60 * 60 * 1000) })
     .where(eq(users.id, user.id));
 
-  // Desktop: surface the token so the user can complete the reset locally.
-  return NextResponse.json({ ...generic, token });
+  // SECURITY: never return the reset token in the HTTP response on a networked deployment —
+  // anyone who knows an email could take over the account. Only the offline desktop build
+  // (server bound to 127.0.0.1, BKA_OFFLINE=1) surfaces it for local convenience. In all
+  // cases the token is logged server-side so a local operator can retrieve it; a hosted
+  // deployment should email a reset link instead.
+  console.log(`[auth/request-reset] reset token for ${user.email}: ${token}`);
+  if (process.env.BKA_OFFLINE === '1') {
+    return NextResponse.json({ ...generic, token });
+  }
+  return NextResponse.json(generic);
 }

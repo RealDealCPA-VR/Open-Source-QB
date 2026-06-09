@@ -5,10 +5,19 @@
  * Shows Operating / Investing / Financing sections and net cash change.
  * "Download CSV" exports the visible report as a Blob download.
  */
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
+import { TrendingUp } from 'lucide-react';
 import { Button, Card, Input, Label, PageHeader, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { fmtDate } from '../_components/shared';
+
+interface CashFlowLine {
+  accountId: string;
+  code: string;
+  name: string;
+  amount: string;
+}
 
 interface CashFlowReport {
   from?: string;
@@ -18,17 +27,19 @@ interface CashFlowReport {
     changeInAR: string;
     changeInAP: string;
     changeInInventory: string;
+    otherChanges: CashFlowLine[];
     total: string;
   };
   investing: {
-    netFixedAssetActivity: string;
+    lines: CashFlowLine[];
     total: string;
   };
   financing: {
-    netEquityActivity: string;
+    lines: CashFlowLine[];
     total: string;
   };
   netCashChange: string;
+  cashAccountsChange: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -53,10 +64,13 @@ function buildCsv(report: CashFlowReport): string {
     toCsvRow('Operating', 'Change in Accounts Receivable', report.operating.changeInAR),
     toCsvRow('Operating', 'Change in Accounts Payable', report.operating.changeInAP),
     toCsvRow('Operating', 'Change in Inventory', report.operating.changeInInventory),
+    ...report.operating.otherChanges.map((l) =>
+      toCsvRow('Operating', `${l.code} ${l.name}`, l.amount),
+    ),
     toCsvRow('Operating', 'Total Operating', report.operating.total),
-    toCsvRow('Investing', 'Net Fixed Asset Activity', report.investing.netFixedAssetActivity),
+    ...report.investing.lines.map((l) => toCsvRow('Investing', `${l.code} ${l.name}`, l.amount)),
     toCsvRow('Investing', 'Total Investing', report.investing.total),
-    toCsvRow('Financing', 'Net Equity Activity', report.financing.netEquityActivity),
+    ...report.financing.lines.map((l) => toCsvRow('Financing', `${l.code} ${l.name}`, l.amount)),
     toCsvRow('Financing', 'Total Financing', report.financing.total),
     toCsvRow('Summary', 'Net Cash Change', report.netCashChange),
   ];
@@ -153,12 +167,11 @@ export default function CashFlowPage() {
     }
   }, [from, to]);
 
-  // Load on first render
-  const [loaded, setLoaded] = useState(false);
-  if (!loaded) {
-    setLoaded(true);
+  // Load on mount
+  useEffect(() => {
     load();
-  }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function handleDownload() {
     if (!report) return;
@@ -172,6 +185,7 @@ export default function CashFlowPage() {
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
         title="Cash Flow Statement"
+        icon={TrendingUp}
         action={
           <Button
             variant="secondary"
@@ -222,9 +236,8 @@ export default function CashFlowPage() {
             {/* Period label */}
             {(report.from || report.to) && (
               <div className="px-6 pt-4 pb-1 text-sm text-navy/50">
-                Period:{' '}
-                {report.from ? new Date(report.from).toLocaleDateString() : 'Beginning'} –{' '}
-                {report.to ? new Date(report.to).toLocaleDateString() : 'Present'}
+                Period: {report.from ? fmtDate(report.from) : 'Beginning'} –{' '}
+                {report.to ? fmtDate(report.to) : 'Present'}
               </div>
             )}
 
@@ -252,26 +265,46 @@ export default function CashFlowPage() {
                   value={report.operating.changeInInventory}
                   indent
                 />
+                {report.operating.otherChanges.map((l) => (
+                  <SectionRow
+                    key={l.accountId}
+                    label={`Change in ${l.code} ${l.name}`}
+                    value={l.amount}
+                    indent
+                  />
+                ))}
                 <SectionTotal label="Net Cash from Operating" value={report.operating.total} />
                 <Spacer />
 
                 {/* Investing */}
                 <SectionHeader title="Investing Activities" />
-                <SectionRow
-                  label="Net Fixed Asset Activity"
-                  value={report.investing.netFixedAssetActivity}
-                  indent
-                />
+                {report.investing.lines.length === 0 && (
+                  <SectionRow label="No investing activity" value="0.00" indent />
+                )}
+                {report.investing.lines.map((l) => (
+                  <SectionRow
+                    key={l.accountId}
+                    label={`${l.code} ${l.name}`}
+                    value={l.amount}
+                    indent
+                  />
+                ))}
                 <SectionTotal label="Net Cash from Investing" value={report.investing.total} />
                 <Spacer />
 
                 {/* Financing */}
                 <SectionHeader title="Financing Activities" />
-                <SectionRow
-                  label="Net Equity Activity"
-                  value={report.financing.netEquityActivity}
-                  indent
-                />
+                {report.financing.lines.length === 0 && (
+                  <SectionRow label="No financing activity" value="0.00" indent />
+                )}
+                {report.financing.lines.map((l) => (
+                  <SectionRow
+                    key={l.accountId}
+                    label={`${l.code} ${l.name}`}
+                    value={l.amount}
+                    indent
+                  />
+                ))}
                 <SectionTotal label="Net Cash from Financing" value={report.financing.total} />
               </tbody>
 

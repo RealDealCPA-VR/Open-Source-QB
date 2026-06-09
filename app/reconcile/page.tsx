@@ -1,24 +1,28 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
 import { CheckSquare } from 'lucide-react';
 import {
   Badge,
   Button,
   Card,
+  ConfirmDialog,
   Input,
   Label,
+  Modal,
   PageHeader,
   Select,
+  Spinner,
   Table,
   Td,
   Th,
-  Toaster,
   Tr,
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
+import { formatDate as fmtDate } from '@/lib/dates';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -26,6 +30,8 @@ import { formatCurrency, Money } from '@/lib/money';
 
 interface BankAccount {
   id: string;
+  /** Linked GL account id. */
+  accountId: string;
   bankName: string;
   accountNumber: string;
   glAccountName: string;
@@ -65,6 +71,27 @@ interface Progress {
   difference: string;
 }
 
+interface ReconcileInfo {
+  bankAccountId: string;
+  bankName: string;
+  glAccountId: string;
+  glAccountName: string;
+  glAccountCode: string;
+  glType: string;
+  isCreditCard: boolean;
+  lastReconciledDate: string | null;
+  beginningBalance: string;
+  recomputedBalance: string;
+  discrepancy: string;
+}
+
+interface GLAccount {
+  id: string;
+  code: string;
+  name: string;
+  type: string;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -74,15 +101,18 @@ function fmt(v: string | null | undefined) {
   return formatCurrency(v);
 }
 
-function fmtDate(iso: string | null | undefined) {
-  if (!iso) return '—';
-  return new Date(iso).toLocaleDateString();
-}
-
-function statusTone(status: string): 'info' | 'success' | 'neutral' {
+function statusTone(status: string): 'info' | 'success' | 'warning' | 'neutral' {
   if (status === 'in_progress') return 'info';
   if (status === 'completed') return 'success';
+  if (status === 'undone') return 'warning';
   return 'neutral';
+}
+
+function statusLabel(status: string): string {
+  if (status === 'in_progress') return 'In Progress';
+  if (status === 'completed') return 'Completed';
+  if (status === 'undone') return 'Undone';
+  return status;
 }
 
 function lineAmount(line: ClearableLine): string {
@@ -104,14 +134,38 @@ function differenceClose(difference: string): boolean {
 function StartForm({
   bankAccounts,
   onStarted,
+  onUndone,
 }: {
   bankAccounts: BankAccount[];
   onStarted: (recon: Reconciliation) => void;
+  onUndone: () => void;
 }) {
   const [bankAccountId, setBankAccountId] = useState('');
   const [statementDate, setStatementDate] = useState('');
   const [statementBalance, setStatementBalance] = useState('');
   const [saving, setSaving] = useState(false);
+  const [info, setInfo] = useState<ReconcileInfo | null>(null);
+  const [undoing, setUndoing] = useState(false);
+  const [confirmUndo, setConfirmUndo] = useState(false);
+
+  // Load Begin-Reconciliation info (beginning balance, last reconciled,
+  // discrepancy check) whenever the selected bank account changes.
+  useEffect(() => {
+    setInfo(null);
+    if (!bankAccountId) return;
+    let cancelled = false;
+    api
+      .get<ReconcileInfo>(`/api/reconciliations/info?bankAccountId=${bankAccountId}`)
+      .then((i) => {
+        if (!cancelled) setInfo(i);
+      })
+      .catch((err) => {
+        toast(err instanceof ApiError ? err.message : 'Failed to load account info.', 'danger');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bankAccountId]);
 
   async function handleStart() {
     if (!bankAccountId || !statementDate || !statementBalance) {
@@ -134,13 +188,39 @@ function StartForm({
     }
   }
 
+  async function handleUndo() {
+    if (!info) return;
+    setUndoing(true);
+    try {
+      await api.post('/api/reconciliations/undo', { bankAccountId });
+      toast('Last reconciliation undone.', 'success');
+      // Refresh the info panel and the history list.
+      const refreshed = await api.get<ReconcileInfo>(
+        `/api/reconciliations/info?bankAccountId=${bankAccountId}`,
+      );
+      setInfo(refreshed);
+      onUndone();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to undo reconciliation.', 'danger');
+    } finally {
+      setUndoing(false);
+      setConfirmUndo(false);
+    }
+  }
+
+  const hasDiscrepancy = info != null && !Money.isZero(info.discrepancy);
+
   return (
     <Card className="p-6 max-w-lg">
       <h2 className="text-lg font-bold text-navy mb-4">Start New Reconciliation</h2>
       <div className="space-y-4">
         <div>
-          <Label>Bank Account</Label>
-          <Select value={bankAccountId} onChange={(e) => setBankAccountId(e.target.value)}>
+          <Label htmlFor="recon-bank-account">Bank Account</Label>
+          <Select
+            id="recon-bank-account"
+            value={bankAccountId}
+            onChange={(e) => setBankAccountId(e.target.value)}
+          >
             <option value="">Select bank account…</option>
             {bankAccounts.map((ba) => (
               <option key={ba.id} value={ba.id}>
@@ -149,17 +229,58 @@ function StartForm({
             ))}
           </Select>
         </div>
+
+        {info && (
+          <div className="rounded-lg bg-slate-50 border border-slate-200 p-4 space-y-1 text-sm">
+            <div className="flex justify-between">
+              <span className="text-navy/60">Beginning Balance</span>
+              <span className="font-mono font-semibold text-navy">
+                {formatCurrency(info.beginningBalance)}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-navy/60">Last Reconciled</span>
+              <span className="text-navy">{fmtDate(info.lastReconciledDate)}</span>
+            </div>
+            {info.isCreditCard && (
+              <div className="pt-1">
+                <Badge tone="info">Credit Card Account</Badge>
+              </div>
+            )}
+            {hasDiscrepancy && (
+              <div className="mt-2 rounded-md bg-gold/10 border border-gold/40 p-2 text-navy text-xs">
+                <strong>Beginning balance discrepancy of {formatCurrency(info.discrepancy)}.</strong>{' '}
+                A previously reconciled transaction was voided or changed (recomputed cleared
+                balance: {formatCurrency(info.recomputedBalance)}). See the{' '}
+                <Link href="/reports/reconciliation" className="underline">
+                  Reconciliation Discrepancy report
+                </Link>{' '}
+                to locate it, or undo the last reconciliation to repair.
+              </div>
+            )}
+            {info.lastReconciledDate && (
+              <div className="pt-2">
+                <Button size="sm" variant="secondary" onClick={() => setConfirmUndo(true)}>
+                  Undo Last Reconciliation
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+
         <div>
-          <Label>Statement Date</Label>
+          <Label htmlFor="recon-statement-date">Statement Date</Label>
           <Input
+            id="recon-statement-date"
             type="date"
             value={statementDate}
             onChange={(e) => setStatementDate(e.target.value)}
           />
         </div>
         <div>
-          <Label>Statement Ending Balance</Label>
+          <Label htmlFor="recon-statement-balance">Statement Ending Balance</Label>
           <Input
+            id="recon-statement-balance"
             type="number"
             step="0.01"
             placeholder="0.00"
@@ -167,10 +288,21 @@ function StartForm({
             onChange={(e) => setStatementBalance(e.target.value)}
           />
         </div>
-        <Button onClick={handleStart} disabled={saving}>
-          {saving ? 'Starting…' : 'Start Reconciliation'}
+        <Button onClick={handleStart} loading={saving}>
+          Start Reconciliation
         </Button>
       </div>
+
+      <ConfirmDialog
+        open={confirmUndo}
+        title="Undo last reconciliation?"
+        message={`Undo the last completed reconciliation for ${info?.bankName ?? 'this account'}? Its cleared transactions will become un-cleared and the beginning balance will roll back to the previous statement.`}
+        confirmLabel="Undo"
+        tone="danger"
+        loading={undoing}
+        onConfirm={handleUndo}
+        onClose={() => setConfirmUndo(false)}
+      />
     </Card>
   );
 }
@@ -181,16 +313,51 @@ function StartForm({
 
 function ReconcileSession({
   recon,
+  bankAccounts,
   onComplete,
 }: {
   recon: Reconciliation;
+  bankAccounts: BankAccount[];
   onComplete: () => void;
 }) {
   const [lines, setLines] = useState<ClearableLine[]>([]);
   const [progress, setProgress] = useState<Progress | null>(null);
+  const [info, setInfo] = useState<ReconcileInfo | null>(null);
+  const [glAccounts, setGlAccounts] = useState<GLAccount[]>([]);
   const [loadingLines, setLoadingLines] = useState(true);
   const [completing, setCompleting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [confirmCancel, setConfirmCancel] = useState(false);
   const [toggling, setToggling] = useState<string | null>(null);
+  const [editBalance, setEditBalance] = useState('');
+  const [savingBalance, setSavingBalance] = useState(false);
+
+  // Service charge / interest earned inputs
+  const [chargeAmount, setChargeAmount] = useState('');
+  const [chargeAccountId, setChargeAccountId] = useState('');
+  const [interestAmount, setInterestAmount] = useState('');
+  const [interestAccountId, setInterestAccountId] = useState('');
+  const [applyingAdjustments, setApplyingAdjustments] = useState(false);
+
+  // Pay credit card prompt (shown after completing a CC reconciliation)
+  const [showPayCC, setShowPayCC] = useState(false);
+  const [payAccountId, setPayAccountId] = useState('');
+  const [payAmount, setPayAmount] = useState('');
+  const [payDate, setPayDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [paying, setPaying] = useState(false);
+
+  // Load account info (beginning balance / CC detection) + GL accounts for the
+  // service charge / interest selects.
+  useEffect(() => {
+    api
+      .get<ReconcileInfo>(`/api/reconciliations/info?bankAccountId=${recon.bankAccountId}`)
+      .then(setInfo)
+      .catch(() => {});
+    api
+      .get<GLAccount[]>('/api/accounts')
+      .then(setGlAccounts)
+      .catch(() => {});
+  }, [recon.bankAccountId]);
 
   const loadLines = useCallback(async () => {
     setLoadingLines(true);
@@ -241,11 +408,119 @@ function ReconcileSession({
     try {
       await api.patch(`/api/reconciliations/${recon.id}`, { action: 'complete' });
       toast('Reconciliation completed successfully.', 'success');
-      onComplete();
+      if (info?.isCreditCard) {
+        // QB flow: offer to write a check for the reconciled balance.
+        setPayAmount(progress?.statementBalance ?? recon.statementBalance);
+        setShowPayCC(true);
+      } else {
+        onComplete();
+      }
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to complete reconciliation.', 'danger');
     } finally {
       setCompleting(false);
+    }
+  }
+
+  async function handleApplyAdjustments() {
+    const body: {
+      action: string;
+      serviceCharge?: { amount: string; accountId: string };
+      interestEarned?: { amount: string; accountId: string };
+    } = { action: 'adjustments' };
+    if (chargeAmount && Number(chargeAmount) > 0) {
+      if (!chargeAccountId) {
+        toast('Select an expense account for the service charge.', 'danger');
+        return;
+      }
+      body.serviceCharge = { amount: chargeAmount, accountId: chargeAccountId };
+    }
+    if (interestAmount && Number(interestAmount) > 0) {
+      if (!interestAccountId) {
+        toast('Select an income account for the interest earned.', 'danger');
+        return;
+      }
+      body.interestEarned = { amount: interestAmount, accountId: interestAccountId };
+    }
+    if (!body.serviceCharge && !body.interestEarned) {
+      toast('Enter a service charge and/or interest amount.', 'danger');
+      return;
+    }
+    setApplyingAdjustments(true);
+    try {
+      await api.patch<Progress>(`/api/reconciliations/${recon.id}`, body);
+      setChargeAmount('');
+      setInterestAmount('');
+      toast('Adjustments posted and cleared.', 'success');
+      await loadLines();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to post adjustments.', 'danger');
+    } finally {
+      setApplyingAdjustments(false);
+    }
+  }
+
+  async function handlePayCC() {
+    if (!payAccountId) {
+      toast('Select the bank account to pay from.', 'danger');
+      return;
+    }
+    if (!payAmount || Number(payAmount) <= 0) {
+      toast('Enter a payment amount greater than zero.', 'danger');
+      return;
+    }
+    setPaying(true);
+    try {
+      await api.post(`/api/reconciliations/${recon.id}/pay`, {
+        paymentAccountId: payAccountId,
+        amount: payAmount,
+        date: payDate ? new Date(payDate).toISOString() : undefined,
+      });
+      toast('Credit card payment recorded.', 'success');
+      setShowPayCC(false);
+      onComplete();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to record payment.', 'danger');
+    } finally {
+      setPaying(false);
+    }
+  }
+
+  async function handleCancel() {
+    setCancelling(true);
+    try {
+      await api.del(`/api/reconciliations/${recon.id}`);
+      toast('Reconciliation cancelled.', 'success');
+      onComplete();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to cancel reconciliation.', 'danger');
+    } finally {
+      setCancelling(false);
+      setConfirmCancel(false);
+    }
+  }
+
+  async function handleUpdateBalance() {
+    if (!editBalance) {
+      toast('Enter the corrected statement balance.', 'danger');
+      return;
+    }
+    setSavingBalance(true);
+    try {
+      const updatedProgress = await api.patch<Progress>(`/api/reconciliations/${recon.id}`, {
+        action: 'updateStatement',
+        statementBalance: editBalance,
+      });
+      setProgress(updatedProgress);
+      setEditBalance('');
+      toast('Statement balance updated.', 'success');
+    } catch (err) {
+      toast(
+        err instanceof ApiError ? err.message : 'Failed to update statement balance.',
+        'danger',
+      );
+    } finally {
+      setSavingBalance(false);
     }
   }
 
@@ -258,11 +533,33 @@ function ReconcileSession({
     <div className="space-y-6">
       {/* Progress summary */}
       <Card className="p-6">
-        <h2 className="text-lg font-bold text-navy mb-4">
+        <h2 className="text-lg font-bold text-navy mb-1">
           Reconciliation — {recon.bankName} (statement date: {fmtDate(recon.statementDate)})
         </h2>
+        {info && (
+          <p className="text-sm text-navy/60 mb-4">
+            {info.isCreditCard && (
+              <span className="mr-2 align-middle">
+                <Badge tone="info">Credit Card</Badge>
+              </span>
+            )}
+            Last reconciled: {fmtDate(info.lastReconciledDate)}
+            {info.lastReconciledDate ? ` at ${formatCurrency(info.beginningBalance)}` : ' — never'}
+            {!Money.isZero(info.discrepancy) && (
+              <span className="ml-2 text-gold font-semibold">
+                Beginning balance discrepancy: {formatCurrency(info.discrepancy)}
+              </span>
+            )}
+          </p>
+        )}
         {progress ? (
-          <div className="grid grid-cols-3 gap-6 text-center">
+          <div className="grid grid-cols-2 xl:grid-cols-4 gap-6 text-center">
+            <div>
+              <p className="text-xs text-navy/60 uppercase tracking-wide mb-1">Beginning Balance</p>
+              <p className="text-2xl font-bold text-navy">
+                {info ? fmt(info.beginningBalance) : '…'}
+              </p>
+            </div>
             <div>
               <p className="text-xs text-navy/60 uppercase tracking-wide mb-1">Statement Balance</p>
               <p className="text-2xl font-bold text-navy">{fmt(progress.statementBalance)}</p>
@@ -274,7 +571,7 @@ function ReconcileSession({
             <div>
               <p className="text-xs text-navy/60 uppercase tracking-wide mb-1">Difference</p>
               <p
-                className={`text-2xl font-bold ${differenceClose(progress.difference) ? 'text-emerald-600' : 'text-red-500'}`}
+                className={`text-2xl font-bold ${differenceClose(progress.difference) ? 'text-emerald' : 'text-red-500'}`}
               >
                 {fmt(progress.difference)}
               </p>
@@ -283,12 +580,199 @@ function ReconcileSession({
         ) : (
           <p className="text-navy/50 text-sm">Loading progress…</p>
         )}
-        <div className="mt-4 flex justify-end">
-          <Button onClick={handleComplete} disabled={!canComplete || completing}>
-            {completing ? 'Finishing…' : 'Finish Reconciliation'}
+        {recon.status === 'in_progress' && (
+          <div className="mt-4 flex items-end gap-2">
+            <div>
+              <Label htmlFor="recon-correct-balance">Correct Statement Balance</Label>
+              <Input
+                id="recon-correct-balance"
+                type="number"
+                step="0.01"
+                placeholder={progress?.statementBalance ?? '0.00'}
+                value={editBalance}
+                onChange={(e) => setEditBalance(e.target.value)}
+              />
+            </div>
+            <Button
+              variant="secondary"
+              onClick={handleUpdateBalance}
+              loading={savingBalance}
+              disabled={!editBalance}
+            >
+              Update Balance
+            </Button>
+          </div>
+        )}
+        <div className="mt-4 flex justify-end gap-2">
+          {recon.status === 'in_progress' && (
+            <Button variant="secondary" onClick={() => setConfirmCancel(true)}>
+              Cancel Reconciliation
+            </Button>
+          )}
+          <Button onClick={handleComplete} loading={completing} disabled={!canComplete}>
+            Finish Reconciliation
           </Button>
         </div>
       </Card>
+
+      <ConfirmDialog
+        open={confirmCancel}
+        title="Cancel reconciliation?"
+        message="Cleared checkmarks from this session will be discarded."
+        confirmLabel="Cancel Reconciliation"
+        tone="danger"
+        loading={cancelling}
+        onConfirm={handleCancel}
+        onClose={() => setConfirmCancel(false)}
+      />
+
+      {/* Service charge / interest earned */}
+      {recon.status === 'in_progress' && (
+        <Card className="p-6">
+          <h3 className="text-base font-bold text-navy mb-1">Service Charge & Interest Earned</h3>
+          <p className="text-sm text-navy/60 mb-4">
+            Amounts on the statement that are not in your books yet. They post journal entries
+            dated {fmtDate(recon.statementDate)} and are cleared into this reconciliation
+            automatically.
+          </p>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="space-y-2">
+              <Label htmlFor="recon-service-charge">Service Charge</Label>
+              <Input
+                id="recon-service-charge"
+                type="number"
+                step="0.01"
+                min="0"
+                placeholder="0.00"
+                value={chargeAmount}
+                onChange={(e) => setChargeAmount(e.target.value)}
+              />
+              <Select
+                aria-label="Service charge expense account"
+                value={chargeAccountId}
+                onChange={(e) => setChargeAccountId(e.target.value)}
+              >
+                <option value="">Expense account…</option>
+                {glAccounts
+                  .filter((a) => a.type === 'expense')
+                  .map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.code} — {a.name}
+                    </option>
+                  ))}
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="recon-interest-earned">Interest Earned</Label>
+              <Input
+                id="recon-interest-earned"
+                type="number"
+                step="0.01"
+                min="0"
+                placeholder="0.00"
+                value={interestAmount}
+                onChange={(e) => setInterestAmount(e.target.value)}
+              />
+              <Select
+                aria-label="Interest earned income account"
+                value={interestAccountId}
+                onChange={(e) => setInterestAccountId(e.target.value)}
+              >
+                <option value="">Income account…</option>
+                {glAccounts
+                  .filter((a) => a.type === 'revenue')
+                  .map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.code} — {a.name}
+                    </option>
+                  ))}
+              </Select>
+            </div>
+          </div>
+          <div className="mt-4 flex justify-end">
+            <Button
+              variant="secondary"
+              onClick={handleApplyAdjustments}
+              loading={applyingAdjustments}
+            >
+              Post & Clear Adjustments
+            </Button>
+          </div>
+        </Card>
+      )}
+
+      {/* Pay credit card prompt (after completing a CC reconciliation) */}
+      <Modal
+        open={showPayCC}
+        onClose={() => {
+          setShowPayCC(false);
+          onComplete();
+        }}
+        title="Pay Credit Card Balance"
+        footer={
+          <>
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setShowPayCC(false);
+                onComplete();
+              }}
+              disabled={paying}
+            >
+              Not Now
+            </Button>
+            <Button onClick={handlePayCC} loading={paying}>
+              Write a Check for the Balance
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-navy/70">
+            The reconciliation is complete. Record a payment for the statement balance now? This
+            posts <span className="font-semibold">Dr {info?.glAccountName ?? 'Credit Card'}</span>{' '}
+            / <span className="font-semibold">Cr bank</span>.
+          </p>
+          <div>
+            <Label htmlFor="recon-pay-from">Pay From</Label>
+            <Select
+              id="recon-pay-from"
+              autoFocus
+              value={payAccountId}
+              onChange={(e) => setPayAccountId(e.target.value)}
+            >
+              <option value="">Select bank account…</option>
+              {bankAccounts
+                .filter((ba) => ba.id !== recon.bankAccountId && ba.accountId !== info?.glAccountId)
+                .map((ba) => (
+                  <option key={ba.id} value={ba.accountId}>
+                    {ba.bankName} – {ba.glAccountCode} {ba.glAccountName}
+                  </option>
+                ))}
+            </Select>
+          </div>
+          <div>
+            <Label htmlFor="recon-pay-amount">Amount</Label>
+            <Input
+              id="recon-pay-amount"
+              type="number"
+              step="0.01"
+              min="0"
+              value={payAmount}
+              onChange={(e) => setPayAmount(e.target.value)}
+            />
+          </div>
+          <div>
+            <Label htmlFor="recon-pay-date">Payment Date</Label>
+            <Input
+              id="recon-pay-date"
+              type="date"
+              value={payDate}
+              onChange={(e) => setPayDate(e.target.value)}
+            />
+          </div>
+        </div>
+      </Modal>
 
       {/* Clearable lines */}
       <Card className="p-6">
@@ -301,7 +785,9 @@ function ReconcileSession({
           )}
         </h3>
         {loadingLines ? (
-          <p className="text-navy/50 text-sm py-6 text-center">Loading…</p>
+          <div className="py-10 flex justify-center">
+            <Spinner className="text-electric" />
+          </div>
         ) : lines.length === 0 ? (
           <p className="text-navy/50 text-sm py-6 text-center">
             No clearable transactions found for this period.
@@ -314,14 +800,14 @@ function ReconcileSession({
                 <Th>Date</Th>
                 <Th>Description</Th>
                 <Th>Memo</Th>
-                <Th className="text-right">Amount</Th>
+                <Th numeric>Amount</Th>
               </tr>
             </thead>
             <tbody>
               {lines.map((line) => (
                 <Tr
                   key={line.journalEntryLineId}
-                  className={line.isCleared ? 'bg-emerald-50' : ''}
+                  className={line.isCleared ? 'bg-emerald/10' : ''}
                 >
                   <Td>
                     <input
@@ -335,7 +821,7 @@ function ReconcileSession({
                   <Td>{fmtDate(line.date)}</Td>
                   <Td className="max-w-xs truncate">{line.description}</Td>
                   <Td className="text-navy/60">{line.memo ?? '—'}</Td>
-                  <Td className="text-right font-mono">
+                  <Td numeric>
                     <span
                       className={
                         line.debit
@@ -379,8 +865,8 @@ function PastReconciliations({
           <tr>
             <Th>Bank Account</Th>
             <Th>Statement Date</Th>
-            <Th className="text-right">Statement Balance</Th>
-            <Th className="text-right">Reconciled Balance</Th>
+            <Th numeric>Statement Balance</Th>
+            <Th numeric>Reconciled Balance</Th>
             <Th>Status</Th>
             <Th>Completed</Th>
             <Th></Th>
@@ -394,19 +880,24 @@ function PastReconciliations({
                 <span className="ml-1 text-navy/40 text-xs">…{r.accountNumber.slice(-4)}</span>
               </Td>
               <Td>{fmtDate(r.statementDate)}</Td>
-              <Td className="text-right font-mono">{fmt(r.statementBalance)}</Td>
-              <Td className="text-right font-mono">{fmt(r.reconciledBalance)}</Td>
+              <Td numeric>{fmt(r.statementBalance)}</Td>
+              <Td numeric>{fmt(r.reconciledBalance)}</Td>
               <Td>
-                <Badge tone={statusTone(r.status)}>
-                  {r.status === 'in_progress' ? 'In Progress' : 'Completed'}
-                </Badge>
+                <Badge tone={statusTone(r.status)}>{statusLabel(r.status)}</Badge>
               </Td>
               <Td>{fmtDate(r.completedAt)}</Td>
               <Td>
-                {r.status === 'in_progress' && (
+                {r.status === 'in_progress' ? (
                   <Button size="sm" variant="secondary" onClick={() => onResume(r)}>
                     Resume
                   </Button>
+                ) : (
+                  <Link
+                    href={`/reports/reconciliation/${r.id}`}
+                    className="text-electric text-sm font-semibold hover:underline"
+                  >
+                    Report
+                  </Link>
                 )}
               </Td>
             </Tr>
@@ -464,11 +955,12 @@ export default function ReconcilePage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
       <PageHeader title="Bank Reconciliation" icon={CheckSquare} />
 
       {loading ? (
-        <p className="text-navy/50">Loading…</p>
+        <div className="py-10 flex justify-center">
+          <Spinner className="text-electric" />
+        </div>
       ) : activeRecon ? (
         <div className="space-y-4">
           <Button
@@ -479,11 +971,19 @@ export default function ReconcilePage() {
           >
             Back to reconciliation list
           </Button>
-          <ReconcileSession recon={activeRecon} onComplete={handleComplete} />
+          <ReconcileSession
+            recon={activeRecon}
+            bankAccounts={bankAccounts}
+            onComplete={handleComplete}
+          />
         </div>
       ) : (
         <div className="space-y-8">
-          <StartForm bankAccounts={bankAccounts} onStarted={handleStarted} />
+          <StartForm
+            bankAccounts={bankAccounts}
+            onStarted={handleStarted}
+            onUndone={loadData}
+          />
           <PastReconciliations
             reconciliations={reconciliations}
             onResume={(r) => setActiveRecon(r)}

@@ -6,13 +6,20 @@
  * and a bill is created.
  *
  * Status flow:
- *   open  →  closed   (via convertToBill — stamps convertedBillId)
- *   open  →  void     (via updateStatus)
+ *   open  →  partial  (via convertToBill with per-line quantities — some qty unbilled)
+ *   open / partial  →  closed   (via convertToBill once every line is fully billed,
+ *                                or manually via updateStatus)
+ *   open  →  void     (via updateStatus; blocked once anything has been billed)
  *
- * Conversion:
- *   convertToBill(ctx, poId) calls createBill with the PO lines mapped to
- *   BillLineInput (accountId + amount), posts the A/P entry, then stamps the PO
- *   with the resulting bill id and sets status = 'closed'.
+ * Conversion / partial billing:
+ *   convertToBill(ctx, poId, opts?) bills the PO (default: every line's full
+ *   remaining quantity; or per-line quantities via opts.lines). Item lines pass
+ *   itemId/quantity/unitCost through to createBill so inventory items receive
+ *   stock (perpetual inventory). purchaseOrderLines.quantityBilled tracks how
+ *   much of each line has been pulled onto bills; multiple bills per PO are
+ *   supported. Idempotency / over-billing is enforced by a guarded conditional
+ *   UPDATE on quantityBilled inside the transaction. convertedBillId is stamped
+ *   with the bill that completes (closes) the PO.
  */
 import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
@@ -32,9 +39,13 @@ import {
 // ---------------------------------------------------------------------------
 
 export interface PurchaseOrderLineInput {
+  /** Item being ordered — passes through to the bill (inventory items receive stock). */
   itemId?: string | null;
-  /** GL account to debit when the PO is converted to a bill (expense / asset). */
-  accountId: string;
+  /**
+   * GL account to debit when the PO is billed (expense / asset).
+   * Required unless itemId is set (item lines route via the item's accounts).
+   */
+  accountId?: string | null;
   description?: string | null;
   quantity: string | number;
   rate: string | number;
@@ -82,7 +93,7 @@ export async function createPurchaseOrder(
   // Compute per-line amounts using safe decimal math.
   type ComputedLine = {
     itemId: string | null;
-    accountId: string;
+    accountId: string | null;
     description: string | null;
     quantity: string;
     rate: string;
@@ -99,14 +110,16 @@ export async function createPurchaseOrder(
     const rate = Money.of(l.rate);
     if (qty.lessThanOrEqualTo(0)) throw validation(`Line ${i + 1}: quantity must be positive.`);
     if (rate.lessThan(0)) throw validation(`Line ${i + 1}: rate cannot be negative.`);
-    if (!l.accountId) throw validation(`Line ${i + 1}: accountId is required.`);
+    if (!l.accountId && !l.itemId) {
+      throw validation(`Line ${i + 1}: select an account or an item.`);
+    }
 
     const amount = Money.round2(Money.mul(qty, rate));
     total = total.plus(amount);
 
     computedLines.push({
       itemId: l.itemId ?? null,
-      accountId: l.accountId,
+      accountId: l.accountId ?? null,
       description: l.description ?? null,
       quantity: toAmountString(qty),
       rate: toAmountString(rate),
@@ -219,6 +232,20 @@ export async function updateStatus(
     );
   }
 
+  if (po.status === 'partial' && status === 'open') {
+    throw new ServiceError(
+      'CONFLICT',
+      'Cannot mark a partially billed purchase order as open — its billed quantities already track the open balance.',
+    );
+  }
+
+  if (po.status === 'partial' && status === 'void') {
+    throw new ServiceError(
+      'CONFLICT',
+      'Cannot void a partially billed purchase order. Close it instead to stop further billing.',
+    );
+  }
+
   const [updated] = await ctx.db
     .update(purchaseOrders)
     .set({ status })
@@ -240,23 +267,60 @@ export async function updateStatus(
 // convertToBill
 // ---------------------------------------------------------------------------
 
+/** A per-line billing request for partial PO billing. */
+export interface ConvertToBillLineInput {
+  /** purchaseOrderLines.id to bill from. */
+  lineId: string;
+  /** Quantity to bill now (> 0 and ≤ the line's remaining unbilled quantity). */
+  quantity: string | number;
+}
+
+export interface ConvertToBillOptions {
+  /**
+   * Per-line quantities to bill. Lines omitted from the array are not billed.
+   * When undefined, every line is billed at its full remaining quantity
+   * (legacy full-convert behaviour).
+   */
+  lines?: ConvertToBillLineInput[];
+  /** Bill date — defaults to the PO date. */
+  date?: Date;
+  /** Vendor bill / reference number for the created bill. */
+  billNumber?: string | null;
+}
+
 /**
- * Convert a purchase order to a bill:
- * 1. Validate the PO is open and not already converted.
- * 2. Load PO lines.
- * 3. Call `createBill` (which posts the A/P GL entry).
- * 4. Stamp convertedBillId on the PO and set status = 'closed'.
- * 5. Return the newly created bill.
+ * Bill a purchase order (fully or partially) — atomically:
+ * 1. Validate the PO is billable (not void, not closed) and resolve the billing
+ *    plan: requested per-line quantities, or every line's remaining quantity.
+ * 2. Inside ONE transaction:
+ *    a. Claim each billed line via a guarded conditional UPDATE that increments
+ *       quantityBilled only while quantityBilled + qty ≤ quantity. Zero rows
+ *       back means a concurrent bill consumed the quantity — throw CONFLICT.
+ *       This per-line quantity guard is the idempotency / over-billing guard
+ *       (multiple bills per PO are now allowed, so the old single-shot
+ *       convertedBillId claim no longer applies).
+ *    b. Call `createBill` with the tx context (posts the A/P GL entry in the
+ *       same transaction via a savepoint). Item lines pass itemId + quantity +
+ *       unitCost through so inventory items receive stock perpetually.
+ *    c. Recompute the PO status: 'closed' when every line is fully billed
+ *       (stamping convertedBillId with the closing bill), else 'partial'.
+ * Any failure rolls back the line claims, the bill, and the GL entry together,
+ * so a crash mid-conversion can never leave a posted bill with stale PO
+ * quantities (and re-running convert can never double-post A/P).
  */
-export async function convertToBill(ctx: ServiceContext, poId: string) {
+export async function convertToBill(
+  ctx: ServiceContext,
+  poId: string,
+  opts?: ConvertToBillOptions,
+) {
   const [po] = await ctx.db
     .select()
     .from(purchaseOrders)
     .where(and(eq(purchaseOrders.id, poId), eq(purchaseOrders.companyId, ctx.companyId)));
   if (!po) throw notFound('Purchase order');
 
-  if (po.status === 'closed' || po.convertedBillId) {
-    throw new ServiceError('CONFLICT', 'Purchase order has already been converted to a bill.');
+  if (po.status === 'closed') {
+    throw new ServiceError('CONFLICT', 'Purchase order has already been fully billed.');
   }
   if (po.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot convert a voided purchase order.');
@@ -272,34 +336,155 @@ export async function convertToBill(ctx: ServiceContext, poId: string) {
     throw validation('Purchase order has no lines to convert.');
   }
 
-  // createBill takes accountId + amount (not qty/rate); each PO line's pre-computed
-  // amount becomes the bill line amount. accountId is the expense/asset account.
-  const bill = await createBill(ctx, {
-    vendorId: po.vendorId,
-    date: po.date,
-    dueDate: po.expectedDate ?? null,
-    memo: po.memo,
-    lines: lines.map((l) => ({
-      accountId: l.accountId!,
-      description: l.description ?? null,
-      quantity: l.quantity,
-      amount: l.amount,
-    })),
+  const remainingOf = (l: (typeof lines)[number]) =>
+    Money.of(l.quantity).minus(Money.of(l.quantityBilled ?? '0'));
+
+  // --- Resolve the billing plan -------------------------------------------
+  type PlanEntry = { line: (typeof lines)[number]; qty: ReturnType<typeof Money.of> };
+  const plan: PlanEntry[] = [];
+
+  if (opts?.lines && opts.lines.length > 0) {
+    const lineById = new Map(lines.map((l) => [l.id, l]));
+    const seen = new Set<string>();
+    for (const [i, req] of opts.lines.entries()) {
+      const line = lineById.get(req.lineId);
+      if (!line) {
+        throw validation(`Billing line ${i + 1}: purchase order line not found.`);
+      }
+      if (seen.has(req.lineId)) {
+        throw validation(`Billing line ${i + 1}: duplicate purchase order line.`);
+      }
+      seen.add(req.lineId);
+
+      const qty = Money.of(req.quantity);
+      if (qty.lessThanOrEqualTo(0)) {
+        throw validation(`Billing line ${i + 1}: quantity must be positive.`);
+      }
+      const remaining = remainingOf(line);
+      if (qty.greaterThan(remaining)) {
+        throw validation(
+          `Billing line ${i + 1}: only ${remaining.toFixed(4)} remaining unbilled ` +
+            `(ordered ${Money.of(line.quantity).toFixed(4)}, ` +
+            `billed ${Money.of(line.quantityBilled ?? '0').toFixed(4)}).`,
+        );
+      }
+      plan.push({ line, qty });
+    }
+  } else {
+    // Default: bill the full remaining quantity of every line.
+    for (const line of lines) {
+      const remaining = remainingOf(line);
+      if (remaining.greaterThan(0)) plan.push({ line, qty: remaining });
+    }
+  }
+
+  if (plan.length === 0) {
+    throw new ServiceError('CONFLICT', 'Purchase order has no unbilled quantity remaining.');
+  }
+
+  // --- Map the plan to bill lines (item passthrough → perpetual inventory) --
+  const billLineInputs = plan.map(({ line, qty }, i) => {
+    if (!line.itemId && !line.accountId) {
+      throw validation(
+        `Purchase order line ${i + 1} has no account or item; cannot convert to bill.`,
+      );
+    }
+    const amount = toAmountString(Money.round2(Money.mul(qty, line.rate)));
+    return line.itemId
+      ? {
+          // Item line: createBill routes the debit via the item (inventory items
+          // go Dr Inventory Asset and receive stock in the same transaction).
+          itemId: line.itemId,
+          accountId: line.accountId ?? null,
+          description: line.description ?? null,
+          quantity: qty.toFixed(4),
+          unitCost: line.rate,
+          amount,
+        }
+      : {
+          accountId: line.accountId,
+          description: line.description ?? null,
+          quantity: qty.toFixed(4),
+          amount,
+        };
   });
 
-  // Stamp the PO as converted.
-  await ctx.db
-    .update(purchaseOrders)
-    .set({ status: 'closed', convertedBillId: bill.id })
-    .where(eq(purchaseOrders.id, poId));
+  return inTransaction(ctx, async (tx) => {
+    // Claim each line's quantity with a guarded conditional UPDATE. If a
+    // concurrent conversion already consumed the quantity, zero rows come back
+    // and we bail without posting anything.
+    for (const { line, qty } of plan) {
+      const qtyStr = qty.toFixed(4);
+      const claimed = await tx.db
+        .update(purchaseOrderLines)
+        .set({
+          quantityBilled: sql`${purchaseOrderLines.quantityBilled} + ${qtyStr}::numeric`,
+        })
+        .where(
+          and(
+            eq(purchaseOrderLines.id, line.id),
+            eq(purchaseOrderLines.purchaseOrderId, poId),
+            sql`${purchaseOrderLines.quantityBilled} + ${qtyStr}::numeric <= ${purchaseOrderLines.quantity}`,
+          ),
+        )
+        .returning({ id: purchaseOrderLines.id });
+      if (claimed.length === 0) {
+        throw new ServiceError(
+          'CONFLICT',
+          'Purchase order quantities were billed by another transaction. Reload and retry.',
+        );
+      }
+    }
 
-  await writeAudit(ctx, {
-    action: 'update',
-    entityType: 'purchase_order',
-    entityId: poId,
-    oldValues: { status: po.status, convertedBillId: null },
-    newValues: { status: 'closed', convertedBillId: bill.id },
+    // Passing the tx context means the bill + GL entry post inside this
+    // transaction (createBill's own inTransaction becomes a savepoint).
+    const bill = await createBill(tx, {
+      vendorId: po.vendorId,
+      billNumber: opts?.billNumber ?? null,
+      date: opts?.date ?? po.date,
+      dueDate: po.expectedDate ?? null,
+      memo: po.memo,
+      lines: billLineInputs,
+    });
+
+    // Recompute PO status from the post-claim line quantities.
+    const refreshed = await tx.db
+      .select({
+        quantity: purchaseOrderLines.quantity,
+        quantityBilled: purchaseOrderLines.quantityBilled,
+      })
+      .from(purchaseOrderLines)
+      .where(eq(purchaseOrderLines.purchaseOrderId, poId));
+    const fullyBilled = refreshed.every(
+      (l) => !Money.of(l.quantity).minus(Money.of(l.quantityBilled ?? '0')).greaterThan(0),
+    );
+    const newStatus = fullyBilled ? ('closed' as const) : ('partial' as const);
+
+    await tx.db
+      .update(purchaseOrders)
+      .set({
+        status: newStatus,
+        // Stamp the bill that completes the PO (legacy full-convert semantics);
+        // earlier partial bills are linked via quantityBilled + the audit trail.
+        ...(fullyBilled && !po.convertedBillId ? { convertedBillId: bill.id } : {}),
+      })
+      .where(and(eq(purchaseOrders.id, poId), eq(purchaseOrders.companyId, tx.companyId)));
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'purchase_order',
+      entityId: poId,
+      oldValues: { status: po.status },
+      newValues: {
+        status: newStatus,
+        billId: bill.id,
+        billedQuantities: plan.map(({ line, qty }) => ({
+          lineId: line.id,
+          quantity: qty.toFixed(4),
+        })),
+      },
+    });
+
+    return bill;
   });
-
-  return bill;
 }

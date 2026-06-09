@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { Building2, Plus, TrendingDown, Calendar } from 'lucide-react';
+import { Boxes, Plus, TrendingDown, Calendar } from 'lucide-react';
 import {
   Button,
   Card,
@@ -13,11 +13,13 @@ import {
   Tr,
   Modal,
   PageHeader,
+  EmptyState,
+  Spinner,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { formatCurrency } from '@/lib/money';
+import { formatCurrency, Money } from '@/lib/money';
+import { formatDate } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -78,8 +80,9 @@ const EMPTY_FORM: AssetForm = {
   placedInService: today(),
 };
 
-function netBookValue(asset: FixedAsset): number {
-  return parseFloat(asset.cost) - parseFloat(asset.accumulatedDepreciation);
+/** Decimal-safe net book value — cost minus accumulated depreciation. */
+function netBookValue(asset: FixedAsset) {
+  return Money.sub(asset.cost, asset.accumulatedDepreciation);
 }
 
 // ---------------------------------------------------------------------------
@@ -134,8 +137,8 @@ function AddAssetModal({
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
-          <Button form="add-asset-form" type="submit" disabled={saving}>
-            {saving ? 'Saving...' : 'Add Asset'}
+          <Button form="add-asset-form" type="submit" loading={saving}>
+            Add Asset
           </Button>
         </>
       }
@@ -145,6 +148,7 @@ function AddAssetModal({
           <Label htmlFor="fa-name">Asset Name</Label>
           <Input
             id="fa-name"
+            autoFocus
             required
             placeholder="e.g. Office Server, Company Vehicle"
             value={form.name}
@@ -235,9 +239,9 @@ function RecordDepreciationModal({
 
   if (!asset) return null;
 
-  const depBase = parseFloat(asset.cost) - parseFloat(asset.salvageValue);
-  const monthly = (depBase / asset.usefulLifeMonths).toFixed(2);
-  const remaining = (depBase - parseFloat(asset.accumulatedDepreciation)).toFixed(2);
+  const depBase = Money.sub(asset.cost, asset.salvageValue);
+  const monthly = Money.round2(Money.div(depBase, asset.usefulLifeMonths));
+  const remaining = Money.sub(depBase, asset.accumulatedDepreciation);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -264,8 +268,8 @@ function RecordDepreciationModal({
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
-          <Button form="dep-form" type="submit" disabled={saving}>
-            {saving ? 'Posting...' : 'Post Depreciation'}
+          <Button form="dep-form" type="submit" loading={saving}>
+            Post Depreciation
           </Button>
         </>
       }
@@ -334,6 +338,7 @@ function ScheduleModal({
     <Modal
       open={open}
       onClose={onClose}
+      size="lg"
       title={detail ? `Depreciation Schedule — ${detail.name}` : 'Depreciation Schedule'}
       footer={
         <Button variant="secondary" onClick={onClose}>
@@ -341,10 +346,14 @@ function ScheduleModal({
         </Button>
       }
     >
-      {loading && <p className="text-navy/50 text-sm">Loading...</p>}
+      {loading && (
+        <div className="flex items-center gap-2 text-navy/50 text-sm">
+          <Spinner className="h-4 w-4" /> Loading...
+        </div>
+      )}
       {detail && (
         <div className="space-y-4">
-          <div className="grid grid-cols-3 gap-2 text-sm">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-sm">
             <div className="rounded-lg bg-slate-50 p-2 text-center">
               <div className="text-navy/50 text-xs">Cost</div>
               <div className="font-bold">{formatCurrency(detail.cost)}</div>
@@ -356,23 +365,21 @@ function ScheduleModal({
             <div className="rounded-lg bg-slate-50 p-2 text-center">
               <div className="text-navy/50 text-xs">Net Book Value</div>
               <div className="font-bold text-electric">
-                {formatCurrency(
-                  (parseFloat(detail.cost) - parseFloat(detail.accumulatedDepreciation)).toFixed(2),
-                )}
+                {formatCurrency(Money.sub(detail.cost, detail.accumulatedDepreciation))}
               </div>
             </div>
           </div>
 
-          <div className="overflow-y-auto max-h-64">
-            <table className="w-full text-xs border-collapse">
+          <div className="overflow-y-auto max-h-80">
+            <Table>
               <thead>
-                <tr className="border-b-2 border-navy/10">
-                  <th className="py-1.5 px-2 text-left text-navy/60 font-semibold">Period</th>
-                  <th className="py-1.5 px-2 text-left text-navy/60 font-semibold">Date</th>
-                  <th className="py-1.5 px-2 text-right text-navy/60 font-semibold">Amount</th>
-                  <th className="py-1.5 px-2 text-right text-navy/60 font-semibold">Accumulated</th>
-                  <th className="py-1.5 px-2 text-right text-navy/60 font-semibold">NBV</th>
-                  <th className="py-1.5 px-2 text-center text-navy/60 font-semibold">Posted</th>
+                <tr>
+                  <Th>Period</Th>
+                  <Th>Date</Th>
+                  <Th numeric>Amount</Th>
+                  <Th numeric>Accumulated</Th>
+                  <Th numeric>NBV</Th>
+                  <Th className="text-center">Posted</Th>
                 </tr>
               </thead>
               <tbody>
@@ -383,29 +390,24 @@ function ScheduleModal({
                     return eDate === sDate;
                   });
                   return (
-                    <tr key={row.period} className="border-b border-slate-50 hover:bg-electric/5">
-                      <td className="py-1 px-2 text-navy/70">{row.period}</td>
-                      <td className="py-1 px-2 text-navy/70">
-                        {new Date(row.date).toLocaleDateString('en-US', {
-                          year: 'numeric',
-                          month: 'short',
-                        })}
-                      </td>
-                      <td className="py-1 px-2 text-right">{formatCurrency(row.amount)}</td>
-                      <td className="py-1 px-2 text-right">{formatCurrency(row.accumulated)}</td>
-                      <td className="py-1 px-2 text-right font-medium">{formatCurrency(row.netBookValue)}</td>
-                      <td className="py-1 px-2 text-center">
+                    <Tr key={row.period}>
+                      <Td className="text-navy/70">{row.period}</Td>
+                      <Td className="text-navy/70">{formatDate(row.date, 'MMM yyyy')}</Td>
+                      <Td numeric>{formatCurrency(row.amount)}</Td>
+                      <Td numeric>{formatCurrency(row.accumulated)}</Td>
+                      <Td numeric className="font-medium">{formatCurrency(row.netBookValue)}</Td>
+                      <Td className="text-center">
                         {entry ? (
-                          <span className="inline-block w-2 h-2 rounded-full bg-emerald-500" title="Posted" />
+                          <span className="inline-block w-2 h-2 rounded-full bg-emerald" title="Posted" />
                         ) : (
                           <span className="inline-block w-2 h-2 rounded-full bg-slate-200" title="Not yet posted" />
                         )}
-                      </td>
-                    </tr>
+                      </Td>
+                    </Tr>
                   );
                 })}
               </tbody>
-            </table>
+            </Table>
           </div>
 
           <p className="text-xs text-navy/40">
@@ -445,20 +447,18 @@ export default function FixedAssetsPage() {
     load();
   }, [load]);
 
-  const totalCost = assets.reduce((s, a) => s + parseFloat(a.cost), 0);
+  const totalCost = assets.reduce((s, a) => s.plus(Money.of(a.cost)), Money.zero());
   const totalAccumulated = assets.reduce(
-    (s, a) => s + parseFloat(a.accumulatedDepreciation),
-    0,
+    (s, a) => s.plus(Money.of(a.accumulatedDepreciation)),
+    Money.zero(),
   );
-  const totalNBV = totalCost - totalAccumulated;
+  const totalNBV = totalCost.minus(totalAccumulated);
 
   return (
-    <main className="p-6 max-w-6xl mx-auto space-y-6">
-      <Toaster />
-
+    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans space-y-6">
       <PageHeader
         title="Fixed Assets"
-        icon={Building2}
+        icon={Boxes}
         action={
           <Button onClick={() => setAddOpen(true)}>
             <Plus className="h-4 w-4" />
@@ -468,7 +468,7 @@ export default function FixedAssetsPage() {
       />
 
       {/* Summary cards */}
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <Card className="p-4 text-center">
           <p className="text-xs text-navy/50 mb-1">Total Cost</p>
           <p className="text-2xl font-extrabold text-navy">{formatCurrency(totalCost)}</p>
@@ -486,16 +486,21 @@ export default function FixedAssetsPage() {
       {/* Assets table */}
       <Card className="p-0 overflow-hidden">
         {loading ? (
-          <p className="p-6 text-navy/50 text-sm">Loading...</p>
-        ) : assets.length === 0 ? (
-          <div className="p-12 text-center">
-            <Building2 className="h-12 w-12 text-navy/20 mx-auto mb-3" />
-            <p className="text-navy/40 text-sm">No fixed assets yet.</p>
-            <Button className="mt-4" onClick={() => setAddOpen(true)}>
-              <Plus className="h-4 w-4" />
-              Add First Asset
-            </Button>
+          <div className="flex items-center gap-2 p-6 text-navy/50 text-sm">
+            <Spinner className="h-4 w-4" /> Loading...
           </div>
+        ) : assets.length === 0 ? (
+          <EmptyState
+            icon={Boxes}
+            title="No fixed assets yet"
+            message="Add your first asset to start tracking depreciation."
+            action={
+              <Button onClick={() => setAddOpen(true)}>
+                <Plus className="h-4 w-4" />
+                Add First Asset
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -503,37 +508,32 @@ export default function FixedAssetsPage() {
                 <Th>Asset Name</Th>
                 <Th>Placed in Service</Th>
                 <Th>Useful Life</Th>
-                <Th className="text-right">Cost</Th>
-                <Th className="text-right">Accumulated Dep.</Th>
-                <Th className="text-right">Net Book Value</Th>
+                <Th numeric>Cost</Th>
+                <Th numeric>Accumulated Dep.</Th>
+                <Th numeric>Net Book Value</Th>
                 <Th className="text-center">Actions</Th>
               </tr>
             </thead>
             <tbody>
               {assets.map((asset) => {
                 const nbv = netBookValue(asset);
-                const fullyDep =
-                  parseFloat(asset.accumulatedDepreciation) >=
-                  parseFloat(asset.cost) - parseFloat(asset.salvageValue);
+                const fullyDep = Money.gte(
+                  asset.accumulatedDepreciation,
+                  Money.sub(asset.cost, asset.salvageValue),
+                );
                 return (
                   <Tr key={asset.id}>
                     <Td className="font-medium">{asset.name}</Td>
-                    <Td className="text-navy/60 text-sm">
-                      {new Date(asset.placedInService).toLocaleDateString('en-US', {
-                        year: 'numeric',
-                        month: 'short',
-                        day: 'numeric',
-                      })}
-                    </Td>
+                    <Td className="text-navy/60 text-sm">{formatDate(asset.placedInService)}</Td>
                     <Td className="text-navy/60 text-sm">{asset.usefulLifeMonths} mo</Td>
-                    <Td className="text-right font-mono text-sm">
+                    <Td numeric className="text-sm">
                       {formatCurrency(asset.cost)}
                     </Td>
-                    <Td className="text-right font-mono text-sm text-red-500">
+                    <Td numeric className="text-sm text-red-500">
                       {formatCurrency(asset.accumulatedDepreciation)}
                     </Td>
-                    <Td className="text-right font-mono text-sm font-semibold text-electric">
-                      {formatCurrency(nbv.toFixed(2))}
+                    <Td numeric className="text-sm font-semibold text-electric">
+                      {formatCurrency(nbv)}
                     </Td>
                     <Td className="text-center">
                       <div className="flex items-center justify-center gap-2">

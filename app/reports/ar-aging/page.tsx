@@ -11,10 +11,10 @@ import {
   Tr,
   PageHeader,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { AsOfControl, downloadCsv, todayStr } from '../_components/shared';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -47,50 +47,36 @@ interface AgingReport {
 }
 
 // ---------------------------------------------------------------------------
-// CSV download helper
+// CSV export (uses the shared downloadCsv helper)
 // ---------------------------------------------------------------------------
 
-function downloadCsv(report: AgingReport, filename: string) {
-  const headers = ['Customer', 'Current', '1-30 Days', '31-60 Days', '61-90 Days', '91+ Days', 'Total'];
+function exportCsv(report: AgingReport) {
   const asOfDate = new Date(report.asOf).toLocaleDateString('en-US');
-
-  const dataRows = report.rows.map((r) => [
-    r.name,
-    r.current,
-    r.days1_30,
-    r.days31_60,
-    r.days61_90,
-    r.days91plus,
-    r.total,
-  ]);
-
-  const totalsRow = [
-    'TOTAL',
-    report.totals.current,
-    report.totals.days1_30,
-    report.totals.days31_60,
-    report.totals.days61_90,
-    report.totals.days91plus,
-    report.totals.total,
-  ];
-
-  const escape = (v: string) => `"${v.replace(/"/g, '""')}"`;
-  const lines = [
-    `"A/R Aging Report — As Of ${asOfDate}"`,
-    '',
-    headers.map(escape).join(','),
-    ...dataRows.map((row) => row.map(escape).join(',')),
-    totalsRow.map(escape).join(','),
-  ];
-
-  const csv = lines.join('\r\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
+  downloadCsv(
+    'ar-aging.csv',
+    `A/R Aging Report — As Of ${asOfDate}`,
+    ['Customer', 'Current', '1-30 Days', '31-60 Days', '61-90 Days', '91+ Days', 'Total'],
+    [
+      ...report.rows.map((r) => [
+        r.name,
+        r.current,
+        r.days1_30,
+        r.days31_60,
+        r.days61_90,
+        r.days91plus,
+        r.total,
+      ]),
+      [
+        'TOTAL',
+        report.totals.current,
+        report.totals.days1_30,
+        report.totals.days31_60,
+        report.totals.days61_90,
+        report.totals.days91plus,
+        report.totals.total,
+      ],
+    ],
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +84,7 @@ function downloadCsv(report: AgingReport, filename: string) {
 // ---------------------------------------------------------------------------
 
 export default function ArAgingPage() {
+  const [asOf, setAsOf] = useState(todayStr());
   const [report, setReport] = useState<AgingReport | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -106,7 +93,9 @@ export default function ArAgingPage() {
     setLoading(true);
     setError(null);
     try {
-      const data = await api.get<AgingReport>('/api/reports/ar-aging');
+      const data = await api.get<AgingReport>(
+        `/api/reports/ar-aging?asOf=${encodeURIComponent(asOf)}`,
+      );
       setReport(data);
     } catch (err) {
       const msg = err instanceof ApiError ? err.message : 'Failed to load AR aging report.';
@@ -115,11 +104,12 @@ export default function ArAgingPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [asOf]);
 
   useEffect(() => {
     load();
-  }, [load]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const asOfLabel = report
     ? new Date(report.asOf).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
@@ -127,8 +117,6 @@ export default function ArAgingPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
-
       <PageHeader
         title="A/R Aging"
         icon={Clock}
@@ -142,7 +130,7 @@ export default function ArAgingPage() {
               size="sm"
               disabled={!report || loading}
               onClick={() => {
-                if (report) downloadCsv(report, 'ar-aging.csv');
+                if (report) exportCsv(report);
               }}
             >
               Download CSV
@@ -150,6 +138,10 @@ export default function ArAgingPage() {
           </div>
         }
       />
+
+      <Card className="p-4 mb-4">
+        <AsOfControl asOf={asOf} onChange={setAsOf} onRun={load} />
+      </Card>
 
       <Card className="p-0 overflow-hidden">
         {loading && (
@@ -172,12 +164,12 @@ export default function ArAgingPage() {
             <thead>
               <tr>
                 <Th>Customer</Th>
-                <Th className="text-right">Current</Th>
-                <Th className="text-right">1–30 Days</Th>
-                <Th className="text-right">31–60 Days</Th>
-                <Th className="text-right">61–90 Days</Th>
-                <Th className="text-right">91+ Days</Th>
-                <Th className="text-right">Total</Th>
+                <Th numeric>Current</Th>
+                <Th numeric>1–30 Days</Th>
+                <Th numeric>31–60 Days</Th>
+                <Th numeric>61–90 Days</Th>
+                <Th numeric>91+ Days</Th>
+                <Th numeric>Total</Th>
               </tr>
             </thead>
             <tbody>
@@ -191,22 +183,12 @@ export default function ArAgingPage() {
                 report.rows.map((row) => (
                   <Tr key={row.id}>
                     <Td className="font-medium">{row.name}</Td>
-                    <Td className="text-right tabular-nums">
-                      {formatCurrency(row.current)}
-                    </Td>
-                    <Td className="text-right tabular-nums">
-                      {formatCurrency(row.days1_30)}
-                    </Td>
-                    <Td className="text-right tabular-nums">
-                      {formatCurrency(row.days31_60)}
-                    </Td>
-                    <Td className="text-right tabular-nums">
-                      {formatCurrency(row.days61_90)}
-                    </Td>
-                    <Td className="text-right tabular-nums">
-                      {formatCurrency(row.days91plus)}
-                    </Td>
-                    <Td className="text-right tabular-nums font-semibold">
+                    <Td numeric>{formatCurrency(row.current)}</Td>
+                    <Td numeric>{formatCurrency(row.days1_30)}</Td>
+                    <Td numeric>{formatCurrency(row.days31_60)}</Td>
+                    <Td numeric>{formatCurrency(row.days61_90)}</Td>
+                    <Td numeric>{formatCurrency(row.days91plus)}</Td>
+                    <Td numeric className="font-semibold">
                       {formatCurrency(row.total)}
                     </Td>
                   </Tr>

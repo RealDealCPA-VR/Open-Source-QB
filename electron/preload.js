@@ -9,8 +9,16 @@ contextBridge.exposeInMainWorld('bookkeeper', {
   saveFile: (opts) => ipcRenderer.invoke('dialog:saveFile', opts),
   /** Active company data directory. */
   dataDir: () => ipcRenderer.invoke('app:dataDir'),
-  /** Subscribe to main->renderer messages (menu actions, navigation). */
-  onMenu: (cb) => ipcRenderer.on('menu', (_e, action) => cb(action)),
-  onNavigate: (cb) => ipcRenderer.on('navigate', (_e, route) => cb(route)),
+  /** Subscribe to main->renderer messages (menu actions, navigation). Returns an unsubscribe. */
+  onMenu: (cb) => {
+    const handler = (_e, action) => cb(action);
+    ipcRenderer.on('menu', handler);
+    return () => ipcRenderer.removeListener('menu', handler);
+  },
+  onNavigate: (cb) => {
+    const handler = (_e, route) => cb(route);
+    ipcRenderer.on('navigate', handler);
+    return () => ipcRenderer.removeListener('navigate', handler);
+  },
   isDesktop: true,
 });

@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { ClipboardList, ChevronDown, ChevronRight, Search } from 'lucide-react';
+import Link from 'next/link';
+import { FileClock, ChevronDown, ChevronRight, Copy } from 'lucide-react';
 import {
   Button,
   Card,
@@ -14,10 +15,12 @@ import {
   Td,
   Tr,
   PageHeader,
+  EmptyState,
+  Spinner,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { formatDate } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -77,6 +80,90 @@ const ACTION_TONES: Record<string, 'success' | 'info' | 'warning' | 'danger' | '
 };
 
 // ---------------------------------------------------------------------------
+// Entity label resolution — show document numbers / names instead of raw UUIDs.
+// The audit list endpoint only carries entityType/entityId, so we resolve labels
+// client-side from the corresponding list endpoints (fetched once, in parallel).
+// ---------------------------------------------------------------------------
+
+type AnyRow = Record<string, unknown>;
+const str = (v: unknown) => (v === null || v === undefined ? '' : String(v));
+
+const LABEL_SOURCES: Record<
+  string,
+  { url: string; rows: (d: unknown) => AnyRow[]; label: (r: AnyRow) => string; href?: (id: string) => string }
+> = {
+  account: {
+    url: '/api/accounts',
+    rows: (d) => (Array.isArray(d) ? (d as AnyRow[]) : []),
+    label: (r) => `${str(r.code)} · ${str(r.name)}`,
+  },
+  invoice: {
+    url: '/api/invoices',
+    rows: (d) => (Array.isArray(d) ? (d as AnyRow[]) : []),
+    label: (r) => `Invoice #${str(r.invoiceNumber)}`,
+    href: (id) => `/invoices?focus=${id}`,
+  },
+  bill: {
+    url: '/api/bills',
+    rows: (d) => (Array.isArray(d) ? (d as AnyRow[]) : []),
+    label: (r) => (r.billNumber ? `Bill #${str(r.billNumber)}` : 'Bill'),
+  },
+  customer: {
+    url: '/api/customers',
+    rows: (d) => (Array.isArray(d) ? (d as AnyRow[]) : []),
+    label: (r) => str(r.displayName),
+    href: (id) => `/customers?focus=${id}`,
+  },
+  vendor: {
+    url: '/api/vendors',
+    rows: (d) => (Array.isArray(d) ? (d as AnyRow[]) : []),
+    label: (r) => str(r.displayName) || str(r.name),
+    href: (id) => `/vendors?focus=${id}`,
+  },
+  employee: {
+    url: '/api/employees',
+    rows: (d) => (Array.isArray(d) ? (d as AnyRow[]) : []),
+    label: (r) => `${str(r.firstName)} ${str(r.lastName)}`.trim(),
+  },
+  journal_entry: {
+    url: '/api/journal-entries',
+    rows: (d) => ((d as { entries?: AnyRow[] })?.entries ?? []),
+    label: (r) => `JE #${str(r.entryNumber)}`,
+  },
+  payment: {
+    url: '/api/payments',
+    rows: (d) => ((d as { payments?: AnyRow[] })?.payments ?? []),
+    label: (r) => (r.paymentNumber ? `Payment #${str(r.paymentNumber)}` : 'Payment'),
+  },
+};
+
+/** key: `${entityType}:${entityId}` -> human label */
+type LabelMap = Map<string, { label: string; href?: string }>;
+
+async function buildLabelMap(): Promise<LabelMap> {
+  const map: LabelMap = new Map();
+  await Promise.allSettled(
+    Object.entries(LABEL_SOURCES).map(async ([type, source]) => {
+      const data = await api.get<unknown>(source.url);
+      for (const row of source.rows(data)) {
+        if (typeof row.id !== 'string') continue;
+        const label = source.label(row);
+        if (!label) continue;
+        map.set(`${type}:${row.id}`, { label, href: source.href?.(row.id) });
+      }
+    }),
+  );
+  return map;
+}
+
+function copyId(id: string) {
+  navigator.clipboard
+    ?.writeText(id)
+    .then(() => toast('Record ID copied to clipboard', 'info'))
+    .catch(() => toast('Could not copy ID', 'danger'));
+}
+
+// ---------------------------------------------------------------------------
 // Helper: JSON diff viewer
 // ---------------------------------------------------------------------------
 
@@ -96,7 +183,7 @@ function JsonDiff({ label, value }: { label: string; value: unknown }) {
 // Expandable row component
 // ---------------------------------------------------------------------------
 
-function AuditRow({ row }: { row: AuditLogRow }) {
+function AuditRow({ row, entityLabels }: { row: AuditLogRow; entityLabels: LabelMap }) {
   const [expanded, setExpanded] = useState(false);
   const [detail, setDetail] = useState<AuditLogRow | null>(null);
   const [loading, setLoading] = useState(false);
@@ -105,19 +192,13 @@ function AuditRow({ row }: { row: AuditLogRow }) {
     if (!expanded && !detail) {
       setLoading(true);
       try {
-        // Fetch detail from the list endpoint with limit=1 targeting by offset would
-        // not include old/newValues; instead we call the general endpoint with a detail
-        // query param. Since we only expose list GET, we embed values in the list
-        // response for rows that have them; for the expandable we use what we already
-        // have on the row, fetching detail only if values are absent.
+        // The list endpoint trims oldValues/newValues for performance, so fetch the full
+        // record from the detail endpoint when the row doesn't already carry them.
         if (row.oldValues !== undefined || row.newValues !== undefined) {
           setDetail(row);
         } else {
-          // Re-fetch with detail=true (our route doesn't expose a single-row endpoint,
-          // so we re-query the list filtering to just this entity+action and pick the
-          // first match). For a proper detail endpoint that would be /api/audit-trail/:id.
-          // Here we re-use the list endpoint with a large payload already in the row.
-          setDetail(row);
+          const full = await api.get<AuditLogRow>(`/api/audit-trail/${row.id}`);
+          setDetail(full);
         }
       } catch (err) {
         toast(err instanceof ApiError ? err.message : 'Failed to load details', 'danger');
@@ -131,19 +212,11 @@ function AuditRow({ row }: { row: AuditLogRow }) {
   const actionTone = ACTION_TONES[row.action] ?? 'neutral';
   const actionLabel =
     ACTION_OPTIONS.find((o) => o.value === row.action)?.label ?? row.action;
-  const date = new Date(row.createdAt);
-  const dateStr = date.toLocaleDateString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-  });
-  const timeStr = date.toLocaleTimeString('en-US', {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
+  const dateStr = formatDate(row.createdAt);
+  const timeStr = formatDate(row.createdAt, 'HH:mm:ss');
 
   const shownDetail = detail ?? row;
+  const entity = entityLabels.get(`${row.entityType}:${row.entityId}`);
 
   return (
     <>
@@ -174,7 +247,31 @@ function AuditRow({ row }: { row: AuditLogRow }) {
           </span>
         </Td>
         <Td>
-          <span className="font-mono text-xs text-navy/50 break-all">{row.entityId}</span>
+          {entity ? (
+            entity.href ? (
+              <Link
+                href={entity.href}
+                onClick={(e) => e.stopPropagation()}
+                className="text-sm font-medium text-electric hover:underline"
+              >
+                {entity.label}
+              </Link>
+            ) : (
+              <span className="text-sm text-navy/80">{entity.label}</span>
+            )
+          ) : (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                copyId(row.entityId);
+              }}
+              title="Copy record ID"
+              className="inline-flex items-center gap-1 text-xs text-navy/50 hover:text-navy"
+            >
+              <Copy className="h-3 w-3" />
+              Copy record ID
+            </button>
+          )}
         </Td>
       </Tr>
 
@@ -183,10 +280,11 @@ function AuditRow({ row }: { row: AuditLogRow }) {
           <td colSpan={6} className="px-4 pb-4 pt-0 bg-slate-50/80 border-b border-slate-100">
             <div className="rounded-xl border border-slate-200 bg-white p-4 mt-1">
               {loading ? (
-                <p className="text-sm text-navy/40">Loading details...</p>
+                <div className="flex items-center gap-2 text-sm text-navy/40">
+                  <Spinner className="h-4 w-4" /> Loading details...
+                </div>
               ) : (
                 <>
-                  <p className="text-xs text-navy/40 mb-3 font-mono">ID: {row.id}</p>
                   {shownDetail.oldValues == null && shownDetail.newValues == null ? (
                     <p className="text-sm text-navy/40 italic">No value snapshot recorded.</p>
                   ) : (
@@ -225,6 +323,9 @@ export default function AuditTrailPage() {
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(0);
 
+  // Human labels for entity references (entityType:entityId -> document number / name).
+  const [entityLabels, setEntityLabels] = useState<LabelMap>(new Map());
+
   // Filters
   const [filterAction, setFilterAction] = useState('');
   const [filterEntityType, setFilterEntityType] = useState('');
@@ -258,27 +359,36 @@ export default function AuditTrailPage() {
     }
   }, [filterAction, filterEntityType, filterFrom, filterTo]);
 
-  useEffect(() => {
-    setPage(0);
-    fetchLogs(0);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filterAction, filterEntityType, filterFrom, filterTo]);
-
+  // Single fetch effect: filter changes recreate fetchLogs (and reset the page in
+  // their handlers), page changes re-run it — exactly one request per change.
   useEffect(() => {
     fetchLogs(page);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page]);
+  }, [page, fetchLogs]);
 
-  function handleSearch() {
-    setPage(0);
-    fetchLogs(0);
+  // Entity labels load once, in parallel, and tolerate partial failures.
+  useEffect(() => {
+    let cancelled = false;
+    buildLabelMap().then((map) => {
+      if (!cancelled) setEntityLabels(map);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** Update a filter and jump back to the first page (one fetch via the effect). */
+  function applyFilter(setter: (v: string) => void) {
+    return (value: string) => {
+      setPage(0);
+      setter(value);
+    };
   }
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
         title="Audit Trail"
-        icon={ClipboardList}
+        icon={FileClock}
         action={
           <span className="text-sm text-navy/50">
             {total.toLocaleString()} event{total !== 1 ? 's' : ''}
@@ -294,7 +404,7 @@ export default function AuditTrailPage() {
             <Select
               id="filterAction"
               value={filterAction}
-              onChange={(e) => setFilterAction(e.target.value)}
+              onChange={(e) => applyFilter(setFilterAction)(e.target.value)}
             >
               {ACTION_OPTIONS.map((opt) => (
                 <option key={opt.value} value={opt.value}>
@@ -309,7 +419,7 @@ export default function AuditTrailPage() {
             <Select
               id="filterEntityType"
               value={filterEntityType}
-              onChange={(e) => setFilterEntityType(e.target.value)}
+              onChange={(e) => applyFilter(setFilterEntityType)(e.target.value)}
             >
               {ENTITY_TYPE_OPTIONS.map((opt) => (
                 <option key={opt.value} value={opt.value}>
@@ -325,7 +435,7 @@ export default function AuditTrailPage() {
               id="filterFrom"
               type="date"
               value={filterFrom}
-              onChange={(e) => setFilterFrom(e.target.value)}
+              onChange={(e) => applyFilter(setFilterFrom)(e.target.value)}
             />
           </div>
 
@@ -335,7 +445,7 @@ export default function AuditTrailPage() {
               id="filterTo"
               type="date"
               value={filterTo}
-              onChange={(e) => setFilterTo(e.target.value)}
+              onChange={(e) => applyFilter(setFilterTo)(e.target.value)}
             />
           </div>
         </div>
@@ -344,6 +454,7 @@ export default function AuditTrailPage() {
           <Button
             variant="secondary"
             onClick={() => {
+              setPage(0);
               setFilterAction('');
               setFilterEntityType('');
               setFilterFrom('');
@@ -352,22 +463,21 @@ export default function AuditTrailPage() {
           >
             Clear
           </Button>
-          <Button onClick={handleSearch}>
-            <Search className="h-4 w-4" />
-            Search
-          </Button>
         </div>
       </Card>
 
       {/* ---- Table ---- */}
       <Card>
         {loading ? (
-          <div className="p-12 text-center text-navy/40 text-sm">Loading audit trail...</div>
-        ) : rows.length === 0 ? (
-          <div className="p-12 text-center">
-            <ClipboardList className="mx-auto h-10 w-10 text-navy/20 mb-3" />
-            <p className="text-navy/50 text-sm">No audit log entries match your filters.</p>
+          <div className="flex items-center justify-center gap-2 p-12 text-navy/40 text-sm">
+            <Spinner className="h-4 w-4" /> Loading audit trail...
           </div>
+        ) : rows.length === 0 ? (
+          <EmptyState
+            icon={FileClock}
+            title="No audit events found"
+            message="No audit log entries match your filters."
+          />
         ) : (
           <>
             <Table>
@@ -378,12 +488,12 @@ export default function AuditTrailPage() {
                   <Th>User</Th>
                   <Th>Action</Th>
                   <Th>Entity Type</Th>
-                  <Th>Entity ID</Th>
+                  <Th>Record</Th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map((row) => (
-                  <AuditRow key={row.id} row={row} />
+                  <AuditRow key={row.id} row={row} entityLabels={entityLabels} />
                 ))}
               </tbody>
             </Table>
@@ -421,8 +531,6 @@ export default function AuditTrailPage() {
           </>
         )}
       </Card>
-
-      <Toaster />
     </main>
   );
 }

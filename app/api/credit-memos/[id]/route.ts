@@ -1,11 +1,18 @@
 /**
  * GET    /api/credit-memos/:id              — fetch credit memo with lines
- * POST   /api/credit-memos/:id              — actions: { action: 'apply', invoiceId, amount }
+ * POST   /api/credit-memos/:id              — actions:
+ *           { action: 'apply',  invoiceId, amount }
+ *           { action: 'refund', bankAccountId, amount, date?, memo? }
  * DELETE /api/credit-memos/:id              — void the credit memo
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { getCreditMemo, applyToInvoice, voidCreditMemo } from '@/lib/services/creditMemos';
+import {
+  getCreditMemo,
+  applyToInvoice,
+  refundCreditMemo,
+  voidCreditMemo,
+} from '@/lib/services/creditMemos';
 import { ServiceError } from '@/lib/services/_base';
 
 function errorResponse(err: unknown) {
@@ -45,27 +52,46 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const ctx = await getServerContext();
     const body = await req.json();
 
-    if (body.action !== 'apply') {
-      return NextResponse.json(
-        { error: `Unknown action '${body.action}'. Supported: apply`, code: 'VALIDATION' },
-        { status: 400 },
-      );
+    if (body.action === 'apply') {
+      if (!body.invoiceId) {
+        return NextResponse.json({ error: 'invoiceId is required', code: 'VALIDATION' }, { status: 400 });
+      }
+      if (body.amount === undefined || body.amount === null) {
+        return NextResponse.json({ error: 'amount is required', code: 'VALIDATION' }, { status: 400 });
+      }
+
+      const result = await applyToInvoice(ctx, {
+        creditMemoId: id,
+        invoiceId: body.invoiceId,
+        amount: body.amount,
+      });
+
+      return NextResponse.json(result);
     }
 
-    if (!body.invoiceId) {
-      return NextResponse.json({ error: 'invoiceId is required', code: 'VALIDATION' }, { status: 400 });
-    }
-    if (body.amount === undefined || body.amount === null) {
-      return NextResponse.json({ error: 'amount is required', code: 'VALIDATION' }, { status: 400 });
+    if (body.action === 'refund') {
+      if (!body.bankAccountId) {
+        return NextResponse.json({ error: 'bankAccountId is required', code: 'VALIDATION' }, { status: 400 });
+      }
+      if (body.amount === undefined || body.amount === null) {
+        return NextResponse.json({ error: 'amount is required', code: 'VALIDATION' }, { status: 400 });
+      }
+
+      const result = await refundCreditMemo(ctx, {
+        creditMemoId: id,
+        bankAccountId: body.bankAccountId,
+        amount: body.amount,
+        date: body.date ? new Date(body.date) : null,
+        memo: body.memo ?? null,
+      });
+
+      return NextResponse.json(result);
     }
 
-    const result = await applyToInvoice(ctx, {
-      creditMemoId: id,
-      invoiceId: body.invoiceId,
-      amount: body.amount,
-    });
-
-    return NextResponse.json(result);
+    return NextResponse.json(
+      { error: `Unknown action '${body.action}'. Supported: apply, refund`, code: 'VALIDATION' },
+      { status: 400 },
+    );
   } catch (err) {
     return errorResponse(err);
   }

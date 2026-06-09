@@ -39,13 +39,19 @@ function sign(payload: string): string {
   return crypto.createHmac('sha256', secret()).update(payload).digest('base64url');
 }
 
-export function createSessionToken(userId: string): string {
-  const payload = JSON.stringify({ userId, exp: Date.now() + SESSION_TTL_MS });
+/** Token audience: a main-app user session vs. an employee self-service portal session. */
+export type TokenKind = 'user' | 'portal';
+
+export function createSessionToken(userId: string, kind: TokenKind = 'user'): string {
+  const payload = JSON.stringify({ userId, kind, exp: Date.now() + SESSION_TTL_MS });
   const body = Buffer.from(payload).toString('base64url');
   return `${body}.${sign(body)}`;
 }
 
-export function verifySessionToken(token: string | undefined | null): { userId: string } | null {
+export function verifySessionToken(
+  token: string | undefined | null,
+  expectedKind: TokenKind = 'user',
+): { userId: string } | null {
   if (!token) return null;
   const [body, sig] = token.split('.');
   if (!body || !sig) return null;
@@ -58,6 +64,10 @@ export function verifySessionToken(token: string | undefined | null): { userId: 
     const data = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
     if (typeof data.userId !== 'string' || typeof data.exp !== 'number') return null;
     if (Date.now() > data.exp) return null;
+    // Bind the token to its audience so a portal token cannot be replayed as a main-app
+    // session (and vice versa). Legacy tokens with no `kind` are treated as 'user'.
+    const kind: TokenKind = data.kind === 'portal' ? 'portal' : 'user';
+    if (kind !== expectedKind) return null;
     return { userId: data.userId };
   } catch {
     return null;
@@ -92,7 +102,7 @@ export async function getCurrentUser() {
   if (!userId) return null;
   const db = await getDb();
   const [user] = await db
-    .select({ id: users.id, email: users.email, name: users.name })
+    .select({ id: users.id, email: users.email, name: users.name, totpEnabled: users.totpEnabled })
     .from(users)
     .where(eq(users.id, userId));
   return user ?? null;
@@ -102,7 +112,7 @@ export async function getCurrentUser() {
 export async function getPortalEmployeeId(): Promise<string | null> {
   try {
     const store = await cookies();
-    return verifySessionToken(store.get(PORTAL_COOKIE)?.value)?.userId ?? null;
+    return verifySessionToken(store.get(PORTAL_COOKIE)?.value, 'portal')?.userId ?? null;
   } catch {
     return null;
   }

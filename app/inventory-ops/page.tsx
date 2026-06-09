@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { Package, RefreshCw, ClipboardCheck } from 'lucide-react';
+import Link from 'next/link';
+import { Package, PackageSearch, RefreshCw, ClipboardCheck } from 'lucide-react';
 import {
   Button,
   Card,
@@ -15,11 +16,12 @@ import {
   Tr,
   Modal,
   PageHeader,
+  EmptyState,
+  Spinner,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api } from '@/lib/client';
-import { formatCurrency } from '@/lib/money';
+import { formatCurrency, Money } from '@/lib/money';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -151,8 +153,8 @@ function PhysicalCountModal({ open, onClose, onDone }: PhysicalCountModalProps) 
             <Button variant="secondary" onClick={onClose} disabled={saving}>
               Cancel
             </Button>
-            <Button onClick={handleSubmit} disabled={saving || loadingItems}>
-              {saving ? 'Saving…' : 'Record Count'}
+            <Button type="submit" form="physical-count-form" loading={saving} disabled={loadingItems}>
+              Record Count
             </Button>
           </>
         )
@@ -180,7 +182,7 @@ function PhysicalCountModal({ open, onClose, onDone }: PhysicalCountModalProps) 
               <span className="text-navy/60">Delta</span>
               <span
                 className={`font-semibold tabular-nums ${
-                  deltaNum < 0 ? 'text-red-600' : deltaNum > 0 ? 'text-emerald-600' : 'text-navy/50'
+                  deltaNum < 0 ? 'text-red-600' : deltaNum > 0 ? 'text-emerald' : 'text-navy/50'
                 }`}
               >
                 {deltaNum > 0 ? '+' : ''}{result.delta}
@@ -195,7 +197,12 @@ function PhysicalCountModal({ open, onClose, onDone }: PhysicalCountModalProps) 
             {result.journalEntryId ? (
               <div className="flex justify-between text-xs">
                 <span className="text-navy/40">Journal Entry</span>
-                <span className="text-navy/60 font-mono">{result.journalEntryId.slice(0, 8)}…</span>
+                <Link
+                  href={`/journal?focus=${result.journalEntryId}`}
+                  className="text-electric font-semibold hover:underline"
+                >
+                  View entry
+                </Link>
               </div>
             ) : (
               <p className="text-xs text-navy/40 italic">No GL entry needed (delta = 0).</p>
@@ -206,7 +213,7 @@ function PhysicalCountModal({ open, onClose, onDone }: PhysicalCountModalProps) 
               className={`rounded-lg px-4 py-3 text-sm font-medium ${
                 deltaNum < 0
                   ? 'bg-red-50 text-red-700'
-                  : 'bg-emerald-50 text-emerald-700'
+                  : 'bg-emerald/10 text-emerald'
               }`}
             >
               {deltaNum < 0
@@ -217,14 +224,24 @@ function PhysicalCountModal({ open, onClose, onDone }: PhysicalCountModalProps) 
         </div>
       ) : (
         // Entry form
-        <div className="space-y-4">
+        <form
+          id="physical-count-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleSubmit();
+          }}
+          className="space-y-4"
+        >
           <div>
             <Label htmlFor="pc-item">Item *</Label>
             {loadingItems ? (
-              <p className="text-sm text-navy/40 py-2">Loading items…</p>
+              <div className="flex items-center gap-2 text-sm text-navy/40 py-2">
+                <Spinner className="h-4 w-4" /> Loading items…
+              </div>
             ) : (
               <Select
                 id="pc-item"
+                autoFocus
                 value={itemId}
                 onChange={(e) => setItemId(e.target.value)}
               >
@@ -277,7 +294,7 @@ function PhysicalCountModal({ open, onClose, onDone }: PhysicalCountModalProps) 
                     parseFloat(countedQty) - parseFloat(selectedItem.quantityOnHand ?? '0') < 0
                       ? 'text-red-500 font-semibold'
                       : parseFloat(countedQty) - parseFloat(selectedItem.quantityOnHand ?? '0') > 0
-                      ? 'text-emerald-600 font-semibold'
+                      ? 'text-emerald font-semibold'
                       : 'text-navy/40'
                   }
                 >
@@ -290,11 +307,10 @@ function PhysicalCountModal({ open, onClose, onDone }: PhysicalCountModalProps) 
                   <span className="ml-2 text-navy/40">
                     ≈{' '}
                     {formatCurrency(
-                      Math.abs(
-                        (parseFloat(countedQty || '0') -
-                          parseFloat(selectedItem.quantityOnHand ?? '0')) *
-                          parseFloat(selectedItem.averageCost),
-                      ).toFixed(2),
+                      Money.mul(
+                        Money.sub(countedQty || '0', selectedItem.quantityOnHand ?? '0'),
+                        selectedItem.averageCost,
+                      ).abs(),
                     )}{' '}
                     GL impact
                   </span>
@@ -312,7 +328,7 @@ function PhysicalCountModal({ open, onClose, onDone }: PhysicalCountModalProps) 
               onChange={(e) => setDate(e.target.value)}
             />
           </div>
-        </div>
+        </form>
       )}
     </Modal>
   );
@@ -346,11 +362,9 @@ export default function InventoryOpsPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
-
       <PageHeader
         title="Inventory Operations"
-        icon={Package}
+        icon={PackageSearch}
         action={
           <div className="flex items-center gap-3">
             <Button variant="secondary" onClick={fetchReport} disabled={loading}>
@@ -384,44 +398,41 @@ export default function InventoryOpsPage() {
 
       <Card className="p-0 overflow-hidden">
         {loading ? (
-          <div className="flex items-center justify-center py-20 text-navy/40 text-sm">
-            Loading reorder report…
+          <div className="flex items-center justify-center gap-2 py-20 text-navy/40 text-sm">
+            <Spinner className="h-4 w-4" /> Loading reorder report…
           </div>
         ) : !report || report.rows.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-20 gap-3 text-navy/40">
-            <Package className="h-10 w-10 opacity-30" />
-            <p className="text-sm font-medium">No items need reordering right now.</p>
-            <p className="text-xs">
-              Items appear here when their quantity on hand falls to or below their reorder point.
-            </p>
-          </div>
+          <EmptyState
+            icon={Package}
+            title="No items need reordering right now"
+            message="Items appear here when their quantity on hand falls to or below their reorder point."
+          />
         ) : (
           <Table>
             <thead>
               <Tr>
                 <Th>Item</Th>
                 <Th>SKU</Th>
-                <Th className="text-right">On Hand</Th>
-                <Th className="text-right">Reorder Point</Th>
-                <Th className="text-right">Avg Cost</Th>
-                <Th className="text-right">Suggested Order</Th>
-                <Th className="text-right">Est. Cost</Th>
+                <Th numeric>On Hand</Th>
+                <Th numeric>Reorder Point</Th>
+                <Th numeric>Avg Cost</Th>
+                <Th numeric>Suggested Order</Th>
+                <Th numeric>Est. Cost</Th>
               </Tr>
             </thead>
             <tbody>
               {report.rows.map((row) => {
                 const belowZero =
                   parseFloat(row.quantityOnHand) <= 0;
-                const estCost =
-                  parseFloat(row.suggestedReorderQty) * parseFloat(row.averageCost);
+                const estCost = Money.mul(row.suggestedReorderQty, row.averageCost);
 
                 return (
                   <Tr key={row.id}>
                     <Td className="font-semibold text-navy">{row.name}</Td>
-                    <Td className="text-navy/50 font-mono text-xs">
+                    <Td className="text-navy/50 text-xs">
                       {row.sku ?? '—'}
                     </Td>
-                    <Td className="text-right tabular-nums">
+                    <Td numeric>
                       <span
                         className={
                           belowZero
@@ -432,17 +443,17 @@ export default function InventoryOpsPage() {
                         {parseFloat(row.quantityOnHand).toFixed(2)}
                       </span>
                     </Td>
-                    <Td className="text-right tabular-nums text-navy/70">
+                    <Td numeric className="text-navy/70">
                       {parseFloat(row.reorderPoint).toFixed(2)}
                     </Td>
-                    <Td className="text-right tabular-nums text-navy/70">
+                    <Td numeric className="text-navy/70">
                       {formatCurrency(row.averageCost)}
                     </Td>
-                    <Td className="text-right tabular-nums font-semibold text-electric">
+                    <Td numeric className="font-semibold text-electric">
                       {parseFloat(row.suggestedReorderQty).toFixed(2)}
                     </Td>
-                    <Td className="text-right tabular-nums text-navy/70">
-                      {formatCurrency(estCost.toFixed(2))}
+                    <Td numeric className="text-navy/70">
+                      {formatCurrency(estCost)}
                     </Td>
                   </Tr>
                 );
@@ -461,14 +472,10 @@ export default function InventoryOpsPage() {
             Total estimated reorder cost:{' '}
             <span className="font-semibold text-navy/70">
               {formatCurrency(
-                report.rows
-                  .reduce(
-                    (sum, r) =>
-                      sum +
-                      parseFloat(r.suggestedReorderQty) * parseFloat(r.averageCost),
-                    0,
-                  )
-                  .toFixed(2),
+                report.rows.reduce(
+                  (sum, r) => sum.plus(Money.mul(r.suggestedReorderQty, r.averageCost)),
+                  Money.zero(),
+                ),
               )}
             </span>
           </span>

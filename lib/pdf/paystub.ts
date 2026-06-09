@@ -25,6 +25,8 @@ export interface PaystubLine {
   kind: 'earning' | 'tax' | 'deduction' | 'employer_contribution';
   name: string;
   amount: string | number;
+  /** Calendar year-to-date total for this line. Renders a YTD column when present. */
+  ytdAmount?: string | number | null;
 }
 
 export interface PaystubPdfData {
@@ -36,6 +38,10 @@ export interface PaystubPdfData {
     periodEnd?: string | null;
     grossPay: string | number;
     netPay: string | number;
+    /** Calendar year-to-date gross through this stub's pay date. */
+    ytdGross?: string | number | null;
+    /** Calendar year-to-date net through this stub's pay date. */
+    ytdNet?: string | number | null;
   };
   lines: PaystubLine[];
 }
@@ -172,8 +178,16 @@ export async function renderPaystubPdf(data: PaystubPdfData): Promise<Uint8Array
   // Section rendering helper
   // -------------------------------------------------------------------------
 
+  // When any YTD figure is present, the current amount column shifts left and a
+  // YTD column is rendered at the right margin.
+  const hasYtd =
+    data.paycheck.ytdGross != null ||
+    data.paycheck.ytdNet != null ||
+    data.lines.some((l) => l.ytdAmount != null);
+
   const COL_NAME  = MARGIN_L;
-  const COL_AMT   = MARGIN_R;
+  const COL_YTD   = MARGIN_R;
+  const COL_AMT   = hasYtd ? MARGIN_R - 110 : MARGIN_R;
   const ROW_H     = 16;
   const SECTION_LABEL_SIZE = 8;
   const LINE_SIZE = 10;
@@ -191,13 +205,28 @@ export async function renderPaystubPdf(data: PaystubPdfData): Promise<Uint8Array
       color: COLOR_GRAY,
     });
 
+    if (hasYtd) {
+      drawText('CURRENT', COL_AMT, cursor, {
+        font: bold,
+        size: SECTION_LABEL_SIZE,
+        color: COLOR_GRAY,
+        rightAlign: true,
+      });
+      drawText('YTD', COL_YTD, cursor, {
+        font: bold,
+        size: SECTION_LABEL_SIZE,
+        color: COLOR_GRAY,
+        rightAlign: true,
+      });
+    }
+
     cursor -= 4;
     drawRule(cursor, COLOR_LIGHT, 0.5);
     cursor -= 12;
 
     // Lines
     for (const line of sectionLines) {
-      drawText(trunc(line.name, 60), COL_NAME, cursor, {
+      drawText(trunc(line.name, hasYtd ? 48 : 60), COL_NAME, cursor, {
         size: LINE_SIZE,
         color: COLOR_BLACK,
       });
@@ -206,6 +235,13 @@ export async function renderPaystubPdf(data: PaystubPdfData): Promise<Uint8Array
         color: COLOR_BLACK,
         rightAlign: true,
       });
+      if (hasYtd && line.ytdAmount != null) {
+        drawText(fmt(line.ytdAmount), COL_YTD, cursor, {
+          size: LINE_SIZE,
+          color: COLOR_GRAY,
+          rightAlign: true,
+        });
+      }
       cursor -= ROW_H;
     }
 
@@ -253,6 +289,14 @@ export async function renderPaystubPdf(data: PaystubPdfData): Promise<Uint8Array
     color: COLOR_NAVY,
     rightAlign: true,
   });
+  if (hasYtd && data.paycheck.ytdGross != null) {
+    drawText(fmt(data.paycheck.ytdGross), COL_YTD, cursor, {
+      font: bold,
+      size: 10,
+      color: COLOR_GRAY,
+      rightAlign: true,
+    });
+  }
   cursor -= ROW_H;
 
   // -------------------------------------------------------------------------
@@ -286,6 +330,17 @@ export async function renderPaystubPdf(data: PaystubPdfData): Promise<Uint8Array
   });
 
   cursor -= NET_BOX_H + 16;
+
+  // YTD net pay (beneath the box, right-aligned)
+  if (hasYtd && data.paycheck.ytdNet != null) {
+    drawText(`YTD Net Pay: ${fmt(data.paycheck.ytdNet)}`, MARGIN_R, cursor + 6, {
+      font: bold,
+      size: 9,
+      color: COLOR_GRAY,
+      rightAlign: true,
+    });
+    cursor -= 14;
+  }
 
   // -------------------------------------------------------------------------
   // FOOTER

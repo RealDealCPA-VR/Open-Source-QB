@@ -6,11 +6,25 @@
  * receivables or payables — only exchanged cash counts. Equity is adjusted by
  * (AR removed − AP removed) to keep Assets = Liabilities + Equity.
  */
+import { Scale } from 'lucide-react';
+import { Badge, Button, Card, Input, Label, PageHeader } from '@/components/ui';
 import { getServerContext } from '@/lib/context';
 import { balanceSheetCashBasis, type BalanceSheetCashBasis } from '@/lib/services/balanceSheetCashBasis';
-import { formatCurrency } from '@/lib/money';
+import { formatCurrency, Money } from '@/lib/money';
 
 export const dynamic = 'force-dynamic';
+
+function toInputDate(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function parseParamDate(v: string | undefined): Date | undefined {
+  if (!v) return undefined;
+  // Parse as local midnight so the rendered date matches what the user picked
+  // regardless of the server's UTC offset.
+  const d = new Date(`${v}T00:00:00`);
+  return isNaN(d.getTime()) ? undefined : d;
+}
 
 type Line = { accountId: string; code: string; name: string; amount: string };
 
@@ -54,9 +68,9 @@ function AdjustmentNote({ bs }: { bs: BalanceSheetCashBasis }) {
   if (!hasAr && !hasAp) return null;
 
   return (
-    <div className="mt-6 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+    <div className="mt-6 rounded-xl border border-gold/25 bg-gold/10 p-4 text-sm text-navy">
       <p className="font-semibold mb-2">Cash-Basis Adjustments Applied</p>
-      <p className="mb-3 text-amber-800/80">
+      <p className="mb-3 text-navy/70">
         Cash-basis accounting excludes receivables and payables. The following balances have been
         removed from this report and equity has been reduced by{' '}
         <span className="font-semibold">{formatCurrency(adjustments.equityAdjustment)}</span> (AR
@@ -100,9 +114,16 @@ function AdjustmentNote({ bs }: { bs: BalanceSheetCashBasis }) {
   );
 }
 
-export default async function BalanceSheetCashPage() {
+export default async function BalanceSheetCashPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ asOf?: string }>;
+}) {
   const ctx = await getServerContext();
-  const bs = await balanceSheetCashBasis(ctx);
+  const params = await searchParams;
+  const asOf = parseParamDate(params.asOf) ?? new Date();
+  const asOfStr = toInputDate(asOf);
+  const bs = await balanceSheetCashBasis(ctx, asOf);
 
   const equityLines: Line[] = [
     ...bs.equity,
@@ -114,30 +135,26 @@ export default async function BalanceSheetCashPage() {
     },
   ];
 
-  const totalLiabAndEquity =
-    Number(bs.totals.totalLiabilities) + Number(bs.totals.totalEquity);
+  const totalLiabAndEquity = Money.add(bs.totals.totalLiabilities, bs.totals.totalEquity);
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       {/* Header */}
-      <div className="flex items-baseline justify-between mb-2">
-        <h1 className="text-3xl font-extrabold text-navy">Balance Sheet — Cash Basis</h1>
-        <span
-          className={`px-3 py-1 rounded-full text-xs font-semibold ${
-            bs.balanced
-              ? 'bg-emerald/15 text-emerald'
-              : 'bg-red-100 text-red-600'
-          }`}
-        >
-          {bs.balanced ? 'Assets = Liabilities + Equity' : 'OUT OF BALANCE'}
-        </span>
-      </div>
+      <PageHeader
+        title="Balance Sheet — Cash Basis"
+        icon={Scale}
+        action={
+          <Badge tone={bs.balanced ? 'success' : 'danger'}>
+            {bs.balanced ? 'Assets = Liabilities + Equity' : 'OUT OF BALANCE'}
+          </Badge>
+        }
+      />
 
       {/* Basis badge */}
-      <div className="flex items-center gap-3 mb-6">
-        <span className="px-3 py-1 rounded-full text-xs font-semibold bg-amber-100 text-amber-700">
+      <div className="flex items-center gap-3 mb-6 -mt-2">
+        <Badge tone="warning" className="bg-gold/10 text-navy border border-gold/25">
           Cash Basis
-        </span>
+        </Badge>
         {bs.asOf && (
           <span className="text-sm text-navy/50">
             As of {new Date(bs.asOf).toLocaleDateString('en-US', { dateStyle: 'long' })}
@@ -149,8 +166,21 @@ export default async function BalanceSheetCashPage() {
         </span>
       </div>
 
+      {/* As-of date picker (plain GET form — server-rendered page) */}
+      <Card className="mb-6 max-w-3xl">
+        <form method="get" className="flex items-end gap-3 flex-wrap p-4">
+          <div>
+            <Label htmlFor="bsc-asof">As of</Label>
+            <Input id="bsc-asof" type="date" name="asOf" defaultValue={asOfStr} />
+          </div>
+          <Button type="submit" variant="secondary" size="sm" className="mb-0.5">
+            Run Report
+          </Button>
+        </form>
+      </Card>
+
       {/* Balance Sheet table */}
-      <div className="rounded-2xl bg-white p-6 shadow-2xl border border-slate-100 max-w-3xl">
+      <Card className="p-6 max-w-3xl">
         <table className="w-full border-collapse">
           <tbody>
             <Group
@@ -184,7 +214,7 @@ export default async function BalanceSheetCashPage() {
             </tr>
           </tfoot>
         </table>
-      </div>
+      </Card>
 
       {/* Adjustment note */}
       <div className="max-w-3xl">

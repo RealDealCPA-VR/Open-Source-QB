@@ -51,5 +51,8 @@ next-env.d.ts
 *.p12
 build/code-sign.pfx
 
+# generated dev launcher (created by npm run make-dev-shortcut)
+scripts/launch-dev.cmd
+
 # NOTE: /drizzle (generated SQL migrations) IS tracked on purpose — it is the DB source of
 # truth and is bundled into the desktop build.

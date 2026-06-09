@@ -83,13 +83,28 @@ describe('computeWithholding — Social Security', () => {
     expect(result.socialSecurity).toBe(expectedSS);
   });
 
-  it('SS is capped at wage base — very high earner pays less than 6.2% of gross', () => {
-    // $20,000/period × 26 = $520,000 annual (well above $168,600 wage base)
-    const result = computeWithholding({ grossPerPeriod: 20000, periodsPerYear: 26, filingStatus: 'single' });
-    // Capped annual SS = 168600 * 0.062 = $10,453.20; per period = $10,453.20 / 26 = $402.05
-    const annualSSCapped = 168600 * 0.062;
-    const expectedSS = (annualSSCapped / 26).toFixed(2);
-    expect(result.socialSecurity).toBe(expectedSS);
+  it('SS wage base applies to actual YTD wages, not an annualized projection — a $20k bonus with low YTD withholds the full 6.2%', () => {
+    // $20,000 bonus on a biweekly schedule. Annualized ($520k) exceeds the wage base,
+    // but the employee's ACTUAL YTD wages are far below it — full 6.2% applies.
+    const result = computeWithholding({
+      grossPerPeriod: 20000, periodsPerYear: 26, filingStatus: 'single', ytdGrossBefore: 30000,
+    });
+    expect(result.socialSecurity).toBe('1240.00'); // 20000 × 6.2%
+  });
+
+  it('SS withholding stops once YTD wages reach the wage base', () => {
+    const result = computeWithholding({
+      grossPerPeriod: 5000, periodsPerYear: 26, filingStatus: 'single', ytdGrossBefore: 168600,
+    });
+    expect(result.socialSecurity).toBe('0.00');
+  });
+
+  it('SS taxes only the portion of the check that fits under the wage base', () => {
+    // YTD 165,000; wage base 168,600 → only 3,600 of this 10,000 check is SS-taxable.
+    const result = computeWithholding({
+      grossPerPeriod: 10000, periodsPerYear: 26, filingStatus: 'single', ytdGrossBefore: 165000,
+    });
+    expect(result.socialSecurity).toBe('223.20'); // 3600 × 6.2%
   });
 });
 

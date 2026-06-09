@@ -11,7 +11,8 @@
  *     method:           'cash'|'check'|'credit_card'|'ach'|'bank_transfer'|'other',
  *     reference?:       string,
  *     paymentAccountId: string,
- *     applications: Array<{ billId: string, amountApplied: string }>
+ *     discountAccountId?: string,   // required if any application takes a discount
+ *     applications: Array<{ billId: string, amountApplied: string, discountTaken?: string }>
  *   }
  *   → 201 { payment: BillPayment }
  *
@@ -98,6 +99,7 @@ export async function POST(req: NextRequest) {
       method:           body.method,
       reference:        body.reference ?? null,
       paymentAccountId: body.paymentAccountId,
+      discountAccountId: body.discountAccountId ?? null,
       applications:     body.applications,
     });
 

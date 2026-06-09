@@ -1,22 +1,25 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { Suspense, useEffect, useState } from 'react';
 import {
-  Building2,
+  Truck,
   Pencil,
   Trash2,
   Plus,
   Phone,
   Mail,
-  AlertCircle,
+  Download,
 } from 'lucide-react';
 import {
   Button,
   Card,
+  ConfirmDialog,
+  EmptyState,
   Input,
   Select,
   Label,
   Badge,
+  Spinner,
   Table,
   Th,
   Td,
@@ -24,10 +27,10 @@ import {
   Modal,
   PageHeader,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { useFocusParam } from '@/lib/useFocusParam';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -92,7 +95,7 @@ function balanceTone(balance: string): 'danger' | 'neutral' {
 // Main page
 // ---------------------------------------------------------------------------
 
-export default function VendorsPage() {
+function VendorsPageContent() {
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -145,6 +148,9 @@ export default function VendorsPage() {
     });
     setModalOpen(true);
   }
+
+  // Auto-open the edit modal when arriving via global search (?focus=<id>)
+  useFocusParam(vendors, loading, openEdit);
 
   function closeModal() {
     setModalOpen(false);
@@ -216,34 +222,45 @@ export default function VendorsPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
-
       <PageHeader
         title="Vendors"
-        icon={Building2}
+        icon={Truck}
         action={
-          <Button onClick={openAdd}>
-            <Plus className="h-4 w-4" />
-            Add Vendor
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="secondary"
+              onClick={() => window.open('/api/export/vendors.csv', '_blank')}
+              title="Export the vendor list to CSV"
+            >
+              <Download className="h-4 w-4" />
+              Export CSV
+            </Button>
+            <Button onClick={openAdd}>
+              <Plus className="h-4 w-4" />
+              Add Vendor
+            </Button>
+          </div>
         }
       />
 
       <Card className="p-0 overflow-hidden">
         {loading ? (
           <div className="flex items-center justify-center py-20 text-navy/40 text-sm gap-2">
-            <span className="animate-spin rounded-full h-5 w-5 border-2 border-electric border-t-transparent" />
+            <Spinner className="h-5 w-5 text-electric" />
             Loading vendors...
           </div>
         ) : vendors.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-20 gap-3 text-navy/40">
-            <Building2 className="h-12 w-12 opacity-30" />
-            <p className="text-sm font-medium">No vendors yet.</p>
-            <Button variant="secondary" size="sm" onClick={openAdd}>
-              <Plus className="h-4 w-4" />
-              Add your first vendor
-            </Button>
-          </div>
+          <EmptyState
+            icon={Truck}
+            title="No vendors yet"
+            message="Add the businesses you buy from to start entering bills and expenses."
+            action={
+              <Button variant="secondary" size="sm" onClick={openAdd}>
+                <Plus className="h-4 w-4" />
+                Add your first vendor
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -253,7 +270,7 @@ export default function VendorsPage() {
                 <Th>Phone</Th>
                 <Th>Terms</Th>
                 <Th>1099</Th>
-                <Th className="text-right">Balance</Th>
+                <Th numeric>Balance</Th>
                 <Th className="text-right">Actions</Th>
               </tr>
             </thead>
@@ -299,7 +316,7 @@ export default function VendorsPage() {
                       <span className="text-navy/30 text-sm">—</span>
                     )}
                   </Td>
-                  <Td className="text-right tabular-nums">
+                  <Td numeric>
                     <span
                       className={
                         Number(v.balance) > 0
@@ -348,8 +365,8 @@ export default function VendorsPage() {
             <Button variant="secondary" onClick={closeModal} disabled={saving}>
               Cancel
             </Button>
-            <Button onClick={handleSave} disabled={saving}>
-              {saving ? 'Saving…' : editingVendor ? 'Save Changes' : 'Create Vendor'}
+            <Button onClick={handleSave} loading={saving}>
+              {editingVendor ? 'Save Changes' : 'Create Vendor'}
             </Button>
           </>
         }
@@ -362,6 +379,7 @@ export default function VendorsPage() {
             </Label>
             <Input
               id="displayName"
+              autoFocus
               placeholder="e.g. Acme Supplies"
               value={form.displayName}
               onChange={(e) => setField('displayName', e.target.value)}
@@ -456,35 +474,31 @@ export default function VendorsPage() {
         </div>
       </Modal>
 
-      {/* ---- Deactivate Confirm Modal ---- */}
-      <Modal
+      {/* ---- Deactivate Confirm ---- */}
+      <ConfirmDialog
         open={!!deactivateTarget}
-        onClose={() => setDeactivateTarget(null)}
         title="Deactivate Vendor"
-        footer={
+        message={
           <>
-            <Button
-              variant="secondary"
-              onClick={() => setDeactivateTarget(null)}
-              disabled={deactivating}
-            >
-              Cancel
-            </Button>
-            <Button variant="danger" onClick={handleDeactivate} disabled={deactivating}>
-              {deactivating ? 'Deactivating…' : 'Deactivate'}
-            </Button>
-          </>
-        }
-      >
-        <div className="flex gap-3 items-start text-sm text-navy/80">
-          <AlertCircle className="h-5 w-5 text-red-400 mt-0.5 shrink-0" />
-          <p>
             Are you sure you want to deactivate{' '}
             <strong>{deactivateTarget?.displayName}</strong>? The vendor will be hidden
             from active lists but existing bills and expenses will be preserved.
-          </p>
-        </div>
-      </Modal>
+          </>
+        }
+        confirmLabel="Deactivate"
+        tone="danger"
+        loading={deactivating}
+        onConfirm={handleDeactivate}
+        onClose={() => setDeactivateTarget(null)}
+      />
     </main>
+  );
+}
+
+export default function VendorsPage() {
+  return (
+    <Suspense fallback={null}>
+      <VendorsPageContent />
+    </Suspense>
   );
 }

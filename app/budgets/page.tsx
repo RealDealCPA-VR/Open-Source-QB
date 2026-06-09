@@ -5,15 +5,16 @@ import { BarChart2, Plus } from 'lucide-react';
 import {
   Button,
   Card,
+  EmptyState,
   Input,
   Label,
   Modal,
   PageHeader,
+  Spinner,
   Table,
   Td,
   Th,
   Tr,
-  Toaster,
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
@@ -82,7 +83,7 @@ function getLineAmount(lines: BudgetLine[], accountId: string, month: number): s
 
 function varianceColor(variance: string): string {
   const n = Number(variance);
-  if (n > 0) return 'text-emerald-600';
+  if (n > 0) return 'text-emerald';
   if (n < 0) return 'text-red-500';
   return 'text-navy/60';
 }
@@ -130,17 +131,22 @@ function NewBudgetModal({
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
-          <Button onClick={handleCreate} disabled={saving}>
-            {saving ? 'Creating...' : 'Create Budget'}
-          </Button>
+          <Button loading={saving} onClick={handleCreate}>Create Budget</Button>
         </>
       }
     >
-      <div className="flex flex-col gap-4">
+      <form
+        className="flex flex-col gap-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          handleCreate();
+        }}
+      >
         <div>
           <Label htmlFor="budgetName">Budget Name *</Label>
           <Input
             id="budgetName"
+            autoFocus
             placeholder="e.g. FY2025 Annual Budget"
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -158,7 +164,9 @@ function NewBudgetModal({
             onChange={(e) => setFiscalYear(e.target.value)}
           />
         </div>
-      </div>
+        {/* Hidden submit so Enter submits the two-field form in all browsers */}
+        <button type="submit" className="hidden" aria-hidden="true" tabIndex={-1} />
+      </form>
     </Modal>
   );
 }
@@ -183,7 +191,8 @@ function BudgetGrid({
 
   return (
     <div className="overflow-x-auto">
-      <table className="w-full border-collapse text-sm min-w-[900px]">
+      {/* Keyed by budget so switching budgets remounts the uncontrolled inputs. */}
+      <table key={budget.id} className="w-full border-collapse text-sm min-w-[900px]">
         <thead>
           <tr>
             <th className="py-2.5 px-3 text-left font-semibold text-navy/70 border-b-2 border-navy/10 sticky left-0 bg-white z-10 min-w-[180px]">
@@ -223,6 +232,7 @@ function BudgetGrid({
                         min="0"
                         step="0.01"
                         placeholder="—"
+                        aria-label={`${acct.name} ${MONTHS[idx]}`}
                         defaultValue={current || ''}
                         onBlur={(e) => {
                           const val = e.target.value.trim();
@@ -439,8 +449,6 @@ export default function BudgetsPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
-
       <PageHeader
         title="Budgets"
         icon={BarChart2}
@@ -457,13 +465,17 @@ export default function BudgetsPage() {
         <div className="w-64 shrink-0">
           <Card className="p-0 overflow-hidden">
             {budgetsLoading ? (
-              <div className="p-6 text-center text-navy/40 text-sm">Loading...</div>
-            ) : budgets.length === 0 ? (
-              <div className="p-6 text-center text-navy/40 text-sm">
-                No budgets yet.
-                <br />
-                Click &ldquo;New Budget&rdquo; to get started.
+              <div className="flex items-center justify-center gap-2 p-6 text-navy/40 text-sm">
+                <Spinner className="text-electric" />
+                Loading...
               </div>
+            ) : budgets.length === 0 ? (
+              <EmptyState
+                icon={BarChart2}
+                title="No budgets yet"
+                message="Create your first budget to get started."
+                action={<Button onClick={() => setNewBudgetOpen(true)}>New Budget</Button>}
+              />
             ) : (
               <ul>
                 {budgets.map((b) => (
@@ -498,8 +510,11 @@ export default function BudgetsPage() {
           )}
 
           {selectedLoading && (
-            <Card className="p-12 text-center">
-              <p className="text-navy/40 text-sm">Loading budget...</p>
+            <Card className="p-12">
+              <div className="flex items-center justify-center gap-2 text-navy/40 text-sm">
+                <Spinner className="text-electric" />
+                Loading budget...
+              </div>
             </Card>
           )}
 
@@ -540,7 +555,8 @@ export default function BudgetsPage() {
                 {tab === 'vs-actual' && (
                   <>
                     {vsActualLoading && (
-                      <div className="py-12 text-center text-navy/40 text-sm">
+                      <div className="flex items-center justify-center gap-2 py-12 text-navy/40 text-sm">
+                        <Spinner className="text-electric" />
                         Loading report...
                       </div>
                     )}

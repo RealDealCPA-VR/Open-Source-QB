@@ -1,22 +1,25 @@
 'use client';
 
 /**
- * Payroll Forms page — W-2 and Form 941 PDF downloads.
+ * Payroll Forms page — W-2, Form 941, Form 940 (FUTA), and W-3 PDF downloads.
  *
  * - W-2 section: select employee + year → "Download W-2" opens the PDF in a new tab.
  * - Form 941 section: pick quarter + year → "Download 941" opens the PDF in a new tab.
+ * - Form 940 section: pick year → annual FUTA worksheet with quarterly liability.
+ * - W-3 section: pick year → transmittal totals across all W-2s.
+ *
+ * Employer EIN (W-2 Box b / W-3 / 940) is read from company settings (settings.ein)
+ * and rendered blank when not configured.
  */
 import { useEffect, useState } from 'react';
-import { FileText } from 'lucide-react';
+import { FileText, ClipboardList } from 'lucide-react';
 import {
   Button,
   Card,
-  Input,
   Select,
   Label,
   PageHeader,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 
@@ -58,6 +61,12 @@ export default function PayrollFormsPage() {
   const [q941Quarter, setQ941Quarter] = useState('1');
   const [q941Year, setQ941Year]       = useState(String(currentYear));
 
+  // 940 form state (annual — defaults to the last completed year)
+  const [f940Year, setF940Year] = useState(String(currentYear - 1));
+
+  // W-3 form state (annual — defaults to the last completed year)
+  const [w3Year, setW3Year] = useState(String(currentYear - 1));
+
   // ---------------------------------------------------------------------------
   // Load employees on mount
   // ---------------------------------------------------------------------------
@@ -65,10 +74,11 @@ export default function PayrollFormsPage() {
     async function load() {
       setLoadingEmployees(true);
       try {
-        const data = await api.get<Employee[]>('/api/employees');
-        const active = data.filter((e) => e.isActive);
-        setEmployees(active);
-        if (active.length > 0) setW2EmployeeId(active[0].id);
+        // Include inactive employees: W-2s must still be issued to staff terminated
+        // during the tax year.
+        const data = await api.get<Employee[]>('/api/employees?includeInactive=true');
+        setEmployees(data);
+        if (data.length > 0) setW2EmployeeId(data[0].id);
       } catch (err) {
         toast(err instanceof ApiError ? err.message : 'Failed to load employees', 'danger');
       } finally {
@@ -96,13 +106,25 @@ export default function PayrollFormsPage() {
     window.open(url, '_blank', 'noopener,noreferrer');
   }
 
+  function handleDownload940() {
+    if (!f940Year) { toast('Please select a year', 'danger'); return; }
+    const url = `/api/payroll/940?year=${encodeURIComponent(f940Year)}`;
+    window.open(url, '_blank', 'noopener,noreferrer');
+  }
+
+  function handleDownloadW3() {
+    if (!w3Year) { toast('Please select a year', 'danger'); return; }
+    const url = `/api/payroll/w3?year=${encodeURIComponent(w3Year)}`;
+    window.open(url, '_blank', 'noopener,noreferrer');
+  }
+
   // ---------------------------------------------------------------------------
   // Render
   // ---------------------------------------------------------------------------
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader title="Payroll Tax Forms" icon={FileText} />
+      <PageHeader title="Payroll Tax Forms" icon={ClipboardList} />
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6 max-w-3xl">
 
@@ -120,7 +142,7 @@ export default function PayrollFormsPage() {
             {loadingEmployees ? (
               <p className="text-xs text-navy/40 mt-1">Loading employees…</p>
             ) : employees.length === 0 ? (
-              <p className="text-xs text-navy/40 mt-1">No active employees found.</p>
+              <p className="text-xs text-navy/40 mt-1">No employees found.</p>
             ) : (
               <Select
                 id="w2Employee"
@@ -129,7 +151,7 @@ export default function PayrollFormsPage() {
               >
                 {employees.map((emp) => (
                   <option key={emp.id} value={emp.id}>
-                    {emp.firstName} {emp.lastName}
+                    {emp.firstName} {emp.lastName}{emp.isActive ? '' : ' (inactive)'}
                   </option>
                 ))}
               </Select>
@@ -201,9 +223,65 @@ export default function PayrollFormsPage() {
           </Button>
         </Card>
 
-      </div>
+        {/* ---- Form 940 Section ---- */}
+        <Card className="p-6 flex flex-col gap-4">
+          <div>
+            <h2 className="text-base font-semibold text-navy">Form 940 — Annual FUTA Return</h2>
+            <p className="text-xs text-navy/50 mt-1">
+              Annual FUTA worksheet: total payments, wages over the $7,000 base, FUTA tax,
+              and the quarterly liability breakdown.
+            </p>
+          </div>
 
-      <Toaster />
+          <div>
+            <Label htmlFor="f940Year">Year</Label>
+            <Select
+              id="f940Year"
+              value={f940Year}
+              onChange={(e) => setF940Year(e.target.value)}
+            >
+              {recentYears().map((y) => (
+                <option key={y} value={String(y)}>{y}</option>
+              ))}
+            </Select>
+          </div>
+
+          <Button onClick={handleDownload940} className="mt-auto">
+            <FileText className="h-4 w-4" />
+            Download 940
+          </Button>
+        </Card>
+
+        {/* ---- W-3 Section ---- */}
+        <Card className="p-6 flex flex-col gap-4">
+          <div>
+            <h2 className="text-base font-semibold text-navy">W-3 — Transmittal of W-2s</h2>
+            <p className="text-xs text-navy/50 mt-1">
+              Totals across all employee W-2s for a calendar year, with the employer EIN
+              from company settings.
+            </p>
+          </div>
+
+          <div>
+            <Label htmlFor="w3Year">Tax Year</Label>
+            <Select
+              id="w3Year"
+              value={w3Year}
+              onChange={(e) => setW3Year(e.target.value)}
+            >
+              {recentYears().map((y) => (
+                <option key={y} value={String(y)}>{y}</option>
+              ))}
+            </Select>
+          </div>
+
+          <Button onClick={handleDownloadW3} className="mt-auto">
+            <FileText className="h-4 w-4" />
+            Download W-3
+          </Button>
+        </Card>
+
+      </div>
     </main>
   );
 }

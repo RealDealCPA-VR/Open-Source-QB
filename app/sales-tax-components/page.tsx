@@ -8,6 +8,7 @@
  * 2. Sales-Tax-by-Agency report — date range picker, shows collected tax split per agency/component.
  */
 import React, { useEffect, useState, useCallback } from 'react';
+import { Percent } from 'lucide-react';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import {
@@ -17,12 +18,12 @@ import {
   Label,
   PageHeader,
   Select,
+  Spinner,
   Table,
   Td,
   Th,
   Tr,
   toast,
-  Toaster,
 } from '@/components/ui';
 
 // ---------------------------------------------------------------------------
@@ -152,7 +153,13 @@ function ComponentEditor({
 
   const combinedPct = (sumComponents(components) * 100).toFixed(4).replace(/\.?0+$/, '');
 
-  if (loading) return <p className="text-navy/50 text-sm">Loading components…</p>;
+  if (loading) {
+    return (
+      <div className="py-4 flex justify-center text-electric">
+        <Spinner className="h-5 w-5" />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4">
@@ -229,8 +236,8 @@ function ComponentEditor({
         <Button variant="secondary" size="sm" onClick={addRow}>
           + Add Row
         </Button>
-        <Button size="sm" onClick={handleSave} disabled={saving}>
-          {saving ? 'Saving…' : 'Save Components'}
+        <Button size="sm" onClick={handleSave} loading={saving}>
+          Save Components
         </Button>
       </div>
     </div>
@@ -267,15 +274,27 @@ function SalesTaxByAgencyReport() {
     <div className="space-y-4">
       <div className="flex flex-wrap gap-4 items-end">
         <div>
-          <Label>From date</Label>
-          <Input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className="w-44" />
+          <Label htmlFor="agency-report-from">From date</Label>
+          <Input
+            id="agency-report-from"
+            type="date"
+            value={from}
+            onChange={(e) => setFrom(e.target.value)}
+            className="w-44"
+          />
         </div>
         <div>
-          <Label>To date</Label>
-          <Input type="date" value={to} onChange={(e) => setTo(e.target.value)} className="w-44" />
+          <Label htmlFor="agency-report-to">To date</Label>
+          <Input
+            id="agency-report-to"
+            type="date"
+            value={to}
+            onChange={(e) => setTo(e.target.value)}
+            className="w-44"
+          />
         </div>
-        <Button onClick={runReport} disabled={loading}>
-          {loading ? 'Running…' : 'Run Report'}
+        <Button onClick={runReport} loading={loading}>
+          Run Report
         </Button>
       </div>
 
@@ -287,7 +306,7 @@ function SalesTaxByAgencyReport() {
               <Th>Agency</Th>
               <Th>Rate</Th>
               <Th>Share</Th>
-              <Th className="text-right">Tax Collected</Th>
+              <Th numeric>Tax Collected</Th>
             </tr>
           </thead>
           <tbody>
@@ -304,7 +323,7 @@ function SalesTaxByAgencyReport() {
                   <Td>{r.agencyName ?? <span className="text-navy/40 italic">—</span>}</Td>
                   <Td className="tabular-nums">{rateToPercent(r.componentRate)}%</Td>
                   <Td className="tabular-nums">{(parseFloat(r.rateShare) * 100).toFixed(2)}%</Td>
-                  <Td className="text-right tabular-nums">{formatCurrency(r.taxCollected)}</Td>
+                  <Td numeric>{formatCurrency(r.taxCollected)}</Td>
                 </Tr>
               ))
             )}
@@ -335,15 +354,14 @@ export default function SalesTaxComponentsPage() {
   const [parentRate, setParentRate] = useState<string | null>(null);
   const [loadingRates, setLoadingRates] = useState(true);
 
-  // Load tax rates and agencies on mount.
+  // Load tax rates and agencies on mount. The two fetches are independent so a
+  // failed agencies lookup (no /api/tax-agencies route yet) must not discard the
+  // tax rates — agencies just degrade to "— None —" in the component editor.
   useEffect(() => {
-    Promise.all([
-      api.get<TaxRate[]>('/api/tax-rates'),
-      api.get<TaxAgency[]>('/api/tax-agencies'),
-    ])
-      .then(([rates, ags]) => {
+    api
+      .get<TaxRate[]>('/api/tax-rates')
+      .then((rates) => {
         setTaxRates(rates);
-        setAgencies(ags);
         if (rates.length > 0 && !selectedRateId) {
           setSelectedRateId(rates[0].id);
           setParentRate(rates[0].rate);
@@ -351,6 +369,15 @@ export default function SalesTaxComponentsPage() {
       })
       .catch(() => toast('Failed to load tax rates', 'danger'))
       .finally(() => setLoadingRates(false));
+
+    api
+      .get<TaxAgency[]>('/api/tax-agencies')
+      .then(setAgencies)
+      .catch(() => {
+        // Non-fatal — the agency picker simply offers no agencies.
+        setAgencies([]);
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function handleRateChange(e: React.ChangeEvent<HTMLSelectElement>) {
@@ -371,8 +398,7 @@ export default function SalesTaxComponentsPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
-      <PageHeader title="Sales Tax Components" />
+      <PageHeader title="Sales Tax Components" icon={Percent} />
 
       {/* ------------------------------------------------------------------ */}
       {/* Section 1: Component editor                                          */}
@@ -381,11 +407,18 @@ export default function SalesTaxComponentsPage() {
         <h2 className="text-lg font-bold text-navy mb-4">Edit Tax Rate Components</h2>
 
         <div className="mb-5">
-          <Label>Tax Rate</Label>
+          <Label htmlFor="tax-rate-picker">Tax Rate</Label>
           {loadingRates ? (
-            <p className="text-navy/40 text-sm">Loading…</p>
+            <div className="py-1 text-electric">
+              <Spinner className="h-5 w-5" />
+            </div>
           ) : (
-            <Select value={selectedRateId} onChange={handleRateChange} className="max-w-xs">
+            <Select
+              id="tax-rate-picker"
+              value={selectedRateId}
+              onChange={handleRateChange}
+              className="max-w-xs"
+            >
               {taxRates.map((t) => (
                 <option key={t.id} value={t.id}>
                   {t.name} ({rateToPercent(t.rate)}%)

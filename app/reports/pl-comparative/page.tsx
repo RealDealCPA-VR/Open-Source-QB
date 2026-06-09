@@ -4,7 +4,7 @@
  * Comparative Profit & Loss — current period vs prior period.
  * Users pick two date ranges; the table shows current / prior / variance / variance %.
  */
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { TrendingUp } from 'lucide-react';
 import {
   Button,
@@ -70,11 +70,16 @@ function pctLabel(pct: string | null): string {
   return `${n >= 0 ? '+' : ''}${n.toFixed(1)}%`;
 }
 
-function varianceClass(variance: string): string {
+/**
+ * Color a variance by whether it is favorable. For income, an increase is
+ * favorable (emerald); for expenses, an increase in spending is unfavorable
+ * (red) and a decrease is favorable (emerald).
+ */
+function varianceClass(variance: string, direction: 'income' | 'expense' = 'income'): string {
   const n = parseFloat(variance);
-  if (n > 0) return 'text-emerald-600';
-  if (n < 0) return 'text-red-500';
-  return 'text-navy/50';
+  if (n === 0) return 'text-navy/50';
+  const favorable = direction === 'expense' ? n < 0 : n > 0;
+  return favorable ? 'text-emerald' : 'text-red-500';
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +93,7 @@ function Section({
   priorTotal,
   varianceTotal,
   variancePctTotal,
+  direction,
 }: {
   title: string;
   rows: ComparativeRow[];
@@ -95,6 +101,7 @@ function Section({
   priorTotal: string;
   varianceTotal: string;
   variancePctTotal: string | null;
+  direction: 'income' | 'expense';
 }) {
   return (
     <>
@@ -108,10 +115,10 @@ function Section({
           <Td className="pl-8 text-navy">{r.name}</Td>
           <Td className="text-right tabular-nums">{formatCurrency(r.current)}</Td>
           <Td className="text-right tabular-nums text-navy/60">{formatCurrency(r.prior)}</Td>
-          <Td className={`text-right tabular-nums ${varianceClass(r.variance)}`}>
+          <Td className={`text-right tabular-nums ${varianceClass(r.variance, direction)}`}>
             {formatCurrency(r.variance)}
           </Td>
-          <Td className={`text-right tabular-nums text-sm ${varianceClass(r.variance)}`}>
+          <Td className={`text-right tabular-nums text-sm ${varianceClass(r.variance, direction)}`}>
             {pctLabel(r.variancePct)}
           </Td>
         </Tr>
@@ -120,10 +127,10 @@ function Section({
         <Td className="py-2">Total {title}</Td>
         <Td className="text-right tabular-nums">{formatCurrency(currentTotal)}</Td>
         <Td className="text-right tabular-nums text-navy/60">{formatCurrency(priorTotal)}</Td>
-        <Td className={`text-right tabular-nums ${varianceClass(varianceTotal)}`}>
+        <Td className={`text-right tabular-nums ${varianceClass(varianceTotal, direction)}`}>
           {formatCurrency(varianceTotal)}
         </Td>
-        <Td className={`text-right tabular-nums text-sm ${varianceClass(varianceTotal)}`}>
+        <Td className={`text-right tabular-nums text-sm ${varianceClass(varianceTotal, direction)}`}>
           {pctLabel(variancePctTotal)}
         </Td>
       </Tr>
@@ -167,6 +174,12 @@ export default function PLComparativePage() {
       setLoading(false);
     }
   }, [from, to, priorFrom, priorTo]);
+
+  // Auto-load the pre-filled default ranges on mount.
+  useEffect(() => {
+    run();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const net = report ? parseFloat(report.totals.currentNetIncome) : 0;
 
@@ -271,6 +284,7 @@ export default function PLComparativePage() {
                 priorTotal={report.totals.priorTotalIncome}
                 varianceTotal={report.totals.varianceTotalIncome}
                 variancePctTotal={report.totals.variancePctTotalIncome}
+                direction="income"
               />
               <Tr>
                 <Td colSpan={5} className="py-1 border-none" />
@@ -282,6 +296,7 @@ export default function PLComparativePage() {
                 priorTotal={report.totals.priorTotalExpenses}
                 varianceTotal={report.totals.varianceTotalExpenses}
                 variancePctTotal={report.totals.variancePctTotalExpenses}
+                direction="expense"
               />
             </tbody>
             <tfoot>
@@ -289,7 +304,7 @@ export default function PLComparativePage() {
                 <td className="py-3 px-4 text-navy">Net Income</td>
                 <td
                   className={`py-3 px-4 text-right tabular-nums ${
-                    net >= 0 ? 'text-emerald-600' : 'text-red-600'
+                    net >= 0 ? 'text-emerald' : 'text-red-600'
                   }`}
                 >
                   {formatCurrency(report.totals.currentNetIncome)}

@@ -214,21 +214,36 @@ describe('Budgets service', () => {
     expect(revRow!.budget).toBe('15000.00');
     // Actual revenue = 18000 (credit-normal, so amount is positive from P&L)
     expect(revRow!.actual).toBe('18000.00');
-    // Variance = actual - budget = 18000 - 15000 = 3000 (favorable: over budget)
+    // Variance = actual - budget = 18000 - 15000 = 3000 (favorable: over target income)
     expect(revRow!.variance).toBe('3000.00');
+    expect(revRow!.accountType).toBe('revenue');
+    expect(revRow!.favorable).toBe(true);
 
     const rentRow = report.rows.find((r) => r.accountId === acct['5000']);
     expect(rentRow).toBeDefined();
     expect(rentRow!.budget).toBe('2000.00');
     // Actual rent = 1800 (debit-normal expense)
     expect(rentRow!.actual).toBe('1800.00');
-    // Variance = 1800 - 2000 = -200 (under budget on expenses)
+    // Variance = 1800 - 2000 = -200 (under budget on expenses → favorable)
     expect(rentRow!.variance).toBe('-200.00');
+    expect(rentRow!.accountType).toBe('expense');
+    expect(rentRow!.favorable).toBe(true);
 
-    // Totals
-    expect(report.totalBudget).toBe('17000.00');
-    expect(report.totalActual).toBe('19800.00');
-    expect(report.totalVariance).toBe('2800.00');
+    // Sectioned totals — income and expenses are no longer mixed into one sum.
+    expect(report.income.budget).toBe('15000.00');
+    expect(report.income.actual).toBe('18000.00');
+    expect(report.income.variance).toBe('3000.00');
+    expect(report.expense.budget).toBe('2000.00');
+    expect(report.expense.actual).toBe('1800.00');
+    expect(report.expense.variance).toBe('-200.00');
+
+    // Net bottom line (income - expense); legacy total fields carry the same.
+    expect(report.netBudget).toBe('13000.00');
+    expect(report.netActual).toBe('16200.00');
+    expect(report.netVariance).toBe('3200.00');
+    expect(report.totalBudget).toBe('13000.00');
+    expect(report.totalActual).toBe('16200.00');
+    expect(report.totalVariance).toBe('3200.00');
   });
 
   it('budgetVsActual returns empty rows for a budget with no lines', async () => {

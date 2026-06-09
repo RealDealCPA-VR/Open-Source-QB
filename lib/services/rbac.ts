@@ -4,8 +4,8 @@
  * The owner of a company always passes.
  */
 import { and, eq } from 'drizzle-orm';
-import { companies, userCompanies } from '@/lib/db/schema';
-import { type ServiceContext, ServiceError } from './_base';
+import { companies, userCompanies, users } from '@/lib/db/schema';
+import { type ServiceContext, ServiceError, notFound, validation, writeAudit } from './_base';
 
 export type Role = 'owner' | 'admin' | 'accountant' | 'viewer';
 
@@ -43,4 +43,117 @@ export async function requireRole(ctx: ServiceContext, allowed: Role | Role[]): 
 /** Convenience: viewers cannot write. */
 export async function requireWrite(ctx: ServiceContext): Promise<Role> {
   return requireRole(ctx, ['accountant', 'admin', 'owner']);
+}
+
+/**
+ * Synchronous write guard against the role pre-loaded onto ctx by `getServerContext`
+ * (no DB round-trip). The same check runs centrally inside `writeAudit`/`inTransaction`
+ * in _base.ts, so every mutation is covered app-wide; call this at the top of a service
+ * when you want the FORBIDDEN error before any work happens.
+ * Contexts without a role (tests, system jobs) are trusted and pass.
+ */
+export function assertWrite(ctx: ServiceContext): void {
+  if (ctx.role === 'viewer') {
+    throw new ServiceError('FORBIDDEN', 'Your role is view-only. This action requires write access.');
+  }
+}
+
+export interface CompanyMember {
+  userId: string;
+  email: string;
+  name: string;
+  role: Role;
+  /** True for the company owner (companies.ownerId) — role cannot be changed. */
+  isOwner: boolean;
+}
+
+/** All members of the active company (user_companies join users). Owner always reports 'owner'. */
+export async function listMembers(ctx: ServiceContext): Promise<CompanyMember[]> {
+  const [company] = await ctx.db
+    .select({ ownerId: companies.ownerId })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId));
+  const rows = await ctx.db
+    .select({
+      userId: userCompanies.userId,
+      role: userCompanies.role,
+      email: users.email,
+      name: users.name,
+    })
+    .from(userCompanies)
+    .innerJoin(users, eq(users.id, userCompanies.userId))
+    .where(eq(userCompanies.companyId, ctx.companyId));
+  return rows.map((r) => {
+    const isOwner = r.userId === company?.ownerId;
+    return {
+      userId: r.userId,
+      email: r.email,
+      name: r.name,
+      role: (isOwner ? 'owner' : (r.role as Role)) ?? 'viewer',
+      isOwner,
+    };
+  });
+}
+
+const ALL_ROLES: Role[] = ['owner', 'admin', 'accountant', 'viewer'];
+
+/**
+ * Change a member's role. Requires admin+; granting 'owner' requires being the owner.
+ * The company owner's own role can never be changed (it derives from companies.ownerId).
+ */
+export async function setMemberRole(
+  ctx: ServiceContext,
+  targetUserId: string,
+  role: Role,
+): Promise<CompanyMember> {
+  const actorRole = await requireRole(ctx, 'admin');
+  if (!ALL_ROLES.includes(role)) {
+    throw validation(`role must be one of: ${ALL_ROLES.join(', ')}.`);
+  }
+  if (role === 'owner' && actorRole !== 'owner') {
+    throw new ServiceError('FORBIDDEN', "Only the company owner can grant the 'owner' role.");
+  }
+
+  const [company] = await ctx.db
+    .select({ ownerId: companies.ownerId })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId));
+  if (company?.ownerId === targetUserId) {
+    throw new ServiceError('FORBIDDEN', "The company owner's role cannot be changed.");
+  }
+
+  const [membership] = await ctx.db
+    .select({ role: userCompanies.role })
+    .from(userCompanies)
+    .where(
+      and(eq(userCompanies.userId, targetUserId), eq(userCompanies.companyId, ctx.companyId)),
+    );
+  if (!membership) throw notFound('Company member');
+
+  await ctx.db
+    .update(userCompanies)
+    .set({ role })
+    .where(
+      and(eq(userCompanies.userId, targetUserId), eq(userCompanies.companyId, ctx.companyId)),
+    );
+
+  await writeAudit(ctx, {
+    action: 'update',
+    entityType: 'user_company',
+    entityId: targetUserId,
+    oldValues: { role: membership.role },
+    newValues: { role },
+  });
+
+  const [user] = await ctx.db
+    .select({ email: users.email, name: users.name })
+    .from(users)
+    .where(eq(users.id, targetUserId));
+  return {
+    userId: targetUserId,
+    email: user?.email ?? '',
+    name: user?.name ?? '',
+    role,
+    isOwner: false,
+  };
 }

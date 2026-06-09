@@ -7,9 +7,9 @@
  * columns, so they remain accurate even after void/adjustment entries.
  */
 import { and, eq, sql } from 'drizzle-orm';
-import { accounts, journalEntries, journalEntryLines } from '@/lib/db/schema';
+import { accounts, journalEntries, journalEntryLines, taxAgencies } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { type ServiceContext, validation } from './_base';
+import { type ServiceContext, ServiceError, notFound, validation } from './_base';
 import { postJournalEntry } from './posting';
 
 // ── COA codes fixed by the project spec ─────────────────────────────────────
@@ -88,9 +88,19 @@ export async function paySalesTax(ctx: ServiceContext, input: PaySalesTaxInput) 
 
   const salesTaxAccountId = await accountIdByCode(ctx, CODE_SALES_TAX_PAYABLE);
   const amtStr = toAmountString(amt);
-  const description = input.memo?.trim()
-    ? input.memo.trim()
-    : `Pay Sales Tax${input.agencyId ? ` (agency: ${input.agencyId})` : ''}`;
+
+  // Human-readable description: use the agency's display name, never its UUID
+  // (the id stays machine-readable in sourceRef below). Skip the lookup for
+  // non-UUID refs — comparing them against a uuid column would error.
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  let description = input.memo?.trim() || 'Pay Sales Tax';
+  if (!input.memo?.trim() && input.agencyId && UUID_RE.test(input.agencyId)) {
+    const [agency] = await ctx.db
+      .select({ name: taxAgencies.name })
+      .from(taxAgencies)
+      .where(and(eq(taxAgencies.companyId, ctx.companyId), eq(taxAgencies.id, input.agencyId)));
+    if (agency) description = `Pay Sales Tax — ${agency.name}`;
+  }
 
   return postJournalEntry(ctx, {
     date: input.date,
@@ -103,34 +113,110 @@ export async function paySalesTax(ctx: ServiceContext, input: PaySalesTaxInput) 
   });
 }
 
-export interface PayPayrollLiabilitiesInput {
-  /** Amount to remit (e.g. 941 tax deposit). Must be > 0. */
+/** One itemized payroll-liability payment line (e.g. "Federal Income Tax" → $300). */
+export interface PayrollLiabilityItemInput {
+  /** Payroll item name as reported by payrollLiabilityBalances (e.g. "Federal Income Tax",
+   * "401k", "Employer Social Security"). Stamped as the journal-line memo so the
+   * payment reconciles against this specific item. */
+  name: string;
+  /** Amount to remit for this item. Must be > 0. */
   amount: number | string;
+}
+
+export interface PayPayrollLiabilitiesInput {
+  /**
+   * Lump-sum amount to remit (e.g. 941 tax deposit). Required when `items` is
+   * omitted/empty. When `items` IS provided, this is optional — if present it must
+   * equal the sum of the item amounts.
+   */
+  amount?: number | string;
   /** Payment date. */
   date: Date;
   /** Bank / cash account used to make the payment. */
   paymentAccountId: string;
   /** Optional memo. */
   memo?: string | null;
+  /**
+   * Per-item amounts (QB Pay Liabilities). Each item posts its own Dr 2300 line
+   * with the item name as the memo, so payments can be reconciled per tax/deduction.
+   */
+  items?: PayrollLiabilityItemInput[];
 }
 
 /**
  * Pay payroll liabilities:
- *   Dr 2300 Payroll Liabilities  <amount>
- *   Cr <paymentAccountId>        <amount>
+ *   Dr 2300 Payroll Liabilities  <amount>      (one line per item when itemized)
+ *   Cr <paymentAccountId>        <total>
  *
- * Reduces the Payroll Liabilities balance and drains the bank account.
+ * Reduces the Payroll Liabilities balance and drains the bank account. Itemized
+ * payments stamp each item's name as the 2300 debit-line memo — that memo is how
+ * payrollLiabilityBalances attributes payments back to specific payroll items.
  */
 export async function payPayrollLiabilities(
   ctx: ServiceContext,
   input: PayPayrollLiabilitiesInput,
 ) {
+  const payrollAccountId = await accountIdByCode(ctx, CODE_PAYROLL_LIABILITIES);
+  const items = input.items ?? [];
+
+  // ── Itemized payment ──────────────────────────────────────────────────────
+  if (items.length > 0) {
+    let total = Money.zero();
+    const debitLines: Array<{ accountId: string; debit: string; memo: string }> = [];
+    const seen = new Set<string>();
+    for (const item of items) {
+      const name = item.name?.trim();
+      if (!name) throw validation('Each liability item needs a name.');
+      if (seen.has(name)) {
+        throw validation(`Duplicate liability item "${name}" — combine into one line.`);
+      }
+      seen.add(name);
+      let amt;
+      try {
+        amt = Money.of(item.amount);
+      } catch {
+        throw validation(`Liability item "${name}": amount is not a valid number.`);
+      }
+      if (!amt.greaterThan(0)) {
+        throw validation(`Liability item "${name}": amount must be greater than zero.`);
+      }
+      total = total.plus(amt);
+      debitLines.push({
+        accountId: payrollAccountId,
+        debit: toAmountString(amt),
+        memo: name,
+      });
+    }
+
+    if (input.amount != null && input.amount !== '' && !Money.eq(input.amount, total)) {
+      throw validation(
+        `amount (${toAmountString(Money.of(input.amount))}) does not match the sum of the item amounts (${toAmountString(total)}).`,
+      );
+    }
+
+    const description = input.memo?.trim()
+      ? input.memo.trim()
+      : `Pay Payroll Liabilities — ${items.length} item${items.length === 1 ? '' : 's'}`;
+
+    return postJournalEntry(ctx, {
+      date: input.date,
+      description,
+      lines: [
+        ...debitLines,
+        { accountId: input.paymentAccountId, credit: toAmountString(total) },
+      ],
+    });
+  }
+
+  // ── Legacy lump-sum payment ───────────────────────────────────────────────
+  if (input.amount == null || input.amount === '') {
+    throw validation('Provide amount or at least one liability item.');
+  }
   const amt = Money.of(input.amount);
   if (!amt.greaterThan(0)) {
     throw validation('Payment amount must be greater than zero.');
   }
 
-  const payrollAccountId = await accountIdByCode(ctx, CODE_PAYROLL_LIABILITIES);
   const amtStr = toAmountString(amt);
   const description = input.memo?.trim() ? input.memo.trim() : 'Pay Payroll Liabilities';
 
@@ -139,6 +225,89 @@ export async function payPayrollLiabilities(
     description,
     lines: [
       { accountId: payrollAccountId, debit: amtStr },
+      { accountId: input.paymentAccountId, credit: amtStr },
+    ],
+  });
+}
+
+export interface PayCreditCardInput {
+  /** GL liability account for the credit card (Dr side — reduces the amount owed). */
+  creditCardAccountId: string;
+  /** Bank / cash GL account the payment is drawn from (Cr side). */
+  paymentAccountId: string;
+  /** Amount to pay. Must be > 0. */
+  amount: number | string;
+  /** Payment date. */
+  date: Date;
+  /**
+   * When the payment settles a completed credit-card reconciliation, pass its id:
+   * the entry is stamped sourceRef "cc-payment:<reconciliationId>" and a second
+   * payment for the same reconciliation is rejected (CONFLICT).
+   */
+  reconciliationId?: string | null;
+  /** Optional memo / description. */
+  memo?: string | null;
+}
+
+/**
+ * Pay a credit card (QB "Write a check for the balance" after reconciling a CC):
+ *   Dr <creditCardAccountId>  <amount>   — reduces the card liability
+ *   Cr <paymentAccountId>     <amount>   — drains the bank account
+ */
+export async function payCreditCard(ctx: ServiceContext, input: PayCreditCardInput) {
+  const amt = Money.of(input.amount);
+  if (!amt.greaterThan(0)) {
+    throw validation('Payment amount must be greater than zero.');
+  }
+  if (!input.creditCardAccountId) throw validation('creditCardAccountId is required.');
+  if (!input.paymentAccountId) throw validation('paymentAccountId is required.');
+  if (input.creditCardAccountId === input.paymentAccountId) {
+    throw validation('Payment account must be different from the credit card account.');
+  }
+
+  // Both accounts must belong to this company; the CC side must be a liability.
+  const [cc] = await ctx.db
+    .select({ id: accounts.id, type: accounts.type })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, input.creditCardAccountId)));
+  if (!cc) throw notFound('Credit card account');
+  if (cc.type !== 'liability') {
+    throw validation('creditCardAccountId must be a liability (credit card) account.');
+  }
+  const [pay] = await ctx.db
+    .select({ id: accounts.id })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, input.paymentAccountId)));
+  if (!pay) throw notFound('Payment account');
+
+  // Duplicate guard: one payment per reconciliation.
+  const sourceRef = input.reconciliationId ? `cc-payment:${input.reconciliationId}` : undefined;
+  if (sourceRef) {
+    const [existing] = await ctx.db
+      .select({ id: journalEntries.id })
+      .from(journalEntries)
+      .where(
+        and(
+          eq(journalEntries.companyId, ctx.companyId),
+          eq(journalEntries.sourceRef, sourceRef),
+          eq(journalEntries.status, 'posted'),
+        ),
+      );
+    if (existing) {
+      throw new ServiceError(
+        'CONFLICT',
+        'A credit card payment for this reconciliation has already been recorded.',
+      );
+    }
+  }
+
+  const amtStr = toAmountString(amt);
+  return postJournalEntry(ctx, {
+    date: input.date,
+    description: input.memo?.trim() ? input.memo.trim() : 'Credit card payment',
+    sourceRef,
+    lines: [
+      { accountId: input.creditCardAccountId, debit: amtStr },
       { accountId: input.paymentAccountId, credit: amtStr },
     ],
   });

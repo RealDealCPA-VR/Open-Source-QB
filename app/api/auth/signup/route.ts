@@ -32,7 +32,7 @@ export async function POST(req: NextRequest) {
   const company = await createCompany(db, { name: (companyName?.trim() || `${name}'s Company`), ownerId: user.id });
 
   const res = NextResponse.json({ id: user.id, name: user.name, email: user.email, companyId: company.id }, { status: 201 });
-  const opts = { httpOnly: true, sameSite: 'lax' as const, path: '/', maxAge: 60 * 60 * 24 * 30 };
+  const opts = { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax' as const, path: '/', maxAge: 60 * 60 * 24 * 30 };
   res.cookies.set(SESSION_COOKIE, createSessionToken(user.id), opts);
   res.cookies.set(COMPANY_COOKIE, company.id, opts);
   return res;

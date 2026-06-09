@@ -1,6 +1,7 @@
 /**
- * GET  /api/reconciliations/[id]  — fetch reconciliation progress.
- * PATCH /api/reconciliations/[id] — complete the reconciliation, or toggle a line.
+ * GET    /api/reconciliations/[id]  — fetch reconciliation progress.
+ * PATCH  /api/reconciliations/[id]  — complete, toggle a line, or correct the statement.
+ * DELETE /api/reconciliations/[id]  — cancel an in-progress reconciliation.
  *
  * PATCH request body variants:
  *
@@ -9,6 +10,14 @@
  *
  *   Toggle a journal entry line as cleared / un-cleared:
  *     { action: "toggleCleared", journalEntryLineId: string, isCleared: boolean }
+ *
+ *   Correct the statement balance and/or date (in-progress only):
+ *     { action: "updateStatement", statementBalance?: string, statementDate?: string }
+ *
+ *   Record statement adjustments (auto-posted + auto-cleared, in-progress only):
+ *     { action: "adjustments",
+ *       serviceCharge?:  { amount: string, accountId: string },
+ *       interestEarned?: { amount: string, accountId: string } }
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -16,8 +25,11 @@ import { ServiceError } from '@/lib/services/_base';
 import {
   getProgress,
   completeReconciliation,
+  cancelReconciliation,
   toggleCleared,
+  updateStatement,
   listClearable,
+  addStatementAdjustments,
 } from '@/lib/services/reconcile';
 
 /** Map ServiceErrorCode to an HTTP status. */
@@ -87,13 +99,66 @@ export async function PATCH(
       return NextResponse.json(progress);
     }
 
+    if (action === 'updateStatement') {
+      const { statementBalance, statementDate } = body ?? {};
+      if (statementBalance == null && !statementDate) {
+        return NextResponse.json(
+          { error: 'statementBalance and/or statementDate is required.' },
+          { status: 400 },
+        );
+      }
+      await updateStatement(ctx, id, {
+        statementBalance: statementBalance ?? undefined,
+        statementDate: statementDate ? new Date(statementDate) : undefined,
+      });
+      // Return updated progress so the client can refresh in one round-trip.
+      const progress = await getProgress(ctx, id);
+      return NextResponse.json(progress);
+    }
+
+    if (action === 'adjustments') {
+      const { serviceCharge, interestEarned } = body ?? {};
+      if (!serviceCharge && !interestEarned) {
+        return NextResponse.json(
+          { error: 'serviceCharge and/or interestEarned is required.' },
+          { status: 400 },
+        );
+      }
+      const progress = await addStatementAdjustments(ctx, id, {
+        serviceCharge: serviceCharge ?? null,
+        interestEarned: interestEarned ?? null,
+      });
+      return NextResponse.json(progress);
+    }
+
     return NextResponse.json(
-      { error: `Unknown action "${action}". Expected "complete" or "toggleCleared".` },
+      {
+        error: `Unknown action "${action}". Expected "complete", "toggleCleared", "updateStatement", or "adjustments".`,
+      },
       { status: 400 },
     );
   } catch (err) {
     if (err instanceof ServiceError) return errResponse(err);
     console.error('[PATCH /api/reconciliations/:id]', err);
+    return NextResponse.json({ error: 'Internal server error.' }, { status: 500 });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /api/reconciliations/[id] — cancel an in-progress reconciliation
+// ---------------------------------------------------------------------------
+export async function DELETE(
+  _req: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  try {
+    const { id } = await params;
+    const ctx = await getServerContext();
+    await cancelReconciliation(ctx, id);
+    return NextResponse.json({ cancelled: true });
+  } catch (err) {
+    if (err instanceof ServiceError) return errResponse(err);
+    console.error('[DELETE /api/reconciliations/:id]', err);
     return NextResponse.json({ error: 'Internal server error.' }, { status: 500 });
   }
 }

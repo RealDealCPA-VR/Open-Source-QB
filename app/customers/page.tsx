@@ -1,10 +1,12 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import { Users, Pencil, UserX, Plus } from 'lucide-react';
+import { Suspense, useEffect, useState } from 'react';
+import { Users, Pencil, UserX, Plus, Download } from 'lucide-react';
 import {
   Button,
   Card,
+  ConfirmDialog,
+  EmptyState,
   Input,
   Select,
   Label,
@@ -15,11 +17,12 @@ import {
   Tr,
   Modal,
   PageHeader,
+  Spinner,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { useFocusParam } from '@/lib/useFocusParam';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -84,6 +87,7 @@ function CustomerForm({
           value={form.displayName}
           onChange={(e) => onChange('displayName', e.target.value)}
           required
+          autoFocus
         />
       </div>
       <div>
@@ -150,7 +154,7 @@ function CustomerForm({
 // Page
 // ---------------------------------------------------------------------------
 
-export default function CustomersPage() {
+function CustomersPageContent() {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [loading, setLoading] = useState(true);
   const [includeInactive, setIncludeInactive] = useState(false);
@@ -249,6 +253,9 @@ export default function CustomersPage() {
     setEditOpen(true);
   }
 
+  // Auto-open the edit modal when arriving via global search (?focus=<id>)
+  useFocusParam(customers, loading, openEditModal);
+
   function updateEditForm(field: keyof CustomerFormState, value: string) {
     setEditForm((prev) => ({ ...prev, [field]: value }));
   }
@@ -322,6 +329,14 @@ export default function CustomersPage() {
               />
               Show inactive
             </label>
+            <Button
+              variant="secondary"
+              onClick={() => window.open('/api/export/customers.csv', '_blank')}
+              title="Export the customer list to CSV"
+            >
+              <Download className="h-4 w-4" />
+              Export CSV
+            </Button>
             <Button onClick={openAddModal}>
               <Plus className="h-4 w-4" />
               Add Customer
@@ -332,16 +347,24 @@ export default function CustomersPage() {
 
       <Card>
         {loading ? (
-          <div className="p-12 text-center text-navy/40 text-sm">Loading customers...</div>
-        ) : customers.length === 0 ? (
-          <div className="p-12 text-center">
-            <Users className="mx-auto h-10 w-10 text-navy/20 mb-3" />
-            <p className="text-navy/50 text-sm">
-              {includeInactive
-                ? 'No customers found.'
-                : 'No active customers yet. Click "Add Customer" to get started.'}
-            </p>
+          <div className="flex items-center justify-center py-20 text-navy/40">
+            <Spinner className="h-6 w-6" />
           </div>
+        ) : customers.length === 0 ? (
+          <EmptyState
+            icon={Users}
+            title={includeInactive ? 'No customers found' : 'No customers yet'}
+            message={
+              includeInactive
+                ? 'There are no customers, active or inactive.'
+                : 'Add your first customer to get started.'
+            }
+            action={
+              <Button onClick={openAddModal}>
+                <Plus className="h-4 w-4" /> Add Customer
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -351,7 +374,7 @@ export default function CustomersPage() {
                 <Th>Email</Th>
                 <Th>Phone</Th>
                 <Th>Terms</Th>
-                <Th className="text-right">Balance</Th>
+                <Th numeric>Balance</Th>
                 <Th>Status</Th>
                 <Th className="text-right">Actions</Th>
               </tr>
@@ -375,7 +398,7 @@ export default function CustomersPage() {
                   </Td>
                   <Td className="text-navy/70">{c.phone ?? '-'}</Td>
                   <Td className="text-navy/70">{termsLabel(c.terms)}</Td>
-                  <Td className="text-right font-mono font-semibold text-navy">
+                  <Td numeric className="font-semibold text-navy">
                     {formatCurrency(c.balance)}
                   </Td>
                   <Td>
@@ -427,8 +450,8 @@ export default function CustomersPage() {
             <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addSaving}>
               Cancel
             </Button>
-            <Button onClick={handleAdd} disabled={addSaving}>
-              {addSaving ? 'Saving...' : 'Create Customer'}
+            <Button onClick={handleAdd} loading={addSaving}>
+              Create Customer
             </Button>
           </>
         }
@@ -450,8 +473,8 @@ export default function CustomersPage() {
             >
               Cancel
             </Button>
-            <Button onClick={handleEdit} disabled={editSaving}>
-              {editSaving ? 'Saving...' : 'Save Changes'}
+            <Button onClick={handleEdit} loading={editSaving}>
+              Save Changes
             </Button>
           </>
         }
@@ -460,34 +483,31 @@ export default function CustomersPage() {
       </Modal>
 
       {/* ---- Deactivate confirm modal ---- */}
-      <Modal
+      <ConfirmDialog
         open={!!deactivateTarget}
-        onClose={() => setDeactivateTarget(null)}
         title="Deactivate Customer"
-        footer={
+        message={
           <>
-            <Button
-              variant="secondary"
-              onClick={() => setDeactivateTarget(null)}
-              disabled={deactivating}
-            >
-              Cancel
-            </Button>
-            <Button variant="danger" onClick={handleDeactivate} disabled={deactivating}>
-              {deactivating ? 'Deactivating...' : 'Yes, Deactivate'}
-            </Button>
+            Are you sure you want to deactivate{' '}
+            <strong className="text-navy">{deactivateTarget?.displayName}</strong>? They will no
+            longer appear in active customer lists, but all historical invoices and payments will
+            be preserved.
           </>
         }
-      >
-        <p className="text-navy/70 text-sm">
-          Are you sure you want to deactivate{' '}
-          <strong className="text-navy">{deactivateTarget?.displayName}</strong>? They will no
-          longer appear in active customer lists, but all historical invoices and payments will be
-          preserved.
-        </p>
-      </Modal>
-
-      <Toaster />
+        confirmLabel="Yes, Deactivate"
+        tone="danger"
+        loading={deactivating}
+        onConfirm={handleDeactivate}
+        onClose={() => setDeactivateTarget(null)}
+      />
     </main>
+  );
+}
+
+export default function CustomersPage() {
+  return (
+    <Suspense fallback={null}>
+      <CustomersPageContent />
+    </Suspense>
   );
 }

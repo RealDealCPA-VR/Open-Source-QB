@@ -14,7 +14,7 @@
  * reference the correct A/R / A/P accounts; only the customer/vendor FK on the
  * sub-ledger documents is updated. The GL and trial balance remain balanced.
  */
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import {
   customers,
   vendors,
@@ -28,8 +28,37 @@ import {
   expenses,
   vendorCredits,
   purchaseOrders,
+  jobs,
+  billLines,
+  expenseLines,
+  customerPrices,
+  timeEntries,
+  mileageLogs,
+  accounts,
+  journalEntries,
+  journalEntryLines,
+  bankAccounts,
+  items,
+  taxAgencies,
+  invoiceLines,
+  salesReceipts,
+  salesReceiptLines,
+  transfers,
+  bankTransactions,
+  transactionRules,
+  budgetLines,
+  creditMemoLines,
+  vendorCreditLines,
+  expenseReportLines,
+  purchaseOrderLines,
+  deposits,
+  fixedAssets,
+  recurringTemplates,
+  memorizedReports,
 } from '@/lib/db/schema';
+import { toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, inTransaction, writeAudit } from './_base';
+import { balanceDelta } from './posting';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -125,6 +154,80 @@ export async function mergeCustomers(
       .where(and(eq(salesOrders.customerId, fromId), eq(salesOrders.companyId, tx.companyId)))
       .returning({ id: salesOrders.id });
 
+    // Sub-ledger tables that ALSO carry customerId — previously orphaned by the merge.
+    const jobRows = await tx.db
+      .update(jobs)
+      .set({ customerId: toId })
+      .where(and(eq(jobs.customerId, fromId), eq(jobs.companyId, tx.companyId)))
+      .returning({ id: jobs.id });
+
+    const timeRows = await tx.db
+      .update(timeEntries)
+      .set({ customerId: toId })
+      .where(and(eq(timeEntries.customerId, fromId), eq(timeEntries.companyId, tx.companyId)))
+      .returning({ id: timeEntries.id });
+
+    const mileageRows = await tx.db
+      .update(mileageLogs)
+      .set({ customerId: toId })
+      .where(and(eq(mileageLogs.customerId, fromId), eq(mileageLogs.companyId, tx.companyId)))
+      .returning({ id: mileageLogs.id });
+
+    // customerPrices: drop any from-customer price whose item is already priced for the
+    // survivor (no unique constraint exists, but we avoid creating duplicate price rows),
+    // then re-point the remainder.
+    const toPriceItems = (
+      await tx.db
+        .select({ itemId: customerPrices.itemId })
+        .from(customerPrices)
+        .where(and(eq(customerPrices.customerId, toId), eq(customerPrices.companyId, tx.companyId)))
+    ).map((r) => r.itemId);
+    if (toPriceItems.length > 0) {
+      await tx.db
+        .delete(customerPrices)
+        .where(
+          and(
+            eq(customerPrices.customerId, fromId),
+            eq(customerPrices.companyId, tx.companyId),
+            inArray(customerPrices.itemId, toPriceItems),
+          ),
+        );
+    }
+    const priceRows = await tx.db
+      .update(customerPrices)
+      .set({ customerId: toId })
+      .where(and(eq(customerPrices.customerId, fromId), eq(customerPrices.companyId, tx.companyId)))
+      .returning({ id: customerPrices.id });
+
+    // billLines / expenseLines have no companyId column — scope via their parent's companyId.
+    const billLineRows = await tx.db
+      .update(billLines)
+      .set({ customerId: toId })
+      .where(
+        and(
+          eq(billLines.customerId, fromId),
+          inArray(
+            billLines.billId,
+            tx.db.select({ id: bills.id }).from(bills).where(eq(bills.companyId, tx.companyId)),
+          ),
+        ),
+      )
+      .returning({ id: billLines.id });
+
+    const expenseLineRows = await tx.db
+      .update(expenseLines)
+      .set({ customerId: toId })
+      .where(
+        and(
+          eq(expenseLines.customerId, fromId),
+          inArray(
+            expenseLines.expenseId,
+            tx.db.select({ id: expenses.id }).from(expenses).where(eq(expenses.companyId, tx.companyId)),
+          ),
+        ),
+      )
+      .returning({ id: expenseLines.id });
+
     // Deactivate the from-customer.
     await tx.db
       .update(customers)
@@ -153,6 +256,12 @@ export async function mergeCustomers(
           estimates: estRows.length,
           creditMemos: cmRows.length,
           salesOrders: soRows.length,
+          jobs: jobRows.length,
+          timeEntries: timeRows.length,
+          mileageLogs: mileageRows.length,
+          customerPrices: priceRows.length,
+          billLines: billLineRows.length,
+          expenseLines: expenseLineRows.length,
         },
       },
     });
@@ -269,5 +378,420 @@ export async function mergeVendors(
       },
       deactivatedId: fromId,
     };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// mergeAccounts
+// ---------------------------------------------------------------------------
+
+export interface MergeAccountsInput {
+  /** The duplicate GL account to fold away — will be deactivated with a zero balance. */
+  fromId: string;
+  /** The surviving GL account. Must be the same type as `fromId`. */
+  toId: string;
+}
+
+export interface MergeAccountsResult {
+  /** Row counts re-pointed per table/column. */
+  reassigned: Record<string, number>;
+  deactivatedId: string;
+  /** The survivor's cached balance, recomputed from the posted ledger after the merge. */
+  newBalance: string;
+}
+
+/**
+ * Merge GL account `fromId` into `toId` (QB: rename an account to an existing
+ * name → "Merge accounts"). Same-type only. Re-points every table that carries
+ * an account FK — the journal lines themselves (the GL history), item account
+ * mappings, bank-account links, bank rules, budgets, document lines, transfers,
+ * fixed-asset mappings, tax agencies, and accountIds embedded in recurring
+ * templates / memorized-report configs — then recomputes the survivor's cached
+ * balance from the posted ledger, zeroes + deactivates the source, and audits.
+ *
+ * Tenancy note: several line tables (journal_entry_lines, invoice_lines, …)
+ * have no companyId column. `fromId` is a UUID primary key verified above to
+ * belong to this company, so `WHERE account_id = fromId` can only ever match
+ * this company's rows — no parent-scoped subquery is needed.
+ */
+export async function mergeAccounts(
+  ctx: ServiceContext,
+  { fromId, toId }: MergeAccountsInput,
+): Promise<MergeAccountsResult> {
+  if (fromId === toId) {
+    throw validation('Cannot merge an account with itself.');
+  }
+
+  const [fromRow] = await ctx.db
+    .select()
+    .from(accounts)
+    .where(and(eq(accounts.id, fromId), eq(accounts.companyId, ctx.companyId)));
+  if (!fromRow) throw notFound(`Account ${fromId}`);
+
+  const [toRow] = await ctx.db
+    .select()
+    .from(accounts)
+    .where(and(eq(accounts.id, toId), eq(accounts.companyId, ctx.companyId)));
+  if (!toRow) throw notFound(`Account ${toId}`);
+
+  if (fromRow.type !== toRow.type) {
+    throw validation(
+      `Accounts must be the same type to merge (${fromRow.type} vs ${toRow.type}).`,
+    );
+  }
+
+  return inTransaction(ctx, async (tx) => {
+    const reassigned: Record<string, number> = {};
+    const count = async (
+      key: string,
+      rows: PromiseLike<Array<{ id: string }>>,
+    ): Promise<void> => {
+      reassigned[key] = (reassigned[key] ?? 0) + (await rows).length;
+    };
+
+    // --- The GL itself: journal entry lines (posted, draft AND void history). ---
+    await count(
+      'journalEntryLines',
+      tx.db
+        .update(journalEntryLines)
+        .set({ accountId: toId })
+        .where(eq(journalEntryLines.accountId, fromId))
+        .returning({ id: journalEntryLines.id }),
+    );
+
+    // --- Sub-account hierarchy: if the survivor was a child of the source, hoist it
+    // to the source's parent FIRST so re-pointing children cannot self-parent it. ---
+    if (toRow.parentId === fromId) {
+      await tx.db
+        .update(accounts)
+        .set({ parentId: fromRow.parentId ?? null, updatedAt: new Date() })
+        .where(eq(accounts.id, toId));
+    }
+    await count(
+      'childAccounts',
+      tx.db
+        .update(accounts)
+        .set({ parentId: toId, updatedAt: new Date() })
+        .where(eq(accounts.parentId, fromId))
+        .returning({ id: accounts.id }),
+    );
+
+    // --- Banking. ---
+    await count(
+      'bankAccounts',
+      tx.db
+        .update(bankAccounts)
+        .set({ accountId: toId, updatedAt: new Date() })
+        .where(eq(bankAccounts.accountId, fromId))
+        .returning({ id: bankAccounts.id }),
+    );
+    await count(
+      'bankTransactions',
+      tx.db
+        .update(bankTransactions)
+        .set({ suggestedAccountId: toId })
+        .where(eq(bankTransactions.suggestedAccountId, fromId))
+        .returning({ id: bankTransactions.id }),
+    );
+    await count(
+      'transactionRules',
+      tx.db
+        .update(transactionRules)
+        .set({ setAccountId: toId })
+        .where(eq(transactionRules.setAccountId, fromId))
+        .returning({ id: transactionRules.id }),
+    );
+
+    // --- Item + vendor + tax-agency account mappings. ---
+    await count(
+      'items',
+      tx.db
+        .update(items)
+        .set({ incomeAccountId: toId, updatedAt: new Date() })
+        .where(eq(items.incomeAccountId, fromId))
+        .returning({ id: items.id }),
+    );
+    await count(
+      'items',
+      tx.db
+        .update(items)
+        .set({ expenseAccountId: toId, updatedAt: new Date() })
+        .where(eq(items.expenseAccountId, fromId))
+        .returning({ id: items.id }),
+    );
+    await count(
+      'items',
+      tx.db
+        .update(items)
+        .set({ assetAccountId: toId, updatedAt: new Date() })
+        .where(eq(items.assetAccountId, fromId))
+        .returning({ id: items.id }),
+    );
+    await count(
+      'vendors',
+      tx.db
+        .update(vendors)
+        .set({ defaultExpenseAccountId: toId, updatedAt: new Date() })
+        .where(eq(vendors.defaultExpenseAccountId, fromId))
+        .returning({ id: vendors.id }),
+    );
+    await count(
+      'taxAgencies',
+      tx.db
+        .update(taxAgencies)
+        .set({ liabilityAccountId: toId })
+        .where(eq(taxAgencies.liabilityAccountId, fromId))
+        .returning({ id: taxAgencies.id }),
+    );
+
+    // --- Document headers + lines that carry account FKs. ---
+    await count(
+      'invoiceLines',
+      tx.db
+        .update(invoiceLines)
+        .set({ accountId: toId })
+        .where(eq(invoiceLines.accountId, fromId))
+        .returning({ id: invoiceLines.id }),
+    );
+    await count(
+      'paymentsReceived',
+      tx.db
+        .update(paymentsReceived)
+        .set({ depositAccountId: toId })
+        .where(eq(paymentsReceived.depositAccountId, fromId))
+        .returning({ id: paymentsReceived.id }),
+    );
+    await count(
+      'salesReceipts',
+      tx.db
+        .update(salesReceipts)
+        .set({ depositAccountId: toId })
+        .where(eq(salesReceipts.depositAccountId, fromId))
+        .returning({ id: salesReceipts.id }),
+    );
+    await count(
+      'salesReceiptLines',
+      tx.db
+        .update(salesReceiptLines)
+        .set({ accountId: toId })
+        .where(eq(salesReceiptLines.accountId, fromId))
+        .returning({ id: salesReceiptLines.id }),
+    );
+    await count(
+      'billLines',
+      tx.db
+        .update(billLines)
+        .set({ accountId: toId })
+        .where(eq(billLines.accountId, fromId))
+        .returning({ id: billLines.id }),
+    );
+    await count(
+      'billPayments',
+      tx.db
+        .update(billPayments)
+        .set({ paymentAccountId: toId })
+        .where(eq(billPayments.paymentAccountId, fromId))
+        .returning({ id: billPayments.id }),
+    );
+    await count(
+      'expenses',
+      tx.db
+        .update(expenses)
+        .set({ paymentAccountId: toId })
+        .where(eq(expenses.paymentAccountId, fromId))
+        .returning({ id: expenses.id }),
+    );
+    await count(
+      'expenseLines',
+      tx.db
+        .update(expenseLines)
+        .set({ accountId: toId })
+        .where(eq(expenseLines.accountId, fromId))
+        .returning({ id: expenseLines.id }),
+    );
+    await count(
+      'creditMemoLines',
+      tx.db
+        .update(creditMemoLines)
+        .set({ accountId: toId })
+        .where(eq(creditMemoLines.accountId, fromId))
+        .returning({ id: creditMemoLines.id }),
+    );
+    await count(
+      'vendorCreditLines',
+      tx.db
+        .update(vendorCreditLines)
+        .set({ accountId: toId })
+        .where(eq(vendorCreditLines.accountId, fromId))
+        .returning({ id: vendorCreditLines.id }),
+    );
+    await count(
+      'expenseReportLines',
+      tx.db
+        .update(expenseReportLines)
+        .set({ accountId: toId })
+        .where(eq(expenseReportLines.accountId, fromId))
+        .returning({ id: expenseReportLines.id }),
+    );
+    await count(
+      'purchaseOrderLines',
+      tx.db
+        .update(purchaseOrderLines)
+        .set({ accountId: toId })
+        .where(eq(purchaseOrderLines.accountId, fromId))
+        .returning({ id: purchaseOrderLines.id }),
+    );
+    await count(
+      'deposits',
+      tx.db
+        .update(deposits)
+        .set({ depositAccountId: toId })
+        .where(eq(deposits.depositAccountId, fromId))
+        .returning({ id: deposits.id }),
+    );
+    await count(
+      'transfers',
+      tx.db
+        .update(transfers)
+        .set({ fromAccountId: toId })
+        .where(eq(transfers.fromAccountId, fromId))
+        .returning({ id: transfers.id }),
+    );
+    await count(
+      'transfers',
+      tx.db
+        .update(transfers)
+        .set({ toAccountId: toId })
+        .where(eq(transfers.toAccountId, fromId))
+        .returning({ id: transfers.id }),
+    );
+
+    // --- Budgets. ---
+    await count(
+      'budgetLines',
+      tx.db
+        .update(budgetLines)
+        .set({ accountId: toId })
+        .where(eq(budgetLines.accountId, fromId))
+        .returning({ id: budgetLines.id }),
+    );
+
+    // --- Fixed assets (three separate account mappings). ---
+    await count(
+      'fixedAssets',
+      tx.db
+        .update(fixedAssets)
+        .set({ assetAccountId: toId })
+        .where(eq(fixedAssets.assetAccountId, fromId))
+        .returning({ id: fixedAssets.id }),
+    );
+    await count(
+      'fixedAssets',
+      tx.db
+        .update(fixedAssets)
+        .set({ depreciationExpenseAccountId: toId })
+        .where(eq(fixedAssets.depreciationExpenseAccountId, fromId))
+        .returning({ id: fixedAssets.id }),
+    );
+    await count(
+      'fixedAssets',
+      tx.db
+        .update(fixedAssets)
+        .set({ accumulatedDepreciationAccountId: toId })
+        .where(eq(fixedAssets.accumulatedDepreciationAccountId, fromId))
+        .returning({ id: fixedAssets.id }),
+    );
+
+    // --- JSONB payloads: recurring templates + memorized reports may embed
+    // accountIds anywhere in their document JSON. UUIDs are globally unique, so a
+    // serialize → string-replace → re-parse round trip re-points them safely. ---
+    let recurringCount = 0;
+    const templates = await tx.db
+      .select({ id: recurringTemplates.id, template: recurringTemplates.template })
+      .from(recurringTemplates)
+      .where(eq(recurringTemplates.companyId, tx.companyId));
+    for (const t of templates) {
+      const json = JSON.stringify(t.template);
+      if (json.includes(fromId)) {
+        await tx.db
+          .update(recurringTemplates)
+          .set({ template: JSON.parse(json.split(fromId).join(toId)) })
+          .where(eq(recurringTemplates.id, t.id));
+        recurringCount++;
+      }
+    }
+    reassigned['recurringTemplates'] = recurringCount;
+
+    let memorizedCount = 0;
+    const reports = await tx.db
+      .select({ id: memorizedReports.id, config: memorizedReports.config })
+      .from(memorizedReports)
+      .where(eq(memorizedReports.companyId, tx.companyId));
+    for (const r of reports) {
+      const json = JSON.stringify(r.config);
+      if (json.includes(fromId)) {
+        await tx.db
+          .update(memorizedReports)
+          .set({ config: JSON.parse(json.split(fromId).join(toId)) })
+          .where(eq(memorizedReports.id, r.id));
+        memorizedCount++;
+      }
+    }
+    reassigned['memorizedReports'] = memorizedCount;
+
+    // --- Recompute the survivor's cached balance from the posted ledger (the
+    // authoritative source the posting engine maintains it from), and zero +
+    // deactivate the source — its entire ledger history now lives on the survivor. ---
+    const [sums] = await tx.db
+      .select({
+        debit: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`,
+        credit: sql<string>`COALESCE(SUM(${journalEntryLines.credit}), 0)`,
+      })
+      .from(journalEntryLines)
+      .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+      .where(
+        and(
+          eq(journalEntryLines.accountId, toId),
+          eq(journalEntries.companyId, tx.companyId),
+          eq(journalEntries.status, 'posted'),
+        ),
+      );
+    const newBalance = toAmountString(
+      balanceDelta(toRow.type, sums?.debit ?? 0, sums?.credit ?? 0),
+    );
+    await tx.db
+      .update(accounts)
+      .set({ balance: newBalance, updatedAt: new Date() })
+      .where(eq(accounts.id, toId));
+
+    await tx.db
+      .update(accounts)
+      .set({ balance: '0.00', isActive: false, updatedAt: new Date() })
+      .where(eq(accounts.id, fromId));
+
+    // Audit: deactivation of the source account.
+    await writeAudit(tx, {
+      action: 'delete',
+      entityType: 'account',
+      entityId: fromId,
+      oldValues: {
+        isActive: fromRow.isActive,
+        code: fromRow.code,
+        name: fromRow.name,
+        balance: fromRow.balance,
+      },
+      newValues: { isActive: false, balance: '0.00', mergedInto: toId },
+    });
+
+    // Audit: the merge operation itself (on the surviving account).
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'account',
+      entityId: toId,
+      oldValues: { balance: toRow.balance },
+      newValues: { mergedFrom: fromId, balance: newBalance, reassigned },
+    });
+
+    return { reassigned, deactivatedId: fromId, newBalance };
   });
 }

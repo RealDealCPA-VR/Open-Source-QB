@@ -6,6 +6,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getItem, updateItem, deactivateItem } from '@/lib/services/items';
+import { setReorderPoint } from '@/lib/services/inventory';
 import { ServiceError } from '@/lib/services/_base';
 
 // ── Error helper ──────────────────────────────────────────────────────────────
@@ -67,7 +68,14 @@ export async function PATCH(req: NextRequest, { params }: RouteParams): Promise<
     if ('taxable' in body)           patch.taxable = body.taxable;
     if ('isActive' in body)          patch.isActive = body.isActive;
 
-    const item = await updateItem(ctx, id, patch);
+    let item = await updateItem(ctx, id, patch);
+
+    // Reorder point is managed by the inventory service (it drives the
+    // reorder report and low-stock alerts). null / '' clears it.
+    if ('reorderPoint' in body) {
+      item = await setReorderPoint(ctx, id, body.reorderPoint ?? null);
+    }
+
     return NextResponse.json({ item });
   } catch (err) {
     if (err instanceof ServiceError) return serviceErrorToResponse(err);

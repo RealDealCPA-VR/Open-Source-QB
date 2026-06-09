@@ -49,8 +49,8 @@ export default function SignupPage() {
             <Label>Password</Label>
             <Input type="password" value={form.password} onChange={set('password')} required minLength={6} />
           </div>
-          <Button type="submit" className="w-full" disabled={busy}>
-            {busy ? 'Creating…' : 'Create account'}
+          <Button type="submit" className="w-full" loading={busy}>
+            Create account
           </Button>
         </form>
         <p className="mt-6 text-center text-sm text-navy/50">

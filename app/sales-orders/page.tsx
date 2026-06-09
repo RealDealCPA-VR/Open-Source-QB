@@ -1,10 +1,11 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { ShoppingCart, Plus, ArrowRight, PlusCircle, MinusCircle } from 'lucide-react';
+import { FileCheck, Plus, ArrowRight, PlusCircle, MinusCircle } from 'lucide-react';
 import {
   Button,
   Card,
+  EmptyState,
   Input,
   Select,
   Label,
@@ -15,10 +16,12 @@ import {
   Tr,
   Modal,
   PageHeader,
+  Spinner,
   toast,
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/format';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -166,8 +169,8 @@ function NewOrderModal({ open, onClose, customers, onCreated }: NewOrderModalPro
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
-          <Button onClick={handleSubmit} disabled={saving}>
-            {saving ? 'Saving…' : 'Create Sales Order'}
+          <Button onClick={handleSubmit} loading={saving}>
+            Create Sales Order
           </Button>
         </>
       }
@@ -180,6 +183,7 @@ function NewOrderModal({ open, onClose, customers, onCreated }: NewOrderModalPro
             id="so-customer"
             value={customerId}
             onChange={(e) => setCustomerId(e.target.value)}
+            autoFocus
           >
             <option value="">Select a customer…</option>
             {customers.map((c) => (
@@ -304,8 +308,8 @@ function ConvertModal({ open, order, onConfirm, onClose, converting }: ConvertMo
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={converting}>Cancel</Button>
-          <Button onClick={onConfirm} disabled={converting}>
-            {converting ? 'Converting…' : 'Convert to Invoice'}
+          <Button onClick={onConfirm} loading={converting}>
+            Convert to Invoice
           </Button>
         </>
       }
@@ -375,7 +379,7 @@ export default function SalesOrdersPage() {
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
         title="Sales Orders"
-        icon={ShoppingCart}
+        icon={FileCheck}
         action={
           <Button onClick={() => setShowNew(true)}>
             <Plus className="h-4 w-4" /> New Sales Order
@@ -385,14 +389,20 @@ export default function SalesOrdersPage() {
 
       <Card className="p-0 overflow-hidden">
         {loading ? (
-          <div className="flex items-center justify-center py-20 text-navy/40 text-sm">
-            Loading sales orders…
+          <div className="flex items-center justify-center py-20 text-navy/40">
+            <Spinner className="h-6 w-6" />
           </div>
         ) : orders.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-20 gap-3 text-navy/40">
-            <ShoppingCart className="h-10 w-10 opacity-30" />
-            <p className="text-sm">No sales orders yet. Create one to get started.</p>
-          </div>
+          <EmptyState
+            icon={FileCheck}
+            title="No sales orders yet"
+            message="Create your first sales order to get started."
+            action={
+              <Button onClick={() => setShowNew(true)}>
+                <Plus className="h-4 w-4" /> New Sales Order
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -400,7 +410,7 @@ export default function SalesOrdersPage() {
                 <Th>Order #</Th>
                 <Th>Customer</Th>
                 <Th>Date</Th>
-                <Th className="text-right">Total</Th>
+                <Th numeric>Total</Th>
                 <Th>Status</Th>
                 <Th className="text-right">Actions</Th>
               </Tr>
@@ -409,11 +419,9 @@ export default function SalesOrdersPage() {
               {orders.map((order) => (
                 <Tr key={order.id}>
                   <Td className="font-semibold text-navy">#{order.orderNumber}</Td>
-                  <Td>{customerMap[order.customerId] ?? order.customerId}</Td>
-                  <Td className="text-navy/70">
-                    {order.date ? order.date.slice(0, 10) : '—'}
-                  </Td>
-                  <Td className="text-right tabular-nums font-medium">
+                  <Td>{customerMap[order.customerId] ?? '—'}</Td>
+                  <Td className="text-navy/70">{formatDate(order.date)}</Td>
+                  <Td numeric className="font-medium">
                     {formatCurrency(order.total)}
                   </Td>
                   <Td>
@@ -421,13 +429,14 @@ export default function SalesOrdersPage() {
                   </Td>
                   <Td className="text-right">
                     {order.status === 'open' && (
-                      <button
+                      <Button
+                        variant="ghost"
+                        size="sm"
                         onClick={() => setConvertTarget(order)}
-                        className="inline-flex items-center gap-1 text-xs text-navy/40 hover:text-electric transition-colors font-medium"
                         title="Convert to Invoice"
                       >
                         <ArrowRight className="h-3.5 w-3.5" /> Convert to Invoice
-                      </button>
+                      </Button>
                     )}
                     {order.status === 'closed' && (
                       <span className="text-xs text-navy/30 italic">Converted</span>

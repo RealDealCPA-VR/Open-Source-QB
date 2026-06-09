@@ -1,13 +1,19 @@
 /**
- * GET /api/bank-transactions?bankAccountId=<uuid>&unmatchedOnly=true|false
+ * GET /api/bank-transactions?bankAccountId=<uuid>&filter=all|unreviewed|matched|excluded
  *
  * Returns staged bank-feed transactions for a bank account, newest first.
- * Pass `unmatchedOnly=true` to filter to unreviewed rows only.
+ *  - filter=unreviewed — not matched AND not excluded (the review queue)
+ *  - filter=matched    — categorized or matched rows
+ *  - filter=excluded   — excluded rows
+ *  - filter=all (default) — everything
+ * `unmatchedOnly=true` is kept for back-compat and behaves like filter=unreviewed.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
-import { listStaged } from '@/lib/services/bankCategorize';
+import { listStaged, type ReviewFilter } from '@/lib/services/bankCategorize';
+
+const FILTERS: ReviewFilter[] = ['all', 'unreviewed', 'matched', 'excluded'];
 
 function errResponse(err: ServiceError): NextResponse {
   const statusMap: Record<string, number> = {
@@ -30,12 +36,22 @@ export async function GET(req: NextRequest) {
     const { searchParams } = new URL(req.url);
     const bankAccountId = searchParams.get('bankAccountId');
     const unmatchedOnly = searchParams.get('unmatchedOnly') === 'true';
+    const filterParam = searchParams.get('filter');
 
     if (!bankAccountId) {
       return NextResponse.json({ error: 'bankAccountId query parameter is required.' }, { status: 400 });
     }
+    if (filterParam && !FILTERS.includes(filterParam as ReviewFilter)) {
+      return NextResponse.json(
+        { error: `filter must be one of: ${FILTERS.join(', ')}.` },
+        { status: 400 },
+      );
+    }
 
-    const rows = await listStaged(ctx, bankAccountId, { unmatchedOnly });
+    const rows = await listStaged(ctx, bankAccountId, {
+      unmatchedOnly,
+      filter: (filterParam as ReviewFilter) ?? undefined,
+    });
     return NextResponse.json(rows);
   } catch (err) {
     if (err instanceof ServiceError) return errResponse(err);

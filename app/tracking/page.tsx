@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Layers, MapPin, Plus, PowerOff } from 'lucide-react';
+import { Layers, MapPin, Plus, PowerOff, Tag } from 'lucide-react';
 import {
   Button,
   Card,
@@ -14,9 +14,11 @@ import {
   Td,
   Tr,
   Modal,
+  ConfirmDialog,
+  EmptyState,
+  Spinner,
   PageHeader,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 
@@ -116,7 +118,7 @@ function ClassesCard() {
   }
 
   const parentName = (id: string | null) =>
-    id ? (classes.find((c) => c.id === id)?.name ?? id) : '-';
+    id ? (classes.find((c) => c.id === id)?.name ?? null) : '-';
 
   return (
     <>
@@ -133,12 +135,20 @@ function ClassesCard() {
         </div>
 
         {loading ? (
-          <div className="py-8 text-center text-navy/40 text-sm">Loading...</div>
-        ) : classes.length === 0 ? (
-          <div className="py-8 text-center">
-            <Layers className="mx-auto h-8 w-8 text-navy/20 mb-2" />
-            <p className="text-navy/50 text-sm">No classes yet. Add one to get started.</p>
+          <div className="py-8 flex justify-center text-electric">
+            <Spinner className="h-6 w-6" />
           </div>
+        ) : classes.length === 0 ? (
+          <EmptyState
+            icon={Layers}
+            title="No classes yet"
+            message="Add a class to tag transactions for reporting."
+            action={
+              <Button onClick={openAddModal}>
+                <Plus className="h-4 w-4" /> Add Class
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -153,7 +163,11 @@ function ClassesCard() {
               {classes.map((c) => (
                 <Tr key={c.id}>
                   <Td className="font-medium text-navy">{c.name}</Td>
-                  <Td className="text-navy/60">{parentName(c.parentId)}</Td>
+                  <Td className="text-navy/60">
+                    {parentName(c.parentId) ?? (
+                      <span className="text-navy/40 italic">Unknown parent</span>
+                    )}
+                  </Td>
                   <Td>
                     <Badge tone={c.isActive ? 'success' : 'neutral'}>
                       {c.isActive ? 'Active' : 'Inactive'}
@@ -190,8 +204,8 @@ function ClassesCard() {
             <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addSaving}>
               Cancel
             </Button>
-            <Button onClick={handleAdd} disabled={addSaving}>
-              {addSaving ? 'Saving...' : 'Create Class'}
+            <Button onClick={handleAdd} loading={addSaving}>
+              Create Class
             </Button>
           </>
         }
@@ -226,31 +240,22 @@ function ClassesCard() {
       </Modal>
 
       {/* Deactivate confirm modal */}
-      <Modal
+      <ConfirmDialog
         open={!!deactivateTarget}
-        onClose={() => setDeactivateTarget(null)}
         title="Deactivate Class"
-        footer={
+        message={
           <>
-            <Button
-              variant="secondary"
-              onClick={() => setDeactivateTarget(null)}
-              disabled={deactivating}
-            >
-              Cancel
-            </Button>
-            <Button variant="danger" onClick={handleDeactivate} disabled={deactivating}>
-              {deactivating ? 'Deactivating...' : 'Yes, Deactivate'}
-            </Button>
+            Are you sure you want to deactivate{' '}
+            <strong className="text-navy">{deactivateTarget?.name}</strong>? It will no longer
+            appear in active lists but historical transactions will be preserved.
           </>
         }
-      >
-        <p className="text-navy/70 text-sm">
-          Are you sure you want to deactivate{' '}
-          <strong className="text-navy">{deactivateTarget?.name}</strong>? It will no longer appear
-          in active lists but historical transactions will be preserved.
-        </p>
-      </Modal>
+        confirmLabel="Yes, Deactivate"
+        tone="danger"
+        loading={deactivating}
+        onConfirm={handleDeactivate}
+        onClose={() => setDeactivateTarget(null)}
+      />
     </>
   );
 }
@@ -341,12 +346,20 @@ function LocationsCard() {
         </div>
 
         {loading ? (
-          <div className="py-8 text-center text-navy/40 text-sm">Loading...</div>
-        ) : locations.length === 0 ? (
-          <div className="py-8 text-center">
-            <MapPin className="mx-auto h-8 w-8 text-navy/20 mb-2" />
-            <p className="text-navy/50 text-sm">No locations yet. Add one to get started.</p>
+          <div className="py-8 flex justify-center text-electric">
+            <Spinner className="h-6 w-6" />
           </div>
+        ) : locations.length === 0 ? (
+          <EmptyState
+            icon={MapPin}
+            title="No locations yet"
+            message="Add a location to tag transactions for reporting."
+            action={
+              <Button onClick={openAddModal}>
+                <Plus className="h-4 w-4" /> Add Location
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -396,8 +409,8 @@ function LocationsCard() {
             <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addSaving}>
               Cancel
             </Button>
-            <Button onClick={handleAdd} disabled={addSaving}>
-              {addSaving ? 'Saving...' : 'Create Location'}
+            <Button onClick={handleAdd} loading={addSaving}>
+              Create Location
             </Button>
           </>
         }
@@ -417,31 +430,22 @@ function LocationsCard() {
       </Modal>
 
       {/* Deactivate confirm modal */}
-      <Modal
+      <ConfirmDialog
         open={!!deactivateTarget}
-        onClose={() => setDeactivateTarget(null)}
         title="Deactivate Location"
-        footer={
+        message={
           <>
-            <Button
-              variant="secondary"
-              onClick={() => setDeactivateTarget(null)}
-              disabled={deactivating}
-            >
-              Cancel
-            </Button>
-            <Button variant="danger" onClick={handleDeactivate} disabled={deactivating}>
-              {deactivating ? 'Deactivating...' : 'Yes, Deactivate'}
-            </Button>
+            Are you sure you want to deactivate{' '}
+            <strong className="text-navy">{deactivateTarget?.name}</strong>? It will no longer
+            appear in active lists but historical transactions will be preserved.
           </>
         }
-      >
-        <p className="text-navy/70 text-sm">
-          Are you sure you want to deactivate{' '}
-          <strong className="text-navy">{deactivateTarget?.name}</strong>? It will no longer appear
-          in active lists but historical transactions will be preserved.
-        </p>
-      </Modal>
+        confirmLabel="Yes, Deactivate"
+        tone="danger"
+        loading={deactivating}
+        onConfirm={handleDeactivate}
+        onClose={() => setDeactivateTarget(null)}
+      />
     </>
   );
 }
@@ -453,7 +457,7 @@ function LocationsCard() {
 export default function TrackingPage() {
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader title="Tracking Dimensions" icon={Layers} />
+      <PageHeader title="Tracking Dimensions" icon={Tag} />
 
       <p className="text-navy/60 text-sm mb-6 max-w-2xl">
         Classes and Locations let you tag transactions for multi-dimensional reporting — similar to
@@ -464,8 +468,6 @@ export default function TrackingPage() {
         <ClassesCard />
         <LocationsCard />
       </div>
-
-      <Toaster />
     </main>
   );
 }

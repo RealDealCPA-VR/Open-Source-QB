@@ -227,51 +227,59 @@ export async function updateStatus(
  * 5. Return the newly created invoice.
  */
 export async function convertToInvoice(ctx: ServiceContext, salesOrderId: string) {
-  const [order] = await ctx.db
-    .select()
-    .from(salesOrders)
-    .where(and(eq(salesOrders.companyId, ctx.companyId), eq(salesOrders.id, salesOrderId)));
-  if (!order) throw notFound('Sales order');
+  // Invoice creation and order stamping must commit or roll back TOGETHER —
+  // otherwise a failure after createInvoice leaves a posted GL invoice with the
+  // order still open and convertible again (duplicate invoice + revenue).
+  // Re-loading the order inside the transaction also closes the
+  // read-then-write race between concurrent converts.
+  return inTransaction(ctx, async (tx) => {
+    const [order] = await tx.db
+      .select()
+      .from(salesOrders)
+      .where(and(eq(salesOrders.companyId, tx.companyId), eq(salesOrders.id, salesOrderId)));
+    if (!order) throw notFound('Sales order');
 
-  if (order.status === 'closed' || order.convertedInvoiceId) {
-    throw new ServiceError('CONFLICT', 'Sales order has already been converted to an invoice.');
-  }
-  if (order.status === 'void') {
-    throw new ServiceError('CONFLICT', 'Cannot convert a voided sales order.');
-  }
+    if (order.status === 'closed' || order.convertedInvoiceId) {
+      throw new ServiceError('CONFLICT', 'Sales order has already been converted to an invoice.');
+    }
+    if (order.status === 'void') {
+      throw new ServiceError('CONFLICT', 'Cannot convert a voided sales order.');
+    }
 
-  const lines = await ctx.db
-    .select()
-    .from(salesOrderLines)
-    .where(eq(salesOrderLines.salesOrderId, salesOrderId))
-    .orderBy(salesOrderLines.lineOrder);
+    const lines = await tx.db
+      .select()
+      .from(salesOrderLines)
+      .where(eq(salesOrderLines.salesOrderId, salesOrderId))
+      .orderBy(salesOrderLines.lineOrder);
 
-  // Create the invoice — this does GL posting via postJournalEntry internally.
-  const invoice = await createInvoice(ctx, {
-    customerId: order.customerId,
-    date: order.date,
-    memo: order.memo,
-    lines: lines.map((l) => ({
-      itemId: l.itemId ?? null,
-      description: l.description ?? null,
-      quantity: l.quantity,
-      rate: l.rate,
-    })),
+    // Create the invoice — this does GL posting via postJournalEntry internally;
+    // its internal inTransaction nests as a savepoint on this transaction.
+    const invoice = await createInvoice(tx, {
+      customerId: order.customerId,
+      date: order.date,
+      memo: order.memo,
+      lines: lines.map((l) => ({
+        itemId: l.itemId ?? null,
+        description: l.description ?? null,
+        quantity: l.quantity,
+        rate: l.rate,
+      })),
+    });
+
+    // Stamp the order as converted.
+    await tx.db
+      .update(salesOrders)
+      .set({ status: 'closed', convertedInvoiceId: invoice.id })
+      .where(eq(salesOrders.id, salesOrderId));
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'sales_order',
+      entityId: salesOrderId,
+      oldValues: { status: order.status, convertedInvoiceId: null },
+      newValues: { status: 'closed', convertedInvoiceId: invoice.id },
+    });
+
+    return invoice;
   });
-
-  // Stamp the order as converted.
-  await ctx.db
-    .update(salesOrders)
-    .set({ status: 'closed', convertedInvoiceId: invoice.id })
-    .where(eq(salesOrders.id, salesOrderId));
-
-  await writeAudit(ctx, {
-    action: 'update',
-    entityType: 'sales_order',
-    entityId: salesOrderId,
-    oldValues: { status: order.status, convertedInvoiceId: null },
-    newValues: { status: 'closed', convertedInvoiceId: invoice.id },
-  });
-
-  return invoice;
 }

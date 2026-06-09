@@ -37,13 +37,14 @@ export async function POST(req: NextRequest) {
     const ctx = await getServerContext();
     const body = await req.json();
 
-    const { customerId, date, expirationDate, lines, memo } = body;
+    const { customerId, date, expirationDate, lines, memo, taxRateId } = body;
 
     const estimate = await createEstimate(ctx, {
       customerId,
       date: new Date(date),
       expirationDate: expirationDate ? new Date(expirationDate) : null,
       lines: lines ?? [],
+      taxRateId: taxRateId ?? null,
       memo: memo ?? null,
     });
 

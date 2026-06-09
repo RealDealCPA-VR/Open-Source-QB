@@ -6,7 +6,9 @@
 import { eq } from 'drizzle-orm';
 import { accounts, companies, users, userCompanies } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
-import { notFound, writeAudit } from './_base';
+import { notFound, validation, writeAudit } from './_base';
+import { hashPassword, verifyPassword } from '@/lib/auth';
+import { requireRole } from './rbac';
 import type { DB } from '@/lib/db';
 
 type AccountSeed = { code: string; name: string; type: string; subtype: string };
@@ -42,6 +44,19 @@ export const DEFAULT_COA: AccountSeed[] = [
 
 export async function listCompanies(db: DB) {
   return db.select().from(companies);
+}
+
+/**
+ * Companies the given user is a member of (via user_companies). Used by the API layer so an
+ * authenticated caller only ever sees their own company files — never other tenants' rows.
+ */
+export async function listCompaniesForUser(db: DB, userId: string) {
+  const rows = await db
+    .select({ company: companies })
+    .from(companies)
+    .innerJoin(userCompanies, eq(userCompanies.companyId, companies.id))
+    .where(eq(userCompanies.userId, userId));
+  return rows.map((r) => r.company);
 }
 
 export async function createCompany(
@@ -136,4 +151,113 @@ export async function updateCompany(ctx: ServiceContext, input: UpdateCompanyInp
   });
 
   return updated;
+}
+
+// ---------------------------------------------------------------------------
+// Closing date (QB "Set Closing Date" + closing-date password) — books protection.
+// Stored in companies.settings as { closingDate: 'YYYY-MM-DD', closingDatePasswordHash }.
+// assertPeriodOpen (lib/services/fiscalPeriods.ts) blocks postings dated on/before the
+// closing date unless ctx.closingDateOverride is set (x-closing-password header verified
+// by getServerContext against the hash).
+// ---------------------------------------------------------------------------
+
+export interface ClosingDateSettings {
+  /** 'YYYY-MM-DD' or null when no closing date is set. */
+  closingDate: string | null;
+  /** Whether a closing-date password is configured. The hash itself is never returned. */
+  hasPassword: boolean;
+}
+
+export async function getClosingDateSettings(ctx: ServiceContext): Promise<ClosingDateSettings> {
+  const company = await getCompany(ctx);
+  if (!company) throw notFound('company');
+  const s = (company.settings ?? {}) as Record<string, unknown>;
+  return {
+    closingDate: typeof s.closingDate === 'string' ? s.closingDate : null,
+    hasPassword: Boolean(s.closingDatePasswordHash),
+  };
+}
+
+export interface SetClosingDateInput {
+  /** 'YYYY-MM-DD' to set, or null to clear the closing date (also clears the password). */
+  closingDate: string | null;
+  /**
+   * Closing-date password: a string sets/replaces it, null/'' removes it,
+   * undefined keeps the existing one.
+   */
+  password?: string | null;
+}
+
+/** Set or clear the company closing date + optional password. Admin/owner only. */
+export async function setClosingDate(
+  ctx: ServiceContext,
+  input: SetClosingDateInput,
+): Promise<ClosingDateSettings> {
+  await requireRole(ctx, 'admin');
+  const existing = await getCompany(ctx);
+  if (!existing) throw notFound('company');
+
+  if (input.closingDate !== null && !/^\d{4}-\d{2}-\d{2}$/.test(input.closingDate)) {
+    throw validation('closingDate must be in YYYY-MM-DD format (or null to clear).');
+  }
+
+  const settings = { ...((existing.settings ?? {}) as Record<string, unknown>) };
+  const before: ClosingDateSettings = {
+    closingDate: typeof settings.closingDate === 'string' ? (settings.closingDate as string) : null,
+    hasPassword: Boolean(settings.closingDatePasswordHash),
+  };
+
+  if (input.closingDate === null) {
+    delete settings.closingDate;
+    delete settings.closingDatePasswordHash;
+  } else {
+    settings.closingDate = input.closingDate;
+    if (input.password === null || input.password === '') {
+      delete settings.closingDatePasswordHash;
+    } else if (typeof input.password === 'string') {
+      settings.closingDatePasswordHash = await hashPassword(input.password);
+    }
+  }
+
+  const [updated] = await ctx.db
+    .update(companies)
+    .set({ settings, updatedAt: new Date() })
+    .where(eq(companies.id, ctx.companyId))
+    .returning();
+
+  const after: ClosingDateSettings = {
+    closingDate: typeof updated.settings?.closingDate === 'string' ? updated.settings.closingDate : null,
+    hasPassword: Boolean(updated.settings?.closingDatePasswordHash),
+  };
+
+  // Audit without ever logging the hash.
+  await writeAudit(ctx, {
+    action: 'update',
+    entityType: 'company',
+    entityId: ctx.companyId,
+    oldValues: { closingDate: before.closingDate, hasPassword: before.hasPassword },
+    newValues: { closingDate: after.closingDate, hasPassword: after.hasPassword },
+  });
+
+  return after;
+}
+
+/**
+ * Verify a request-supplied closing-date password. Used by getServerContext to set
+ * ctx.closingDateOverride from the x-closing-password header.
+ * When no password is configured, any explicit override attempt succeeds (QB's
+ * warn-and-continue behavior when the closing date has no password).
+ */
+export async function verifyClosingDatePassword(
+  db: DB,
+  companyId: string,
+  password: string,
+): Promise<boolean> {
+  const [row] = await db
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, companyId));
+  const hash = (row?.settings as Record<string, unknown> | null)?.closingDatePasswordHash;
+  if (typeof hash !== 'string' || !hash) return true;
+  return verifyPassword(password, hash);
 }

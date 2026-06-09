@@ -20,6 +20,14 @@
  * If your chart of accounts uses SEPARATE asset accounts per item, you would
  * need per-account postings; this service intentionally keeps it simple and
  * mirrors the common single-account approach.
+ *
+ * The zero-net wash only holds if total item-level value is conserved, so:
+ *   - unbuildAssembly distributes the assembly's removed value back to the
+ *     components (instead of restoring them at their possibly-drifted current
+ *     averageCost) — see unbuildAssembly's doc comment.
+ *   - FIFO-tracked items (any item with inventoryLayers rows) are rejected by
+ *     build/unbuild, since this module's averageCost math never touches
+ *     layers; route those items through fifo.ts instead.
  */
 import { and, eq, inArray } from 'drizzle-orm';
 import { assemblyComponents, items } from '@/lib/db/schema';
@@ -31,6 +39,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { assertNotFifoTracked } from './inventory';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -144,6 +153,37 @@ export async function setBom(
     if (!componentMap.has(c.componentItemId)) {
       throw notFound(`Component item ${c.componentItemId}`);
     }
+  }
+
+  // Reject circular references (direct or indirect): if the assembly is
+  // reachable from any of the new components through existing BOMs, saving
+  // this BOM would make the assembly a component of itself.
+  let frontier = [...componentIds];
+  const visited = new Set<string>(componentIds);
+  while (frontier.length > 0) {
+    const edges = await ctx.db
+      .select({ componentItemId: assemblyComponents.componentItemId })
+      .from(assemblyComponents)
+      .where(
+        and(
+          eq(assemblyComponents.companyId, ctx.companyId),
+          inArray(assemblyComponents.assemblyItemId, frontier),
+        ),
+      );
+
+    const next: string[] = [];
+    for (const edge of edges) {
+      if (edge.componentItemId === assemblyItemId) {
+        throw validation(
+          'This BOM would create a circular assembly reference: the assembly is (directly or indirectly) a component of itself.',
+        );
+      }
+      if (!visited.has(edge.componentItemId)) {
+        visited.add(edge.componentItemId);
+        next.push(edge.componentItemId);
+      }
+    }
+    frontier = next;
   }
 
   return inTransaction(ctx, async (tx) => {
@@ -267,6 +307,14 @@ export async function buildAssembly(
     throw validation('Assembly has no bill of materials. Add components before building.');
   }
 
+  // Builds are an average-cost operation: components are consumed at
+  // averageCost and layers are never touched. Refuse FIFO-tracked items
+  // (assembly and components alike), matching adjustInventory/recordCOGS.
+  await assertNotFifoTracked(ctx, input.assemblyItemId);
+  for (const bomLine of bom) {
+    await assertNotFifoTracked(ctx, bomLine.componentItemId);
+  }
+
   // Load all component items with a single query
   const componentIds = bom.map((b) => b.componentItemId);
   const componentRows = await ctx.db
@@ -370,13 +418,14 @@ export async function buildAssembly(
 /**
  * Unbuild `quantity` finished assemblies back into their components.
  *
- * The assembly's averageCost is used to distribute cost back to components
- * proportionally (each component gets back qty * assemblyAvgCost * componentFraction).
- * In practice, for the GL this is still all account 1300 — no GL posting needed.
- *
- * Component averageCost is NOT adjusted on return; quantity is simply restored.
- * (This mirrors QuickBooks' behavior where unbuilds restore qty at the component's
- * current average cost, without recalculating component averageCost.)
+ * The value removed from the assembly (unbuildQty * assembly.averageCost) is
+ * distributed back to the components proportionally to their current-cost
+ * share, and each component's averageCost is recalculated as a weighted
+ * average of its existing stock and the returned units at that distributed
+ * unit cost. Total item-level inventory value is therefore conserved exactly,
+ * which is what keeps the no-GL-posting design sound: account 1300 is
+ * unchanged and item-level valuation still ties to it even when component
+ * costs have drifted since the build.
  */
 export async function unbuildAssembly(
   ctx: ServiceContext,
@@ -405,6 +454,13 @@ export async function unbuildAssembly(
     throw validation('Assembly has no bill of materials.');
   }
 
+  // Same average-cost guard as buildAssembly: FIFO-tracked items must go
+  // through the FIFO endpoints, not item-level averageCost math.
+  await assertNotFifoTracked(ctx, input.assemblyItemId);
+  for (const bomLine of bom) {
+    await assertNotFifoTracked(ctx, bomLine.componentItemId);
+  }
+
   const componentIds = bom.map((b) => b.componentItemId);
   const componentRows = await ctx.db
     .select()
@@ -412,27 +468,72 @@ export async function unbuildAssembly(
     .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, componentIds)));
   const componentMap = new Map(componentRows.map((r) => [r.id, r]));
 
-  return inTransaction(ctx, async (tx) => {
-    // Restore each component's quantityOnHand
-    for (const bomLine of bom) {
-      const comp = componentMap.get(bomLine.componentItemId);
-      if (!comp) throw notFound(`Component item ${bomLine.componentItemId}`);
+  // Value being removed from the assembly item. The returned components must
+  // absorb exactly this value (not their current averageCost) so that total
+  // inventory value is conserved without a GL posting.
+  const removedValue = unbuildQty.times(Money.of(assembly.averageCost ?? '0'));
 
-      const returned = unbuildQty.times(Money.of(bomLine.quantity));
-      const newQty = Money.of(comp.quantityOnHand ?? '0').plus(returned);
+  // Distribute removedValue across components proportionally to their
+  // current-cost share; if every component carries a $0 averageCost,
+  // fall back to a quantity-based split.
+  const returnLines = bom.map((bomLine) => {
+    const comp = componentMap.get(bomLine.componentItemId);
+    if (!comp) throw notFound(`Component item ${bomLine.componentItemId}`);
+    const returned = unbuildQty.times(Money.of(bomLine.quantity));
+    const currentValue = returned.times(Money.of(comp.averageCost ?? '0'));
+    return { comp, returned, currentValue };
+  });
+
+  const totalCurrentValue = returnLines.reduce(
+    (sum, l) => sum.plus(l.currentValue),
+    Money.zero(),
+  );
+  const totalReturnedQty = returnLines.reduce(
+    (sum, l) => sum.plus(l.returned),
+    Money.zero(),
+  );
+
+  return inTransaction(ctx, async (tx) => {
+    // Restore each component's quantityOnHand, weighting the returned value
+    // share into the component's averageCost.
+    for (const line of returnLines) {
+      const { comp, returned } = line;
+
+      const share = totalCurrentValue.greaterThan(0)
+        ? line.currentValue.dividedBy(totalCurrentValue)
+        : totalReturnedQty.greaterThan(0)
+          ? returned.dividedBy(totalReturnedQty)
+          : Money.zero();
+      const valueReturned = removedValue.times(share);
+
+      const oldQty = Money.of(comp.quantityOnHand ?? '0');
+      const oldValue = oldQty.times(Money.of(comp.averageCost ?? '0'));
+      const newQty = oldQty.plus(returned);
+      const newAvgCost = newQty.isZero()
+        ? Money.zero()
+        : oldValue.plus(valueReturned).dividedBy(newQty);
 
       await tx.db
         .update(items)
-        .set({ quantityOnHand: newQty.toFixed(4), updatedAt: new Date() })
+        .set({
+          quantityOnHand: newQty.toFixed(4),
+          averageCost: newAvgCost.toFixed(4),
+          updatedAt: new Date(),
+        })
         .where(eq(items.id, comp.id));
 
       await writeAudit(tx, {
         action: 'update',
         entityType: 'item',
         entityId: comp.id,
-        oldValues: { quantityOnHand: comp.quantityOnHand },
+        oldValues: {
+          quantityOnHand: comp.quantityOnHand,
+          averageCost: comp.averageCost,
+        },
         newValues: {
           quantityOnHand: newQty.toFixed(4),
+          averageCost: newAvgCost.toFixed(4),
+          valueReturned: toAmountString(Money.round2(valueReturned)),
           reason: `assembly_unbuild:${input.assemblyItemId}`,
         },
       });

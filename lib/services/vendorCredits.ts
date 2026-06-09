@@ -79,7 +79,7 @@ async function resolveApAccount(ctx: ServiceContext): Promise<string> {
 export async function createVendorCredit(ctx: ServiceContext, input: CreateVendorCreditInput) {
   // Verify vendor belongs to this company.
   const [vendor] = await ctx.db
-    .select({ id: vendors.id })
+    .select({ id: vendors.id, name: vendors.displayName })
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
@@ -152,7 +152,7 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
 
     const entry = await postJournalEntry(tx, {
       date: input.date,
-      description: `Vendor Credit — ${vendor.id}`,
+      description: `Vendor Credit — ${vendor.name}`,
       sourceRef: `vendor_credit:${credit.id}`,
       lines: postingLines,
     });
@@ -287,19 +287,21 @@ export async function applyToBill(ctx: ServiceContext, input: ApplyToBillInput) 
       .where(eq(vendorCredits.id, input.vendorCreditId))
       .returning();
 
-    // Update bill's amountPaid and balanceDue.
-    const newAmountPaid = Money.round2(Money.of(bill.amountPaid).plus(applyAmount));
+    // Update bill's amountCredited and balanceDue. Credits are tracked separately
+    // from cash payments (amountPaid) so reports/void-guards don't conflate them:
+    // balanceDue = total - amountPaid - amountCredited.
+    const newAmountCredited = Money.round2(Money.of(bill.amountCredited).plus(applyAmount));
     const newBalanceDue = Money.round2(balanceDue.minus(applyAmount));
     const newBillStatus = newBalanceDue.isZero()
       ? 'paid'
-      : newAmountPaid.greaterThan(0)
+      : Money.of(bill.amountPaid).plus(newAmountCredited).greaterThan(0)
         ? 'partial'
         : 'open';
 
     const [updatedBill] = await tx.db
       .update(bills)
       .set({
-        amountPaid: toAmountString(newAmountPaid),
+        amountCredited: toAmountString(newAmountCredited),
         balanceDue: toAmountString(newBalanceDue),
         status: newBillStatus as never,
         updatedAt: new Date(),
@@ -320,6 +322,244 @@ export async function applyToBill(ctx: ServiceContext, input: ApplyToBillInput) 
     });
 
     return { credit: updatedCredit, bill: updatedBill };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// unapplyFromBill
+// ---------------------------------------------------------------------------
+
+export interface UnapplyFromBillInput {
+  vendorCreditId: string;
+  billId: string;
+  /** Amount to unapply (must be <= credit's applied amount and <= bill.amountCredited). */
+  amount: string | number;
+}
+
+/**
+ * Reverse a previous applyToBill: restore the credit's unapplied balance and
+ * give the bill back its balanceDue. No GL entry is involved (same as apply).
+ * This makes the "unapply first" instructions in voidBill / voidVendorCredit
+ * actually satisfiable.
+ */
+export async function unapplyFromBill(ctx: ServiceContext, input: UnapplyFromBillInput) {
+  const unapplyAmount = Money.round2(input.amount);
+
+  if (!unapplyAmount.greaterThan(0)) {
+    throw validation('Unapply amount must be greater than zero.');
+  }
+
+  // Load the vendor credit (scoped to company).
+  const [credit] = await ctx.db
+    .select()
+    .from(vendorCredits)
+    .where(and(eq(vendorCredits.id, input.vendorCreditId), eq(vendorCredits.companyId, ctx.companyId)));
+  if (!credit) throw notFound('Vendor credit');
+
+  if (credit.status === 'void') {
+    throw new ServiceError('CONFLICT', 'Cannot unapply a voided vendor credit.');
+  }
+
+  const appliedTotal = Money.of(credit.total).minus(Money.of(credit.unapplied));
+  if (unapplyAmount.greaterThan(appliedTotal)) {
+    throw validation(
+      `Unapply amount ${toAmountString(unapplyAmount)} exceeds the credit's applied amount ${toAmountString(appliedTotal)}.`,
+    );
+  }
+
+  // Load the bill (scoped to company).
+  const [bill] = await ctx.db
+    .select()
+    .from(bills)
+    .where(and(eq(bills.id, input.billId), eq(bills.companyId, ctx.companyId)));
+  if (!bill) throw notFound('Bill');
+
+  if (bill.status === 'void') {
+    throw new ServiceError('CONFLICT', 'Cannot unapply a credit from a voided bill.');
+  }
+  if (credit.vendorId !== bill.vendorId) {
+    throw validation('Vendor credit and bill must belong to the same vendor.');
+  }
+
+  const billCredited = Money.of(bill.amountCredited);
+  if (unapplyAmount.greaterThan(billCredited)) {
+    throw validation(
+      `Unapply amount ${toAmountString(unapplyAmount)} exceeds the bill's credited amount ${toAmountString(billCredited)}.`,
+    );
+  }
+
+  return inTransaction(ctx, async (tx) => {
+    // Restore the credit's unapplied balance.
+    const newUnapplied = Money.round2(Money.of(credit.unapplied).plus(unapplyAmount));
+    const newCreditStatus = newUnapplied.greaterThanOrEqualTo(Money.of(credit.total))
+      ? 'open'
+      : 'partial';
+
+    const [updatedCredit] = await tx.db
+      .update(vendorCredits)
+      .set({
+        unapplied: toAmountString(newUnapplied),
+        status: newCreditStatus as never,
+      })
+      .where(eq(vendorCredits.id, input.vendorCreditId))
+      .returning();
+
+    // Restore the bill's balanceDue and reduce amountCredited.
+    const newAmountCredited = Money.round2(billCredited.minus(unapplyAmount));
+    const newBalanceDue = Money.round2(Money.of(bill.balanceDue).plus(unapplyAmount));
+    const newBillStatus = newBalanceDue.isZero()
+      ? 'paid'
+      : Money.of(bill.amountPaid).plus(newAmountCredited).greaterThan(0)
+        ? 'partial'
+        : 'open';
+
+    const [updatedBill] = await tx.db
+      .update(bills)
+      .set({
+        amountCredited: toAmountString(newAmountCredited),
+        balanceDue: toAmountString(newBalanceDue),
+        status: newBillStatus as never,
+        updatedAt: new Date(),
+      })
+      .where(eq(bills.id, input.billId))
+      .returning();
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'vendor_credit',
+      entityId: input.vendorCreditId,
+      newValues: {
+        action: 'unapplied_from_bill',
+        billId: input.billId,
+        amount: toAmountString(unapplyAmount),
+        newUnapplied: toAmountString(newUnapplied),
+      },
+    });
+
+    return { credit: updatedCredit, bill: updatedBill };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// refundVendorCredit
+// ---------------------------------------------------------------------------
+
+export interface RefundVendorCreditInput {
+  vendorCreditId: string;
+  /** Bank account the vendor's refund is deposited into. */
+  bankAccountId: string;
+  /** Refund amount; must be <= the credit's unapplied balance. */
+  amount: string | number;
+  date?: Date | null;
+  memo?: string | null;
+}
+
+/**
+ * Record a vendor refund (cash back) against a vendor credit's unapplied balance.
+ *
+ * Posting:
+ *   Dr  bank account              amount   — money arrives in the bank
+ *   Cr  2000 Accounts Payable     amount   — restores the A/P the credit debited
+ *
+ * The original credit debited A/P (reducing the liability); the vendor settling
+ * that credit in cash restores A/P by the same amount while the credit's
+ * unapplied balance is consumed (refundedAmount += amount). Net A/P from the
+ * credit + refund pair is zero, and the A/P control account stays equal to the
+ * open-bill / open-credit subledger.
+ */
+export async function refundVendorCredit(ctx: ServiceContext, input: RefundVendorCreditInput) {
+  const [credit] = await ctx.db
+    .select()
+    .from(vendorCredits)
+    .where(
+      and(eq(vendorCredits.id, input.vendorCreditId), eq(vendorCredits.companyId, ctx.companyId)),
+    );
+  if (!credit) throw notFound('Vendor credit');
+  if (credit.status === 'void') {
+    throw new ServiceError('CONFLICT', 'Cannot refund a voided vendor credit.');
+  }
+
+  const amount = Money.round2(input.amount);
+  if (!amount.greaterThan(0)) throw validation('Refund amount must be greater than zero.');
+  const unapplied = Money.of(credit.unapplied);
+  if (amount.greaterThan(unapplied)) {
+    throw validation(
+      `Refund amount ${toAmountString(amount)} exceeds the credit's unapplied balance ${toAmountString(unapplied)}.`,
+    );
+  }
+
+  // Validate the bank account: company-owned bank/cash asset.
+  const [bankAcct] = await ctx.db
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype })
+    .from(accounts)
+    .where(and(eq(accounts.id, input.bankAccountId), eq(accounts.companyId, ctx.companyId)));
+  if (!bankAcct) throw notFound('Bank account');
+  if (
+    bankAcct.type !== 'asset' ||
+    bankAcct.subtype === 'accounts_receivable' ||
+    bankAcct.subtype === 'inventory'
+  ) {
+    throw validation('Vendor refunds must be deposited into a bank/cash account.');
+  }
+
+  const apAccountId = await resolveApAccount(ctx);
+  const refundDate = input.date ?? new Date();
+
+  return inTransaction(ctx, async (tx) => {
+    // 1. Post the refund receipt.
+    const entry = await postJournalEntry(tx, {
+      date: refundDate,
+      description: input.memo ?? 'Vendor refund received',
+      sourceRef: `refund:${input.vendorCreditId}`,
+      lines: [
+        {
+          accountId: input.bankAccountId,
+          debit: toAmountString(amount),
+          memo: 'Vendor refund deposited',
+        },
+        {
+          accountId: apAccountId,
+          credit: toAmountString(amount),
+          memo: 'Vendor credit settled in cash',
+        },
+      ],
+    });
+
+    // 2. Consume the credit's unapplied balance.
+    const newUnapplied = Money.round2(unapplied.minus(amount));
+    const newRefunded = Money.round2(Money.of(credit.refundedAmount).plus(amount));
+    const newStatus = newUnapplied.isZero() ? 'closed' : 'partial';
+
+    const [updatedCredit] = await tx.db
+      .update(vendorCredits)
+      .set({
+        unapplied: toAmountString(newUnapplied),
+        refundedAmount: toAmountString(newRefunded),
+        status: newStatus as never,
+      })
+      .where(eq(vendorCredits.id, input.vendorCreditId))
+      .returning();
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'vendor_credit',
+      entityId: input.vendorCreditId,
+      oldValues: {
+        unapplied: toAmountString(unapplied),
+        refundedAmount: credit.refundedAmount,
+        status: credit.status,
+      },
+      newValues: {
+        action: 'refund',
+        amount: toAmountString(amount),
+        bankAccountId: input.bankAccountId,
+        unapplied: toAmountString(newUnapplied),
+        refundedAmount: toAmountString(newRefunded),
+        postedEntryId: entry.id,
+      },
+    });
+
+    return { credit: updatedCredit, entry };
   });
 }
 

@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { Layers, Plus, Trash2, Hammer } from 'lucide-react';
+import { Combine, Layers, Plus, Trash2, Hammer } from 'lucide-react';
 import {
   Button,
   Card,
@@ -14,11 +14,19 @@ import {
   Td,
   Tr,
   PageHeader,
+  EmptyState,
+  Spinner,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { formatCurrency } from '@/lib/money';
+import { formatCurrency, Money } from '@/lib/money';
+
+/** Display a decimal quantity without trailing-zero noise (max 4dp). */
+function formatQty(value: string | number | null | undefined): string {
+  return parseFloat(String(value ?? '0') || '0').toLocaleString(undefined, {
+    maximumFractionDigits: 4,
+  });
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -208,27 +216,27 @@ export default function AssembliesPage() {
   // Items available as components (not the assembly itself)
   const componentCandidates = allItems.filter((i) => i.id !== selectedAssemblyId);
 
-  // BOM cost estimate
+  // BOM cost estimate (decimal-safe — never float math for money)
   const estimatedCost = draftRows.reduce((sum, row) => {
     const comp = allItems.find((i) => i.id === row.componentItemId);
     if (!comp || !comp.averageCost) return sum;
-    return sum + parseFloat(comp.averageCost) * parseFloat(row.quantity || '0');
-  }, 0);
+    return sum.plus(Money.mul(comp.averageCost, row.quantity || '0'));
+  }, Money.zero());
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
-
-      <PageHeader title="Inventory Assemblies" icon={Layers} />
+      <PageHeader title="Inventory Assemblies" icon={Combine} />
 
       {/* Assembly selector */}
       <Card className="p-6 mb-6">
         <div className="max-w-md">
           <Label htmlFor="asm-select">Select Assembly Item</Label>
           {loadingItems ? (
-            <div className="text-navy/40 text-sm py-2">Loading items…</div>
+            <div className="flex items-center gap-2 text-navy/40 text-sm py-2">
+              <Spinner className="h-4 w-4" /> Loading items…
+            </div>
           ) : (
             <Select
               id="asm-select"
@@ -251,7 +259,7 @@ export default function AssembliesPage() {
               <span>
                 On hand:{' '}
                 <span className="font-semibold text-navy">
-                  {parseFloat(selectedAssembly.quantityOnHand ?? '0').toFixed(4)}
+                  {formatQty(selectedAssembly.quantityOnHand)}
                 </span>
               </span>
               <span>
@@ -278,25 +286,27 @@ export default function AssembliesPage() {
                 <Button variant="secondary" size="sm" onClick={addDraftRow}>
                   <Plus className="h-4 w-4" /> Add Component
                 </Button>
-                <Button
-                  size="sm"
-                  onClick={saveBom}
-                  disabled={savingBom}
-                >
-                  {savingBom ? 'Saving…' : 'Save BOM'}
+                <Button size="sm" onClick={saveBom} loading={savingBom}>
+                  Save BOM
                 </Button>
               </div>
             </div>
 
             {loadingBom ? (
-              <div className="text-center text-navy/40 text-sm py-8">Loading BOM…</div>
-            ) : draftRows.length === 0 ? (
-              <div className="text-center py-8">
-                <Layers className="mx-auto h-8 w-8 text-navy/20 mb-2" />
-                <p className="text-navy/40 text-sm">
-                  No components. Click &quot;Add Component&quot; to define the bill of materials.
-                </p>
+              <div className="flex items-center justify-center gap-2 text-navy/40 text-sm py-8">
+                <Spinner className="h-4 w-4" /> Loading BOM…
               </div>
+            ) : draftRows.length === 0 ? (
+              <EmptyState
+                icon={Layers}
+                title="No components yet"
+                message="Define the bill of materials by adding the component items this assembly is built from."
+                action={
+                  <Button variant="secondary" onClick={addDraftRow}>
+                    <Plus className="h-4 w-4" /> Add Component
+                  </Button>
+                }
+              />
             ) : (
               <>
                 <Table>
@@ -304,8 +314,8 @@ export default function AssembliesPage() {
                     <tr>
                       <Th>Component Item</Th>
                       <Th className="w-36">Qty per Assembly</Th>
-                      <Th className="text-right">Unit Cost</Th>
-                      <Th className="text-right">On Hand</Th>
+                      <Th numeric>Unit Cost</Th>
+                      <Th numeric>On Hand</Th>
                       <Th className="w-12"></Th>
                     </tr>
                   </thead>
@@ -337,13 +347,11 @@ export default function AssembliesPage() {
                               onChange={(e) => updateDraftRow(idx, 'quantity', e.target.value)}
                             />
                           </Td>
-                          <Td className="text-right tabular-nums text-sm">
+                          <Td numeric className="text-sm">
                             {comp?.averageCost ? formatCurrency(comp.averageCost) : '—'}
                           </Td>
-                          <Td className="text-right tabular-nums text-sm">
-                            {comp?.quantityOnHand
-                              ? parseFloat(comp.quantityOnHand).toFixed(4)
-                              : '—'}
+                          <Td numeric className="text-sm">
+                            {comp?.quantityOnHand ? formatQty(comp.quantityOnHand) : '—'}
                           </Td>
                           <Td>
                             <Button
@@ -402,15 +410,9 @@ export default function AssembliesPage() {
                 />
               </div>
 
-              <Button onClick={handleBuildAction} disabled={building || bom.length === 0}>
+              <Button onClick={handleBuildAction} loading={building} disabled={bom.length === 0}>
                 <Hammer className="h-4 w-4" />
-                {building
-                  ? buildAction === 'build'
-                    ? 'Building…'
-                    : 'Unbuilding…'
-                  : buildAction === 'build'
-                  ? 'Build Assembly'
-                  : 'Unbuild Assembly'}
+                {buildAction === 'build' ? 'Build Assembly' : 'Unbuild Assembly'}
               </Button>
             </div>
 
@@ -429,7 +431,7 @@ export default function AssembliesPage() {
                     return (
                       <li key={row.id}>
                         Consume{' '}
-                        <span className="font-semibold text-navy">{consumed.toFixed(4)}</span>{' '}
+                        <span className="font-semibold text-navy">{formatQty(consumed)}</span>{' '}
                         unit(s) of{' '}
                         <span className="font-semibold text-navy">{row.componentName}</span>
                       </li>
@@ -437,7 +439,7 @@ export default function AssembliesPage() {
                   })}
                   <li className="pt-1 border-t border-navy/10 mt-1">
                     Produce{' '}
-                    <span className="font-semibold text-navy">{parseFloat(buildQty || '0').toFixed(4)}</span>{' '}
+                    <span className="font-semibold text-navy">{formatQty(buildQty || '0')}</span>{' '}
                     unit(s) of{' '}
                     <span className="font-semibold text-navy">{selectedAssembly?.name}</span>
                   </li>

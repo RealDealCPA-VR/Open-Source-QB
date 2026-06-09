@@ -7,15 +7,19 @@
  *  2. Fallback: `ensureDevCompany` (first-run / dev / no session), still honoring a selected
  *     company cookie if present.
  */
-import { cookies } from 'next/headers';
+import { cookies, headers } from 'next/headers';
 import { and, eq } from 'drizzle-orm';
-import { getDb } from '@/lib/db';
-import { ensureDevCompany } from '@/lib/services/company';
-import { companies, userCompanies } from '@/lib/db/schema';
+import { getDb, type DB } from '@/lib/db';
+import { ensureDevCompany, verifyClosingDatePassword } from '@/lib/services/company';
+import { getRole } from '@/lib/services/rbac';
+import { companies, userCompanies, users } from '@/lib/db/schema';
 import { getSessionUserId } from '@/lib/auth';
-import type { ServiceContext } from '@/lib/services/_base';
+import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 
 export const COMPANY_COOKIE = 'bka_company';
+
+/** Header carrying the closing-date password for this request (QB Set Closing Date override). */
+export const CLOSING_PASSWORD_HEADER = 'x-closing-password';
 
 async function selectedCompanyCookie(): Promise<string | undefined> {
   try {
@@ -24,6 +28,23 @@ async function selectedCompanyCookie(): Promise<string | undefined> {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * If the request carries an x-closing-password header, verify it against the company's
+ * closing-date password hash. A valid password (or any explicit attempt when no password is
+ * configured) unlocks postings dated on/before the closing date for THIS request only.
+ */
+async function resolveClosingDateOverride(db: DB, companyId: string): Promise<boolean> {
+  let supplied: string | null = null;
+  try {
+    const h = await headers();
+    supplied = h.get(CLOSING_PASSWORD_HEADER);
+  } catch {
+    return false;
+  }
+  if (supplied === null) return false;
+  return verifyClosingDatePassword(db, companyId, supplied);
 }
 
 export async function getServerContext(): Promise<ServiceContext> {
@@ -56,15 +77,33 @@ export async function getServerContext(): Promise<ServiceContext> {
         .limit(1);
       companyId = owned?.id;
     }
-    if (companyId) return { db, companyId, userId };
+    if (companyId) {
+      // RBAC: load the member's role so the service layer can reject viewer mutations
+      // centrally (writeAudit/inTransaction in lib/services/_base.ts).
+      const role = (await getRole({ db, companyId, userId })) ?? undefined;
+      const closingDateOverride = await resolveClosingDateOverride(db, companyId);
+      return { db, companyId, userId, role, closingDateOverride };
+    }
   }
 
-  // Fallback (no/invalid session, dev, first run).
-  const fb = await ensureDevCompany(db);
-  const sel = await selectedCompanyCookie();
-  if (sel) {
-    const [c] = await db.select().from(companies).where(eq(companies.id, sel));
-    if (c) return { db, companyId: c.id, userId: c.ownerId };
+  // No valid authenticated session.
+  //
+  // SECURITY: never honor a client-supplied bka_company cookie here and never impersonate
+  // an existing tenant. Doing so previously let an unauthenticated caller hit any API route
+  // as an arbitrary company's owner (the API layer is not gated by middleware).
+  //
+  // The only legitimate session-less path is genuine first-run/seed, before any account
+  // exists, so onboarding can boot. Once any user exists, fail closed (HTTP 403 via the
+  // route error handlers). An explicit BKA_ALLOW_DEV_FALLBACK=1 re-opens the old dev behavior.
+  const allowDevFallback = process.env.BKA_ALLOW_DEV_FALLBACK === '1';
+  if (!allowDevFallback) {
+    const [anyUser] = await db.select({ id: users.id }).from(users).limit(1);
+    if (anyUser) {
+      throw new ServiceError('FORBIDDEN', 'Authentication required.');
+    }
   }
-  return { db, companyId: fb.companyId, userId: fb.userId };
+  const fb = await ensureDevCompany(db);
+  // First-run/dev fallback acts as the company owner.
+  const closingDateOverride = await resolveClosingDateOverride(db, fb.companyId);
+  return { db, companyId: fb.companyId, userId: fb.userId, role: 'owner', closingDateOverride };
 }

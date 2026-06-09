@@ -12,6 +12,7 @@ import { accounts, budgetLines, budgets, classes, journalEntries, journalEntryLi
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { notFound } from './_base';
+import { notFiscalCloseEntry } from './reports';
 
 // ---------------------------------------------------------------------------
 // Shared constants
@@ -59,6 +60,8 @@ export async function profitAndLossByClass(
   const entryConds = [
     eq(journalEntries.companyId, ctx.companyId),
     eq(journalEntries.status, 'posted'),
+    // Year-end closing entries must not wipe out closed-year P&L history.
+    notFiscalCloseEntry(),
   ];
   if (range?.from) entryConds.push(sql`${journalEntries.date} >= ${range.from}`);
   if (range?.to) entryConds.push(lte(journalEntries.date, range.to));
@@ -220,11 +223,14 @@ export interface BudgetVsActualByClassRow {
   accountId: string;
   code: string;
   name: string;
+  accountType: 'revenue' | 'expense';
   classId: string; // UNCLASSIFIED_ID for null
   className: string;
   budget: string;
   actual: string;
   variance: string; // actual - budget
+  /** Revenue favorable when actual >= budget; expense favorable when actual <= budget. */
+  favorable: boolean;
 }
 
 export interface BudgetVsActualByClassResult {
@@ -232,6 +238,15 @@ export interface BudgetVsActualByClassResult {
   budgetName: string;
   fiscalYear: number;
   rows: BudgetVsActualByClassRow[];
+  /** Income (revenue) section totals across all classes. */
+  income: { budget: string; actual: string; variance: string };
+  /** Expense section totals across all classes. */
+  expense: { budget: string; actual: string; variance: string };
+  /**
+   * Net bottom line (income - expense). The legacy totalBudget/totalActual/
+   * totalVariance fields carry these net figures — income and expenses are never
+   * summed together as one mixed total.
+   */
   totalBudget: string;
   totalActual: string;
   totalVariance: string;
@@ -254,18 +269,6 @@ export async function budgetVsActualByClass(
     .from(budgetLines)
     .where(eq(budgetLines.budgetId, budgetId));
 
-  if (lines.length === 0) {
-    return {
-      budgetId,
-      budgetName: budget.name,
-      fiscalYear: budget.fiscalYear,
-      rows: [],
-      totalBudget: '0.00',
-      totalActual: '0.00',
-      totalVariance: '0.00',
-    };
-  }
-
   // Aggregate budget by (accountId, classId).
   // Map key = "accountId|classId" (classId may be null -> UNCLASSIFIED_ID).
   const budgetMap = new Map<string, ReturnType<typeof Money.zero>>();
@@ -278,30 +281,10 @@ export async function budgetVsActualByClass(
     budgetMap.set(k, prev.plus(Money.of(line.amount)));
   }
 
-  // ---- Collect account ids and class ids referenced in budget lines ----
-  const budgetAccountIds = [...new Set(lines.map((l) => l.accountId))];
-  const budgetClassIds = [
-    ...new Set(lines.map((l) => l.classId).filter((id): id is string => id !== null)),
-  ];
-
-  // ---- Load account metadata (type, code, name) ----
-  const accountRows = await ctx.db
-    .select({ id: accounts.id, code: accounts.code, name: accounts.name, type: accounts.type })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, budgetAccountIds)));
-  const accountMeta = new Map(accountRows.map((a) => [a.id, a]));
-
-  // ---- Load class names ----
-  const classNameMap = new Map<string, string>();
-  if (budgetClassIds.length > 0) {
-    const classRows = await ctx.db
-      .select({ id: classes.id, name: classes.name })
-      .from(classes)
-      .where(and(eq(classes.companyId, ctx.companyId), inArray(classes.id, budgetClassIds)));
-    for (const c of classRows) classNameMap.set(c.id, c.name);
-  }
-
-  // ---- Query actual posted lines for the budget's fiscal year ----
+  // ---- Query actual posted P&L lines for the budget's fiscal year ----
+  // Not restricted to budgeted accounts: actuals with no matching budget line must
+  // still appear (with budget 0.00) so totals reflect real activity. Closing
+  // entries are excluded so a closed year keeps its actuals.
   const from = new Date(`${budget.fiscalYear}-01-01T00:00:00.000Z`);
   const to = new Date(`${budget.fiscalYear}-12-31T23:59:59.999Z`);
 
@@ -309,61 +292,110 @@ export async function budgetVsActualByClass(
     .select({
       accountId: journalEntryLines.accountId,
       classId: journalEntryLines.classId,
+      accountType: accounts.type,
       debit: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`,
       credit: sql<string>`COALESCE(SUM(${journalEntryLines.credit}), 0)`,
     })
     .from(journalEntryLines)
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
     .where(
       and(
         eq(journalEntries.companyId, ctx.companyId),
         eq(journalEntries.status, 'posted'),
+        notFiscalCloseEntry(),
         sql`${journalEntries.date} >= ${from}`,
         lte(journalEntries.date, to),
-        inArray(journalEntryLines.accountId, budgetAccountIds),
+        inArray(accounts.type, ['revenue', 'expense']),
       ),
     )
-    .groupBy(journalEntryLines.accountId, journalEntryLines.classId);
+    .groupBy(journalEntryLines.accountId, journalEntryLines.classId, accounts.type);
 
   // Build actual map keyed by (accountId, classId).
   const actualMap = new Map<string, ReturnType<typeof Money.zero>>();
   for (const ar of actualRows) {
-    const meta = accountMeta.get(ar.accountId);
-    if (!meta) continue;
-    const type = meta.type as string;
     // Natural balance per account type
     const naturalAmt =
-      type === 'revenue' ? Money.sub(ar.credit, ar.debit) : Money.sub(ar.debit, ar.credit);
+      ar.accountType === 'revenue' ? Money.sub(ar.credit, ar.debit) : Money.sub(ar.debit, ar.credit);
     const k = keyOf(ar.accountId, ar.classId);
     const prev = actualMap.get(k) ?? Money.zero();
     actualMap.set(k, prev.plus(naturalAmt));
   }
 
-  // ---- Build result rows ----
-  const resultRows: BudgetVsActualByClassRow[] = [];
-  let totalBudget = Money.zero();
-  let totalActual = Money.zero();
+  // ---- Load account metadata for the union of budgeted + actual accounts ----
+  const allAccountIds = [
+    ...new Set([...lines.map((l) => l.accountId), ...actualRows.map((r) => r.accountId)]),
+  ];
+  const accountMeta = new Map<
+    string,
+    { id: string; code: string; name: string; type: 'asset' | 'liability' | 'equity' | 'revenue' | 'expense' }
+  >();
+  if (allAccountIds.length > 0) {
+    const accountRows = await ctx.db
+      .select({ id: accounts.id, code: accounts.code, name: accounts.name, type: accounts.type })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, allAccountIds)));
+    for (const a of accountRows) accountMeta.set(a.id, a);
+  }
 
-  for (const [key, budgetAmt] of budgetMap) {
+  // ---- Load class names for the union of budgeted + actual classes ----
+  const allClassIds = [
+    ...new Set(
+      [...lines.map((l) => l.classId), ...actualRows.map((r) => r.classId)].filter(
+        (id): id is string => id !== null,
+      ),
+    ),
+  ];
+  const classNameMap = new Map<string, string>();
+  if (allClassIds.length > 0) {
+    const classRows = await ctx.db
+      .select({ id: classes.id, name: classes.name })
+      .from(classes)
+      .where(and(eq(classes.companyId, ctx.companyId), inArray(classes.id, allClassIds)));
+    for (const c of classRows) classNameMap.set(c.id, c.name);
+  }
+
+  // ---- Build result rows from the union of budgeted and actual keys ----
+  const allKeys = new Set<string>([...budgetMap.keys(), ...actualMap.keys()]);
+  const resultRows: BudgetVsActualByClassRow[] = [];
+  let incomeBudget = Money.zero();
+  let incomeActual = Money.zero();
+  let expenseBudget = Money.zero();
+  let expenseActual = Money.zero();
+
+  for (const key of allKeys) {
     const [accountId, cid] = key.split('|');
     const meta = accountMeta.get(accountId);
     if (!meta) continue; // account deleted — skip
+    // Legacy budget lines on balance-sheet accounts have no P&L actuals — skip.
+    if (meta.type !== 'revenue' && meta.type !== 'expense') continue;
 
+    const isRevenue = meta.type === 'revenue';
+    const budgetAmt = budgetMap.get(key) ?? Money.zero();
     const actualAmt = actualMap.get(key) ?? Money.zero();
     const variance = actualAmt.minus(budgetAmt);
 
-    totalBudget = totalBudget.plus(budgetAmt);
-    totalActual = totalActual.plus(actualAmt);
+    if (isRevenue) {
+      incomeBudget = incomeBudget.plus(budgetAmt);
+      incomeActual = incomeActual.plus(actualAmt);
+    } else {
+      expenseBudget = expenseBudget.plus(budgetAmt);
+      expenseActual = expenseActual.plus(actualAmt);
+    }
 
     resultRows.push({
       accountId,
       code: meta.code,
       name: meta.name,
+      accountType: meta.type,
       classId: cid,
       className: cid === UNCLASSIFIED_ID ? UNCLASSIFIED_NAME : (classNameMap.get(cid) ?? cid),
       budget: toAmountString(budgetAmt),
       actual: toAmountString(actualAmt),
       variance: toAmountString(variance),
+      favorable: isRevenue
+        ? actualAmt.greaterThanOrEqualTo(budgetAmt)
+        : actualAmt.lessThanOrEqualTo(budgetAmt),
     });
   }
 
@@ -373,15 +405,28 @@ export async function budgetVsActualByClass(
     return a.className.localeCompare(b.className);
   });
 
-  const totalVariance = totalActual.minus(totalBudget);
+  const netBudget = incomeBudget.minus(expenseBudget);
+  const netActual = incomeActual.minus(expenseActual);
+  const netVariance = netActual.minus(netBudget);
 
   return {
     budgetId,
     budgetName: budget.name,
     fiscalYear: budget.fiscalYear,
     rows: resultRows,
-    totalBudget: toAmountString(totalBudget),
-    totalActual: toAmountString(totalActual),
-    totalVariance: toAmountString(totalVariance),
+    income: {
+      budget: toAmountString(incomeBudget),
+      actual: toAmountString(incomeActual),
+      variance: toAmountString(incomeActual.minus(incomeBudget)),
+    },
+    expense: {
+      budget: toAmountString(expenseBudget),
+      actual: toAmountString(expenseActual),
+      variance: toAmountString(expenseActual.minus(expenseBudget)),
+    },
+    // Legacy fields now carry the net bottom line (income - expense).
+    totalBudget: toAmountString(netBudget),
+    totalActual: toAmountString(netActual),
+    totalVariance: toAmountString(netVariance),
   };
 }

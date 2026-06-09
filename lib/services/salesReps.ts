@@ -255,6 +255,8 @@ export async function commissionReport(
   const conds = [
     eq(invoices.companyId, ctx.companyId),
     isNotNull(invoices.salesRepId),
+    // Void/draft invoices must not earn commission.
+    sql`${invoices.status} NOT IN ('void', 'draft')`,
   ];
   if (range?.from) conds.push(gte(invoices.date, range.from));
   if (range?.to) conds.push(lte(invoices.date, range.to));

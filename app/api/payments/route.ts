@@ -57,7 +57,9 @@ export async function GET(req: NextRequest) {
  *   reference?:       string,
  *   amount:           string (decimal, e.g. "1500.00"),
  *   depositAccountId?: string (uuid — defaults to Undeposited Funds),
- *   applications:     Array<{ invoiceId: string, amountApplied: string }>
+ *   applications:     Array<{ invoiceId: string, amountApplied: string }>,
+ *   currency?:        string (ISO 4217 — defaults to base currency),
+ *   exchangeRate?:    string (base units per 1 payment-currency unit — defaults to 1)
  * }
  */
 export async function POST(req: NextRequest) {
@@ -93,6 +95,8 @@ export async function POST(req: NextRequest) {
       amount: body.amount,
       depositAccountId: body.depositAccountId ?? null,
       applications: body.applications,
+      currency: body.currency ?? null,
+      exchangeRate: body.exchangeRate ?? null,
     });
 
     return NextResponse.json(result, { status: 201 });

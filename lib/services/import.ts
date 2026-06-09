@@ -26,7 +26,7 @@ import { and, eq } from 'drizzle-orm';
 import { bankAccounts, bankTransactions, fileImports } from '@/lib/db/schema';
 import { toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, notFound, validation, writeAudit } from './_base';
-import { listRules, applyRules } from './rules';
+import { listRules, matchRule } from './rules';
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -112,7 +112,13 @@ function parseOFXSgml(content: string): OFXNode {
   const idx = content.search(/<OFX[\s>]/i);
   const body = idx === -1 ? content.trim() : content.slice(idx).trim();
 
-  const lines = body.split(/\r?\n/);
+  // Normalize: insert a line break before every tag so single-line SGML/XML files
+  // become one-tag-per-line (semantically a no-op for already-multiline files).
+  // Note ">\n<" alone would NOT be enough: in single-line SGML a leaf value is
+  // followed directly by the next "<" with no ">" boundary (<TRNTYPE>DEBIT<DTPOSTED>…),
+  // so we split before every "<". Stray close tags this produces for XML leafs
+  // (e.g. "</NAME>" after "<NAME>ACME") are ignored by the close-tag handler below.
+  const lines = body.replace(/</g, '\n<').split(/\r?\n/);
   // Stack entries: the object being built + the tag name that opened it.
   const stack: Array<{ tag: string; obj: OFXNode }> = [];
   const root: OFXNode = {};
@@ -122,16 +128,26 @@ function parseOFXSgml(content: string): OFXNode {
     const line = rawLine.trim();
     if (!line) continue;
 
-    // Closing tag: </TAG>
+    // Processing instruction (<?xml ...?> / <?OFX ...?> in OFX 2.x) — skip.
+    if (line.startsWith('<?')) continue;
+
+    // Closing tag: </TAG>. Pop back to the matching container; a close tag that
+    // matches no open container (an XML leaf's close that landed on its own line
+    // after normalization) is ignored rather than popping the wrong frame.
     const closeMatch = line.match(/^<\/([A-Z0-9_.]+)>$/i);
     if (closeMatch) {
-      stack.pop();
-      current = stack.length > 0 ? stack[stack.length - 1].obj : root;
+      const tag = closeMatch[1].toUpperCase();
+      const idx = stack.map((f) => f.tag).lastIndexOf(tag);
+      if (idx !== -1) {
+        stack.length = idx;
+        current = stack.length > 0 ? stack[stack.length - 1].obj : root;
+      }
       continue;
     }
 
-    // Leaf tag with value on same line: <TAG>value (no closing tag in SGML)
-    const leafMatch = line.match(/^<([A-Z0-9_.]+)>(.+)$/i);
+    // Leaf tag with value on same line: <TAG>value (SGML, no closing tag) or
+    // <TAG>value</TAG> (OFX 2.x XML) — the optional matching close tag is stripped.
+    const leafMatch = line.match(/^<([A-Z0-9_.]+)>([^<]+?)(?:<\/\1>)?$/i);
     if (leafMatch) {
       const tag = leafMatch[1].toUpperCase();
       const value = leafMatch[2].trim();
@@ -196,7 +212,12 @@ export function parseOFX(content: string): ParsedTransaction[] {
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  if (!(doc as any)?.OFX) throw new ServiceError('VALIDATION', 'No <OFX> root element found.');
+  const ofxRoot = (doc as any)?.OFX;
+  // A string-valued OFX root means the file did not parse into a tree (e.g. a
+  // malformed single-line body) — fail loudly rather than "succeeding" with 0 rows.
+  if (!ofxRoot || typeof ofxRoot !== 'object') {
+    throw new ServiceError('VALIDATION', 'No <OFX> root element found.');
+  }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const stmtList = findBankTranList(doc) as any;
@@ -239,6 +260,34 @@ export const parseQBO = parseOFX;
  * Positive amounts are deposits; negative are withdrawals (standard convention).
  * If debitCol/creditCol are provided, debits are stored as negative and credits as positive.
  */
+/**
+ * Parse a date string against an explicit format hint (e.g. "DD/MM/YYYY", "MM-DD-YYYY",
+ * "YYYY/MM/DD"). Tokenizes both the format and the value on / - . and assigns components by
+ * the format token, building a UTC date (mirroring parseOFXDate to avoid local-tz drift).
+ * Returns an Invalid Date on any structural mismatch so the caller surfaces a VALIDATION error.
+ */
+function parseWithFormat(rawDate: string, format: string): Date {
+  const sep = /[/.\-]/;
+  const fmtTokens = format.split(sep);
+  const valTokens = rawDate.split(sep);
+  if (fmtTokens.length !== valTokens.length) return new Date(NaN);
+
+  let day = 1;
+  let month = 1;
+  let year = 1970;
+  for (let k = 0; k < fmtTokens.length; k++) {
+    const t = fmtTokens[k].trim().toUpperCase();
+    const raw = valTokens[k].trim();
+    const v = parseInt(raw, 10);
+    if (Number.isNaN(v)) return new Date(NaN);
+    if (t.startsWith('D')) day = v;
+    else if (t.startsWith('M')) month = v;
+    else if (t.startsWith('Y')) year = raw.length === 2 ? 2000 + v : v;
+  }
+  if (month < 1 || month > 12 || day < 1 || day > 31) return new Date(NaN);
+  return new Date(Date.UTC(year, month - 1, day));
+}
+
 export function parseCSV(content: string, mapping: CsvMapping): ParsedTransaction[] {
   const result = Papa.parse<Record<string, string>>(content, {
     header: true,
@@ -259,10 +308,11 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
       return (row[key] ?? row[key.toString()] ?? '').trim();
     };
 
-    // Date
+    // Date — honor the caller's declared dateFormat so ambiguous values like "03/04/2024"
+    // are not silently misread by the engine's locale-dependent Date parser.
     const rawDate = col(mapping.dateCol);
     if (!rawDate) throw new ServiceError('VALIDATION', `CSV row ${i + 1}: missing date value.`);
-    const date = new Date(rawDate);
+    const date = mapping.dateFormat ? parseWithFormat(rawDate, mapping.dateFormat) : new Date(rawDate);
     if (isNaN(date.getTime())) {
       throw new ServiceError('VALIDATION', `CSV row ${i + 1}: cannot parse date "${rawDate}".`);
     }
@@ -309,8 +359,14 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
  *
  * We prefix it with "csv-hash:" so it cannot collide with a real OFX FITID.
  */
-function hashFitId(txn: { date: Date; description: string; amount: string }): string {
-  const raw = `${txn.date.toISOString()}|${txn.description}|${txn.amount}`;
+function hashFitId(
+  txn: { date: Date; description: string; amount: string },
+  occurrence = 0,
+): string {
+  // The occurrence index disambiguates legitimately-repeated identical lines within one file
+  // (e.g. two $5.00 coffees on the same day), so they are not collapsed into a single key and
+  // a re-import still round-trips each occurrence to its own prior row.
+  const raw = `${txn.date.toISOString()}|${txn.description}|${txn.amount}|${occurrence}`;
   return 'csv-hash:' + createHash('sha256').update(raw).digest('hex').slice(0, 32);
 }
 
@@ -396,9 +452,13 @@ export async function importTransactions(
 
   // 4a. Apply hash-based fitId fallback for CSV rows that have no fitId.
   //     This ensures re-importing the same CSV doesn't create duplicate rows.
+  const tupleCounts = new Map<string, number>();
   for (const txn of parsed) {
     if (!txn.fitId) {
-      txn.fitId = hashFitId(txn);
+      const key = `${txn.date.toISOString()}|${txn.description}|${txn.amount}`;
+      const n = tupleCounts.get(key) ?? 0;
+      tupleCounts.set(key, n + 1);
+      txn.fitId = hashFitId(txn, n);
     }
   }
 
@@ -419,7 +479,15 @@ export async function importTransactions(
     }
   }
 
-  const toInsert = parsed.filter((p) => !p.fitId || !existingFitIds.has(p.fitId));
+  // Dedupe against both already-staged rows AND earlier rows in THIS batch, so two rows that
+  // genuinely share a fitId within one file don't both insert.
+  const seenInBatch = new Set<string>();
+  const toInsert = parsed.filter((p) => {
+    if (!p.fitId) return true;
+    if (existingFitIds.has(p.fitId) || seenInBatch.has(p.fitId)) return false;
+    seenInBatch.add(p.fitId);
+    return true;
+  });
   const skippedDupes = parsed.length - toInsert.length;
 
   // 5. Pre-fetch active rules once for bulk application.
@@ -432,8 +500,8 @@ export async function importTransactions(
   for (let i = 0; i < toInsert.length; i++) {
     const txn = toInsert[i];
     try {
-      // Apply rules to get suggested account.
-      const suggestedAccountId = await applyRules(
+      // Apply rules to get the suggested account and any payee override.
+      const match = await matchRule(
         ctx,
         { description: txn.description, payee: undefined, amount: txn.amount },
         rules,
@@ -446,10 +514,10 @@ export async function importTransactions(
         fitId: txn.fitId ?? null,
         date: txn.date,
         description: txn.description,
-        payee: null,
+        payee: match?.setPayee ?? null,
         amount: txn.amount,
         matched: false,
-        suggestedAccountId: suggestedAccountId ?? null,
+        suggestedAccountId: match?.setAccountId ?? null,
       });
       importedCount += 1;
     } catch (err) {

@@ -1,14 +1,17 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { CreditCard, Plus, Trash2, PlusCircle, MinusCircle, CheckCircle } from 'lucide-react';
+import { RotateCcw, Plus, Trash2, PlusCircle, MinusCircle, CheckCircle, Banknote } from 'lucide-react';
 import {
   Button,
   Card,
+  ConfirmDialog,
+  EmptyState,
   Input,
   Select,
   Label,
   Badge,
+  Spinner,
   Table,
   Th,
   Td,
@@ -19,6 +22,7 @@ import {
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -34,6 +38,7 @@ interface Account {
   code: string;
   name: string;
   type: string;
+  subtype: string | null;
 }
 
 interface Bill {
@@ -53,6 +58,7 @@ interface VendorCredit {
   status: 'open' | 'partial' | 'closed' | 'void';
   total: string;
   unapplied: string;
+  refundedAmount: string;
   memo: string | null;
 }
 
@@ -174,11 +180,12 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated }: NewCred
       open={open}
       onClose={onClose}
       title="New Vendor Credit"
+      size="lg"
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
-          <Button onClick={handleSubmit} disabled={saving}>
-            {saving ? 'Saving…' : 'Create Credit'}
+          <Button onClick={handleSubmit} loading={saving}>
+            Create Credit
           </Button>
         </>
       }
@@ -187,7 +194,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated }: NewCred
         {/* Vendor */}
         <div>
           <Label htmlFor="vc-vendor">Vendor *</Label>
-          <Select id="vc-vendor" value={vendorId} onChange={(e) => setVendorId(e.target.value)}>
+          <Select id="vc-vendor" autoFocus value={vendorId} onChange={(e) => setVendorId(e.target.value)}>
             <option value="">Select a vendor…</option>
             {vendors.map((v) => (
               <option key={v.id} value={v.id}>{v.displayName}</option>
@@ -221,13 +228,9 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated }: NewCred
         <div>
           <div className="flex items-center justify-between mb-2">
             <Label className="mb-0">Credit Lines</Label>
-            <button
-              type="button"
-              onClick={addLine}
-              className="text-electric hover:text-electric/80 flex items-center gap-1 text-sm font-medium"
-            >
+            <Button type="button" variant="ghost" size="sm" onClick={addLine}>
               <PlusCircle className="h-4 w-4" /> Add line
-            </button>
+            </Button>
           </div>
 
           <div className="rounded-lg border border-slate-200 overflow-hidden">
@@ -358,8 +361,8 @@ function ApplyModal({ open, credit, bills, onClose, onApplied }: ApplyModalProps
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={applying}>Cancel</Button>
-          <Button onClick={handleApply} disabled={applying}>
-            {applying ? 'Applying…' : 'Apply Credit'}
+          <Button onClick={handleApply} loading={applying}>
+            Apply Credit
           </Button>
         </>
       }
@@ -376,12 +379,13 @@ function ApplyModal({ open, credit, bills, onClose, onApplied }: ApplyModalProps
 
         <div>
           <Label htmlFor="apply-bill">Bill *</Label>
-          <Select id="apply-bill" value={billId} onChange={(e) => setBillId(e.target.value)}>
+          <Select id="apply-bill" autoFocus value={billId} onChange={(e) => setBillId(e.target.value)}>
             <option value="">Select a bill…</option>
             {eligibleBills.map((b) => (
               <option key={b.id} value={b.id}>
-                {b.billNumber ? `#${b.billNumber}` : b.id.slice(0, 8)} — Balance:{' '}
-                {formatCurrency(b.balanceDue)} — {b.date.slice(0, 10)}
+                {b.billNumber
+                  ? `#${b.billNumber} — Balance: ${formatCurrency(b.balanceDue)} — ${formatDate(b.date, 'MMM d, yyyy')}`
+                  : `Bill dated ${formatDate(b.date, 'MMM d, yyyy')} — Balance: ${formatCurrency(b.balanceDue)}`}
               </option>
             ))}
           </Select>
@@ -414,36 +418,114 @@ function ApplyModal({ open, credit, bills, onClose, onApplied }: ApplyModalProps
 }
 
 // ---------------------------------------------------------------------------
-// Void confirm modal
+// Refund Modal — record a vendor refund (cash back) against the credit
 // ---------------------------------------------------------------------------
 
-interface VoidModalProps {
+interface RefundModalProps {
   open: boolean;
   credit: VendorCredit | null;
-  onConfirm: () => void;
+  accounts: Account[];
   onClose: () => void;
-  voiding: boolean;
+  onRefunded: () => void;
 }
 
-function VoidModal({ open, credit, onConfirm, onClose, voiding }: VoidModalProps) {
+function RefundModal({ open, credit, accounts, onClose, onRefunded }: RefundModalProps) {
+  const [bankAccountId, setBankAccountId] = useState('');
+  const [amount, setAmount] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (open && credit) {
+      setBankAccountId('');
+      setAmount(Number(credit.unapplied).toFixed(2));
+    }
+  }, [open, credit]);
+
+  // Bank-ish accounts only — exclude A/R, inventory and fixed assets (same filter as
+  // the pay-bills / expenses payment-account pickers).
+  const bankAccounts = accounts.filter(
+    (a) =>
+      a.type === 'asset' &&
+      !['accounts_receivable', 'inventory', 'fixed_assets'].includes(a.subtype ?? ''),
+  );
+
+  async function handleRefund() {
+    if (!credit) return;
+    if (!bankAccountId) { toast('Select a bank account.', 'danger'); return; }
+    if (!amount || parseFloat(amount) <= 0) { toast('Enter a valid refund amount.', 'danger'); return; }
+
+    setSaving(true);
+    try {
+      await api.post(`/api/vendor-credits/${credit.id}`, {
+        action: 'refund',
+        bankAccountId,
+        amount,
+      });
+      toast('Vendor refund recorded.', 'success');
+      onRefunded();
+      onClose();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to record refund.';
+      toast(msg, 'danger');
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <Modal
       open={open}
       onClose={onClose}
-      title="Void Vendor Credit"
+      title="Record Vendor Refund"
       footer={
         <>
-          <Button variant="secondary" onClick={onClose} disabled={voiding}>Cancel</Button>
-          <Button variant="danger" onClick={onConfirm} disabled={voiding}>
-            {voiding ? 'Voiding…' : 'Void Credit'}
+          <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
+          <Button onClick={handleRefund} loading={saving}>
+            Record Refund
           </Button>
         </>
       }
     >
-      <p className="text-navy/80 text-sm">
-        Are you sure you want to void this vendor credit ({formatCurrency(credit?.total ?? '0')})?
-        This will reverse the GL entry and cannot be undone.
-      </p>
+      <div className="space-y-4">
+        {credit && (
+          <div className="rounded-lg bg-navy/5 px-4 py-3 text-sm">
+            <span className="text-navy/60">Unapplied credit available to refund: </span>
+            <span className="font-bold text-navy tabular-nums">
+              {formatCurrency(credit.unapplied)}
+            </span>
+          </div>
+        )}
+
+        <div>
+          <Label htmlFor="vc-refund-bank">Deposit To (Bank Account) *</Label>
+          <Select
+            id="vc-refund-bank"
+            autoFocus
+            value={bankAccountId}
+            onChange={(e) => setBankAccountId(e.target.value)}
+          >
+            <option value="">Select a bank account…</option>
+            {bankAccounts.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.code} — {a.name}
+              </option>
+            ))}
+          </Select>
+        </div>
+
+        <div>
+          <Label htmlFor="vc-refund-amt">Refund Amount *</Label>
+          <Input
+            id="vc-refund-amt"
+            type="number"
+            min="0.01"
+            step="0.01"
+            max={credit?.unapplied}
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+          />
+        </div>
+      </div>
     </Modal>
   );
 }
@@ -461,6 +543,7 @@ export default function VendorCreditsPage() {
 
   const [showNew, setShowNew] = useState(false);
   const [applyTarget, setApplyTarget] = useState<VendorCredit | null>(null);
+  const [refundTarget, setRefundTarget] = useState<VendorCredit | null>(null);
   const [voidTarget, setVoidTarget] = useState<VendorCredit | null>(null);
   const [voiding, setVoiding] = useState(false);
 
@@ -515,7 +598,7 @@ export default function VendorCreditsPage() {
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
         title="Vendor Credits"
-        icon={CreditCard}
+        icon={RotateCcw}
         action={
           <Button onClick={() => setShowNew(true)}>
             <Plus className="h-4 w-4" /> New Vendor Credit
@@ -525,14 +608,20 @@ export default function VendorCreditsPage() {
 
       <Card className="p-0 overflow-hidden">
         {loading ? (
-          <div className="flex items-center justify-center py-20 text-navy/40 text-sm">
-            Loading vendor credits…
+          <div className="flex items-center justify-center gap-2 py-20 text-navy/40 text-sm">
+            <Spinner className="h-4 w-4" /> Loading vendor credits…
           </div>
         ) : credits.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-20 gap-3 text-navy/40">
-            <CreditCard className="h-10 w-10 opacity-30" />
-            <p className="text-sm">No vendor credits yet. Create one to get started.</p>
-          </div>
+          <EmptyState
+            icon={RotateCcw}
+            title="No vendor credits yet"
+            message="Record a credit from a vendor to apply it against bills or get a refund."
+            action={
+              <Button onClick={() => setShowNew(true)}>
+                <Plus className="h-4 w-4" /> New Vendor Credit
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -540,8 +629,8 @@ export default function VendorCreditsPage() {
                 <Th>Vendor</Th>
                 <Th>Date</Th>
                 <Th>Memo</Th>
-                <Th className="text-right">Total</Th>
-                <Th className="text-right">Unapplied</Th>
+                <Th numeric>Total</Th>
+                <Th numeric>Unapplied</Th>
                 <Th>Status</Th>
                 <Th className="text-right">Actions</Th>
               </Tr>
@@ -550,40 +639,53 @@ export default function VendorCreditsPage() {
               {credits.map((c) => (
                 <Tr key={c.id}>
                   <Td className="font-medium text-navy">
-                    {vendorMap[c.vendorId] ?? c.vendorId}
+                    {vendorMap[c.vendorId] ?? '—'}
                   </Td>
-                  <Td className="text-navy/70">{c.date ? c.date.slice(0, 10) : '—'}</Td>
+                  <Td className="text-navy/70">{c.date ? formatDate(c.date, 'MMM d, yyyy') : '—'}</Td>
                   <Td className="text-navy/60 text-sm truncate max-w-[200px]">
                     {c.memo ?? '—'}
                   </Td>
-                  <Td className="text-right tabular-nums font-medium">
+                  <Td numeric className="font-medium">
                     {formatCurrency(c.total)}
                   </Td>
-                  <Td className="text-right tabular-nums font-medium">
+                  <Td numeric className="font-medium">
                     {formatCurrency(c.unapplied)}
                   </Td>
                   <Td>
                     <Badge tone={statusTone(c.status)}>{statusLabel(c.status)}</Badge>
                   </Td>
                   <Td className="text-right">
-                    <span className="inline-flex items-center gap-3">
+                    <span className="inline-flex items-center gap-1">
                       {c.status !== 'void' && c.status !== 'closed' && (
-                        <button
+                        <Button
+                          variant="ghost"
+                          size="sm"
                           onClick={() => setApplyTarget(c)}
-                          className="inline-flex items-center gap-1 text-xs text-navy/40 hover:text-electric transition-colors font-medium"
                           title="Apply to bill"
                         >
                           <CheckCircle className="h-3.5 w-3.5" /> Apply
-                        </button>
+                        </Button>
+                      )}
+                      {c.status !== 'void' && Number(c.unapplied) > 0 && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setRefundTarget(c)}
+                          title="Record vendor refund (cash back)"
+                        >
+                          <Banknote className="h-3.5 w-3.5" /> Refund
+                        </Button>
                       )}
                       {c.status !== 'void' && (
-                        <button
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="text-red-500 hover:text-red-700 hover:bg-red-50"
                           onClick={() => setVoidTarget(c)}
-                          className="inline-flex items-center gap-1 text-xs text-navy/40 hover:text-red-500 transition-colors font-medium"
                           title="Void credit"
                         >
                           <Trash2 className="h-3.5 w-3.5" /> Void
-                        </button>
+                        </Button>
                       )}
                     </span>
                   </Td>
@@ -631,12 +733,23 @@ export default function VendorCreditsPage() {
         onApplied={fetchData}
       />
 
-      <VoidModal
+      <RefundModal
+        open={!!refundTarget}
+        credit={refundTarget}
+        accounts={accounts}
+        onClose={() => setRefundTarget(null)}
+        onRefunded={fetchData}
+      />
+
+      <ConfirmDialog
         open={!!voidTarget}
-        credit={voidTarget}
+        title="Void vendor credit?"
+        message={`Are you sure you want to void this vendor credit (${formatCurrency(voidTarget?.total ?? '0')})? This will reverse the GL entry and cannot be undone.`}
+        confirmLabel="Void Credit"
+        tone="danger"
+        loading={voiding}
         onConfirm={handleVoid}
         onClose={() => setVoidTarget(null)}
-        voiding={voiding}
       />
     </main>
   );

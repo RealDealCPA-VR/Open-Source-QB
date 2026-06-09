@@ -75,34 +75,44 @@ function advanceDate(date: Date, frequency: Frequency): Date {
 }
 
 /**
+ * The run date is authoritative for generated documents: a template payload built
+ * from a real create-input carries the ORIGINAL document date, and reusing it would
+ * post every recurrence into the same historical period. The template's dueDate is
+ * only used to carry the original date→dueDate offset (i.e. the payment terms)
+ * forward from the run date.
+ */
+function recurrenceDueDate(payload: Record<string, unknown>, runDate: Date): Date | null {
+  const baseDate = payload.date ? new Date(payload.date as string) : null;
+  const baseDueDate = payload.dueDate ? new Date(payload.dueDate as string) : null;
+  if (!baseDueDate) return null;
+  if (!baseDate) return baseDueDate; // no offset known — keep the stored dueDate
+  return new Date(runDate.getTime() + (baseDueDate.getTime() - baseDate.getTime()));
+}
+
+/**
  * Parse a template payload into a typed create-input for invoices.
- * Date fields stored as ISO strings are re-hydrated to Date objects.
+ * The document date is always the run date (see recurrenceDueDate).
  */
 function toInvoiceInput(payload: Record<string, unknown>, runDate: Date): CreateInvoiceInput {
-  const date = payload.date ? new Date(payload.date as string) : runDate;
-  const dueDate = payload.dueDate ? new Date(payload.dueDate as string) : undefined;
   return {
     ...(payload as unknown as CreateInvoiceInput),
-    date,
-    dueDate: dueDate ?? null,
+    date: runDate,
+    dueDate: recurrenceDueDate(payload, runDate),
   };
 }
 
 function toBillInput(payload: Record<string, unknown>, runDate: Date): CreateBillInput {
-  const date = payload.date ? new Date(payload.date as string) : runDate;
-  const dueDate = payload.dueDate ? new Date(payload.dueDate as string) : undefined;
   return {
     ...(payload as unknown as CreateBillInput),
-    date,
-    dueDate: dueDate ?? null,
+    date: runDate,
+    dueDate: recurrenceDueDate(payload, runDate),
   };
 }
 
 function toManualEntryInput(payload: Record<string, unknown>, runDate: Date): ManualEntryInput {
-  const date = payload.date ? new Date(payload.date as string) : runDate;
   return {
     ...(payload as unknown as ManualEntryInput),
-    date,
+    date: runDate,
   };
 }
 
@@ -248,8 +258,13 @@ export async function runDue(
     const doc = await generateFromTemplate(ctx, template, runDate);
     generated.push(doc);
 
-    // Advance nextRunDate.
-    const nextRun = advanceDate(runDate, template.frequency as Frequency);
+    // Advance nextRunDate past the reference time. For a template that is several periods
+    // overdue, a single-step advance could leave nextRunDate still <= asOf, causing the very
+    // next runDue() to generate the same template again. Catch up so it fires exactly once.
+    let nextRun = advanceDate(runDate, template.frequency as Frequency);
+    while (nextRun.getTime() <= asOf.getTime()) {
+      nextRun = advanceDate(nextRun, template.frequency as Frequency);
+    }
     await ctx.db
       .update(recurringTemplates)
       .set({ nextRunDate: nextRun })
@@ -280,9 +295,13 @@ export async function runTemplateNow(
   const runDate = new Date();
   const doc = await generateFromTemplate(ctx, template, runDate);
 
-  // Advance nextRunDate as if it ran on schedule.
+  // Advance nextRunDate as if it ran on schedule, catching up past now so an overdue
+  // template can't be immediately re-fired by a subsequent runDue().
   const fromDate = template.nextRunDate ?? runDate;
-  const nextRun = advanceDate(fromDate, template.frequency as Frequency);
+  let nextRun = advanceDate(fromDate, template.frequency as Frequency);
+  while (nextRun.getTime() <= runDate.getTime()) {
+    nextRun = advanceDate(nextRun, template.frequency as Frequency);
+  }
   await ctx.db
     .update(recurringTemplates)
     .set({ nextRunDate: nextRun })

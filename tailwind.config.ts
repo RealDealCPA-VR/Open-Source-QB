@@ -10,50 +10,29 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        // Brand palette used across the app (previously referenced but undefined).
-        navy: "#0b1f3a",
-        electric: "#2f6df6",
-        emerald: "#10b981",
-        gold: "#f5b301",
-        offwhite: "#f7f9fc",
-        border: "hsl(var(--border))",
-        input: "hsl(var(--input))",
-        ring: "hsl(var(--ring))",
-        background: "hsl(var(--background))",
-        foreground: "hsl(var(--foreground))",
-        primary: {
-          DEFAULT: "hsl(var(--primary))",
-          foreground: "hsl(var(--foreground))",
-        },
-        secondary: {
-          DEFAULT: "hsl(var(--secondary))",
-          foreground: "hsl(var(--secondary-foreground))",
-        },
-        destructive: {
-          DEFAULT: "hsl(var(--destructive))",
-          foreground: "hsl(var(--destructive-foreground))",
-        },
-        muted: {
-          DEFAULT: "hsl(var(--muted))",
-          foreground: "hsl(var(--muted-foreground))",
-        },
-        accent: {
-          DEFAULT: "hsl(var(--accent))",
-          foreground: "hsl(var(--accent-foreground))",
-        },
-        popover: {
-          DEFAULT: "hsl(var(--popover))",
-          foreground: "hsl(var(--popover-foreground))",
-        },
-        card: {
-          DEFAULT: "hsl(var(--card))",
-          foreground: "hsl(var(--card-foreground))",
-        },
+        // Canonical brand palette — SINGLE source of truth.
+        // Do not redefine these as CSS variables or manual utility classes.
+        navy: "#0D1B2A",
+        electric: "#0095FF",
+        emerald: "#2ECC71",
+        gold: "#C89B3C",
+        offwhite: "#F5F7FA",
       },
-      borderRadius: {
-        lg: "var(--radius)",
-        md: "calc(var(--radius) - 2px)",
-        sm: "calc(var(--radius) - 4px)",
+      fontFamily: {
+        // Inter is self-hosted via next/font (app/layout.tsx sets --font-inter).
+        sans: [
+          "var(--font-inter)",
+          "Inter",
+          "ui-sans-serif",
+          "system-ui",
+          "sans-serif",
+        ],
+      },
+      boxShadow: {
+        // Brand-tuned soft shadows (previously forced via raw .shadow-xl /
+        // .shadow-2xl overrides in globals.css — now defined once here).
+        xl: "0 6px 24px 0 rgba(13,27,42,.06), 0 1.5px 5px rgba(13,27,42,.03)",
+        "2xl": "0 16px 54px 0 rgba(13,27,42,.19), 0 1.5px 7px rgba(13,27,42,.02)",
       },
     },
   },

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { Fragment, useEffect, useState, useCallback } from 'react';
 import {
   Sparkles,
   ShieldAlert,
@@ -22,7 +22,6 @@ import {
   Tr,
   PageHeader,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api } from '@/lib/client';
 
@@ -142,7 +141,7 @@ function InsightPanel({ detectionId, onApplied }: InsightPanelProps) {
   const isApplied = correction?.status === 'applied';
 
   return (
-    <div className="bg-gradient-to-br from-[#0a1628]/5 via-electric/5 to-[#e8f4ff] border border-electric/20 rounded-xl p-5 mt-2 space-y-4">
+    <div className="bg-electric/5 border border-electric/20 rounded-xl p-5 mt-2 space-y-4">
       {/* Header strip */}
       <div className="flex items-center gap-2 mb-1">
         <Sparkles className="h-4 w-4 text-electric" />
@@ -168,18 +167,9 @@ function InsightPanel({ detectionId, onApplied }: InsightPanelProps) {
             Run an AI-powered analysis to get a structured correction suggestion
             with step-by-step guidance.
           </p>
-          <Button
-            onClick={handleAnalyze}
-            disabled={analyzing}
-            size="sm"
-            className="gap-2 bg-gradient-to-r from-electric to-[#4f8ef7] hover:opacity-90 shadow-md"
-          >
-            {analyzing ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <Sparkles className="h-3.5 w-3.5" />
-            )}
-            {analyzing ? 'Analyzing…' : 'Analyze with AI'}
+          <Button onClick={handleAnalyze} loading={analyzing} size="sm">
+            {!analyzing && <Sparkles className="h-3.5 w-3.5" />}
+            Analyze with AI
           </Button>
         </div>
       )}
@@ -237,18 +227,9 @@ function InsightPanel({ detectionId, onApplied }: InsightPanelProps) {
           {/* Actions row */}
           <div className="flex items-center gap-3 pt-1">
             {!isApplied && (
-              <Button
-                onClick={handleApply}
-                disabled={applying}
-                size="sm"
-                className="bg-emerald text-white hover:bg-emerald/90 shadow-sm"
-              >
-                {applying ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <CheckCircle2 className="h-3.5 w-3.5" />
-                )}
-                {applying ? 'Applying…' : 'Apply Correction'}
+              <Button onClick={handleApply} loading={applying} size="sm">
+                {!applying && <CheckCircle2 className="h-3.5 w-3.5" />}
+                Apply Correction
               </Button>
             )}
             {isApplied && (
@@ -261,14 +242,11 @@ function InsightPanel({ detectionId, onApplied }: InsightPanelProps) {
               variant="ghost"
               size="sm"
               onClick={handleAnalyze}
-              disabled={analyzing || isApplied}
+              loading={analyzing}
+              disabled={isApplied}
               className="text-electric"
             >
-              {analyzing ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Sparkles className="h-3.5 w-3.5" />
-              )}
+              {!analyzing && <Sparkles className="h-3.5 w-3.5" />}
               Re-analyze
             </Button>
           </div>
@@ -289,23 +267,19 @@ export default function ErrorsPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [filter, setFilter] = useState<'all' | 'open' | 'resolved'>('all');
 
+  // Always fetch the unfiltered list so the KPI cards reflect all detections;
+  // the active tab filters client-side below.
   const fetchDetections = useCallback(async () => {
     setLoading(true);
     try {
-      const query =
-        filter === 'open'
-          ? '?resolved=false'
-          : filter === 'resolved'
-          ? '?resolved=true'
-          : '';
-      const res = await api.get<{ detections: Detection[] }>(`/api/errors${query}`);
+      const res = await api.get<{ detections: Detection[] }>('/api/errors');
       setDetections(res.detections);
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Failed to load errors', 'danger');
     } finally {
       setLoading(false);
     }
-  }, [filter]);
+  }, []);
 
   useEffect(() => {
     fetchDetections();
@@ -331,32 +305,27 @@ export default function ErrorsPage() {
     }
   };
 
-  // Summary counts
+  // Summary counts (from the full, unfiltered list)
   const openCount = detections.filter((d) => !d.resolvedAt).length;
   const criticalCount = detections.filter(
     (d) => !d.resolvedAt && (d.severity === 'critical' || d.severity === 'high'),
   ).length;
   const resolvedCount = detections.filter((d) => d.resolvedAt).length;
 
+  // Table rows for the active tab.
+  const visibleDetections = detections.filter((d) =>
+    filter === 'open' ? !d.resolvedAt : filter === 'resolved' ? !!d.resolvedAt : true,
+  );
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
-
       <PageHeader
         title="AI Review"
         icon={ShieldAlert}
         action={
-          <Button
-            onClick={handleRunReview}
-            disabled={running}
-            className="gap-2 bg-gradient-to-r from-electric to-[#4f8ef7] hover:opacity-90 shadow-lg text-white font-bold px-5 py-2.5 text-sm"
-          >
-            {running ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <ScanSearch className="h-4 w-4" />
-            )}
-            {running ? 'Scanning…' : 'Run AI Review'}
+          <Button onClick={handleRunReview} loading={running}>
+            {!running && <ScanSearch className="h-4 w-4" />}
+            Run AI Review
           </Button>
         }
       />
@@ -383,7 +352,7 @@ export default function ErrorsPage() {
             label: 'Critical / High',
             value: criticalCount,
             accent: 'text-red-500',
-            bg: 'border-red-200 bg-red-50',
+            bg: 'border-red-200 bg-red-100',
           },
           {
             icon: CheckCircle2,
@@ -435,7 +404,7 @@ export default function ErrorsPage() {
             <Loader2 className="h-6 w-6 animate-spin text-electric" />
             <span className="text-sm">Loading detections…</span>
           </div>
-        ) : detections.length === 0 ? (
+        ) : visibleDetections.length === 0 ? (
           <div className="flex flex-col items-center justify-center gap-4 py-20 text-navy/40">
             <CheckCircle2 className="h-12 w-12 text-emerald/60" />
             <div className="text-center">
@@ -460,14 +429,13 @@ export default function ErrorsPage() {
               </tr>
             </thead>
             <tbody>
-              {detections.map((det) => {
+              {visibleDetections.map((det) => {
                 const isExpanded = expandedId === det.id;
                 const isResolved = !!det.resolvedAt;
 
                 return (
-                  <>
+                  <Fragment key={det.id}>
                     <Tr
-                      key={det.id}
                       className={
                         isResolved
                           ? 'opacity-60'
@@ -541,7 +509,7 @@ export default function ErrorsPage() {
 
                     {/* Expandable AI insight row */}
                     {isExpanded && !isResolved && (
-                      <tr key={`${det.id}-insight`}>
+                      <tr>
                         <td colSpan={6} className="px-4 pb-4 pt-0">
                           <InsightPanel
                             detectionId={det.id}
@@ -553,7 +521,7 @@ export default function ErrorsPage() {
                         </td>
                       </tr>
                     )}
-                  </>
+                  </Fragment>
                 );
               })}
             </tbody>

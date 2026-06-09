@@ -1,11 +1,12 @@
 /**
  * GET    /api/journal-entries/:id   — fetch a single entry with lines + account names.
+ * PATCH  /api/journal-entries/:id   — edit a posted entry (void + repost atomically).
  * DELETE /api/journal-entries/:id   — void a posted entry (reverses balances).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
-import { getEntry, voidEntry } from '@/lib/services/journal';
+import { getEntry, updateEntry, voidEntry } from '@/lib/services/journal';
 
 type Params = { params: Promise<{ id: string }> };
 
@@ -14,6 +15,29 @@ export async function GET(_req: NextRequest, { params }: Params) {
     const { id } = await params;
     const ctx = await getServerContext();
     const entry = await getEntry(ctx, id);
+    return NextResponse.json({ entry });
+  } catch (err) {
+    return mapError(err);
+  }
+}
+
+export async function PATCH(req: NextRequest, { params }: Params) {
+  try {
+    const { id } = await params;
+    const ctx = await getServerContext();
+    const body = await req.json();
+
+    const date = body.date ? new Date(body.date) : undefined;
+    if (!date || isNaN(date.getTime())) {
+      return NextResponse.json({ error: 'date is required (ISO string).' }, { status: 400 });
+    }
+
+    const entry = await updateEntry(ctx, id, {
+      date,
+      description: body.description ?? '',
+      reference: body.reference === undefined ? undefined : (body.reference ?? null),
+      lines: body.lines ?? [],
+    });
     return NextResponse.json({ entry });
   } catch (err) {
     return mapError(err);
@@ -43,7 +67,7 @@ function mapError(err: unknown): NextResponse {
           ? 400
           : err.code === 'FORBIDDEN'
             ? 403
-            : err.code === 'CONFLICT'
+            : err.code === 'CONFLICT' || err.code === 'PERIOD_CLOSED'
               ? 409
               : 500;
     return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });

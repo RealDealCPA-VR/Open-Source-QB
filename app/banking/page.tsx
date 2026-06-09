@@ -1,14 +1,16 @@
 'use client';
 
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { Landmark, Plus } from 'lucide-react';
+import { Landmark, ListChecks, Plus } from 'lucide-react';
 import {
   Button,
   Card,
+  EmptyState,
   Input,
   Select,
   Label,
   Badge,
+  Spinner,
   Table,
   Th,
   Td,
@@ -16,10 +18,10 @@ import {
   Modal,
   PageHeader,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/dates';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -120,8 +122,8 @@ function AddBankAccountModal({
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
-          <Button onClick={handleSubmit} disabled={saving}>
-            {saving ? 'Saving…' : 'Add Account'}
+          <Button onClick={handleSubmit} loading={saving}>
+            Add Account
           </Button>
         </>
       }
@@ -131,6 +133,7 @@ function AddBankAccountModal({
           <Label htmlFor="ba-gl-account">GL Account (Asset or Liability)</Label>
           <Select
             id="ba-gl-account"
+            autoFocus
             value={accountId}
             onChange={(e) => setAccountId(e.target.value)}
             required
@@ -236,8 +239,8 @@ function AddRuleModal({
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
-          <Button onClick={handleSubmit} disabled={saving}>
-            {saving ? 'Saving…' : 'Add Rule'}
+          <Button onClick={handleSubmit} loading={saving}>
+            Add Rule
           </Button>
         </>
       }
@@ -247,6 +250,7 @@ function AddRuleModal({
           <Label htmlFor="rule-name">Rule Name</Label>
           <Input
             id="rule-name"
+            autoFocus
             placeholder="e.g. Amazon purchases"
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -472,8 +476,15 @@ export default function BankingPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
-      <PageHeader title="Banking" icon={Landmark} />
+      <PageHeader
+        title="Banking"
+        icon={Landmark}
+        action={
+          <Button onClick={() => setShowAddBankAccount(true)}>
+            <Plus className="h-4 w-4" /> Add Bank Account
+          </Button>
+        }
+      />
 
       {/* ------------------------------------------------------------------ */}
       {/* Card 1: Bank Accounts                                               */}
@@ -488,11 +499,20 @@ export default function BankingPage() {
         </div>
 
         {loadingBankAccounts ? (
-          <p className="text-sm text-navy/50 py-4 text-center">Loading…</p>
+          <div className="py-10 flex justify-center">
+            <Spinner className="text-electric" />
+          </div>
         ) : bankAccounts.length === 0 ? (
-          <p className="text-sm text-navy/50 py-4 text-center">
-            No bank accounts yet. Add one to start importing transactions.
-          </p>
+          <EmptyState
+            icon={Landmark}
+            title="No bank accounts yet"
+            message="Add one to start importing transactions."
+            action={
+              <Button onClick={() => setShowAddBankAccount(true)}>
+                <Plus className="h-4 w-4" /> Add Bank Account
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -501,7 +521,7 @@ export default function BankingPage() {
                 <Th>Account #</Th>
                 <Th>GL Account</Th>
                 <Th>Last Reconciled</Th>
-                <Th className="text-right">Reconciled Balance</Th>
+                <Th numeric>Reconciled Balance</Th>
               </Tr>
             </thead>
             <tbody>
@@ -513,12 +533,8 @@ export default function BankingPage() {
                     <span className="text-navy/60 text-xs mr-1">{ba.glAccountCode}</span>
                     {ba.glAccountName}
                   </Td>
-                  <Td>
-                    {ba.lastReconciledDate
-                      ? new Date(ba.lastReconciledDate).toLocaleDateString()
-                      : '—'}
-                  </Td>
-                  <Td className="text-right font-mono">
+                  <Td>{formatDate(ba.lastReconciledDate)}</Td>
+                  <Td numeric>
                     {ba.lastReconciledBalance != null
                       ? formatCurrency(ba.lastReconciledBalance)
                       : '—'}
@@ -629,8 +645,8 @@ export default function BankingPage() {
           </div>
 
           <div className="flex items-center gap-4">
-            <Button type="submit" disabled={importing}>
-              {importing ? 'Importing…' : 'Import'}
+            <Button type="submit" loading={importing}>
+              Import
             </Button>
             {importSummary && (
               <div className="flex gap-3 text-sm">
@@ -659,11 +675,20 @@ export default function BankingPage() {
         </div>
 
         {loadingRules ? (
-          <p className="text-sm text-navy/50 py-4 text-center">Loading…</p>
+          <div className="py-10 flex justify-center">
+            <Spinner className="text-electric" />
+          </div>
         ) : rules.length === 0 ? (
-          <p className="text-sm text-navy/50 py-4 text-center">
-            No rules yet. Rules auto-categorize imported transactions.
-          </p>
+          <EmptyState
+            icon={ListChecks}
+            title="No rules yet"
+            message="Rules auto-categorize imported transactions."
+            action={
+              <Button onClick={() => setShowAddRule(true)}>
+                <Plus className="h-4 w-4" /> Add Rule
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -671,7 +696,8 @@ export default function BankingPage() {
                 <Th>Name</Th>
                 <Th>Condition</Th>
                 <Th>Assign Account</Th>
-                <Th className="text-right">Priority</Th>
+                <Th>Status</Th>
+                <Th numeric>Priority</Th>
               </Tr>
             </thead>
             <tbody>
@@ -694,10 +720,15 @@ export default function BankingPage() {
                           {acct.name}
                         </>
                       ) : (
-                        <span className="text-navy/40 text-xs">{r.setAccountId}</span>
+                        <span className="text-navy/40 text-xs italic">Unknown account</span>
                       )}
                     </Td>
-                    <Td className="text-right">
+                    <Td>
+                      <Badge tone={r.isActive ? 'success' : 'neutral'}>
+                        {r.isActive ? 'Active' : 'Inactive'}
+                      </Badge>
+                    </Td>
+                    <Td numeric>
                       <Badge tone="neutral">{r.priority}</Badge>
                     </Td>
                   </Tr>

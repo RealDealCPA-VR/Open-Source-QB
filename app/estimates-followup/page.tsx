@@ -4,15 +4,14 @@
  * Estimates Follow-up page.
  *
  * Shows two sections:
- *  1. Estimates expiring within 30 days (actionable warning list).
- *  2. Already-expired (status=rejected) estimates that were auto-expired.
+ *  1. Estimates expiring within 7 days (actionable warning list).
+ *  2. All estimates expiring within 30 days.
  *
- * Provides an "Expire Overdue Now" button that calls POST /api/estimates/expire
- * and a readout of the next available check number from GET /api/check-numbers/next.
+ * Provides an "Expire Overdue Now" button that calls POST /api/estimates/expire.
  */
 
 import { useEffect, useState, useCallback } from 'react';
-import { ClipboardList } from 'lucide-react';
+import { Clock } from 'lucide-react';
 import {
   Button,
   Card,
@@ -22,11 +21,13 @@ import {
   Td,
   Tr,
   PageHeader,
+  Spinner,
   toast,
-  Toaster,
+  type BadgeTone,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -39,6 +40,11 @@ interface ExpiringEstimate {
   status: string;
   total: string;
   expirationDate: string;
+}
+
+interface Customer {
+  id: string;
+  displayName: string;
 }
 
 interface ExpiredSummary {
@@ -65,12 +71,10 @@ function expiryBadgeTone(
   return 'info';
 }
 
-function statusBadgeTone(
-  status: string,
-): 'neutral' | 'warning' | 'success' | 'danger' | 'info' {
+function statusBadgeTone(status: string): BadgeTone {
   switch (status) {
     case 'draft': return 'neutral';
-    case 'open': return 'info';
+    case 'open': return 'open';
     case 'accepted': return 'success';
     case 'rejected': return 'danger';
     case 'closed': return 'neutral';
@@ -78,47 +82,43 @@ function statusBadgeTone(
   }
 }
 
+/** "open" -> "Open", "accepted" -> "Accepted" */
+function statusLabel(status: string): string {
+  return status ? status.charAt(0).toUpperCase() + status.slice(1) : status;
+}
+
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
 export default function EstimatesFollowupPage() {
-  const [expiring, setExpiring] = useState<ExpiringEstimate[]>([]);
   const [loadingExpiring, setLoadingExpiring] = useState(true);
-
-  const [nextCheck, setNextCheck] = useState<string | null>(null);
-  const [loadingCheck, setLoadingCheck] = useState(true);
-
-  const [expiring30Days] = useState(30); // window for "expiring soon"
 
   const [expiring7Days, setExpiring7Days] = useState<ExpiringEstimate[]>([]);
   const [expiring30, setExpiring30] = useState<ExpiringEstimate[]>([]);
 
-  const [expiring7Loading] = useState(false);
-
   const [running, setRunning] = useState(false);
   const [lastResult, setLastResult] = useState<number | null>(null);
 
-  // Fetch estimates expiring within 30 days from the estimates list endpoint
-  // (we use the /api/estimates endpoint and filter client-side by status + expiration).
+  // Fetch estimates expiring within 30 days, resolving customer names from
+  // /api/customers (the estimates list endpoint only carries customerId).
   const fetchExpiring = useCallback(async () => {
     setLoadingExpiring(true);
     try {
-      // Use the dedicated expiring endpoint via a query param workaround:
-      // The estimates list doesn't filter by expiration, so we call the service
-      // via the dedicated route we'll expose from /api/estimates and filter here.
-      // The listExpiringEstimates logic lives server-side; we surface it via
-      // a simple GET with ?expiring=30 on the base estimates endpoint.
-      // Since we only have /api/estimates (no query params), we fetch all and filter.
-      const all = await api.get<Array<{
-        id: string;
-        estimateNumber: number;
-        status: string;
-        total: string;
-        expirationDate: string | null;
-        customerId: string;
-        companyId: string;
-      }>>('/api/estimates');
+      const [all, customers] = await Promise.all([
+        api.get<Array<{
+          id: string;
+          estimateNumber: number;
+          status: string;
+          total: string;
+          expirationDate: string | null;
+          customerId: string;
+          companyId: string;
+        }>>('/api/estimates'),
+        api.get<Customer[]>('/api/customers'),
+      ]);
+
+      const custMap = new Map(customers.map((c) => [c.id, c.displayName]));
 
       const now = new Date();
       now.setHours(0, 0, 0, 0);
@@ -129,9 +129,6 @@ export default function EstimatesFollowupPage() {
 
       const actionable = ['draft', 'open', 'accepted'];
 
-      // Build expiring list (estimates with expirationDate within 30 days,
-      // still in actionable status). The customerName is not included in the
-      // list endpoint; we show the customerId shortened as a fallback.
       const mapped: ExpiringEstimate[] = all
         .filter((e) => {
           if (!e.expirationDate) return false;
@@ -142,13 +139,12 @@ export default function EstimatesFollowupPage() {
         .map((e) => ({
           id: e.id,
           estimateNumber: e.estimateNumber,
-          customerName: e.customerId.slice(0, 8) + '…',
+          customerName: custMap.get(e.customerId) ?? '—',
           status: e.status,
           total: e.total,
           expirationDate: e.expirationDate!,
         }));
 
-      setExpiring(mapped);
       setExpiring30(mapped);
       setExpiring7Days(
         mapped.filter((e) => {
@@ -163,22 +159,9 @@ export default function EstimatesFollowupPage() {
     }
   }, []);
 
-  const fetchNextCheck = useCallback(async () => {
-    setLoadingCheck(true);
-    try {
-      const { next } = await api.get<{ next: string }>('/api/check-numbers/next');
-      setNextCheck(next);
-    } catch {
-      toast('Failed to load next check number.', 'danger');
-    } finally {
-      setLoadingCheck(false);
-    }
-  }, []);
-
   useEffect(() => {
     fetchExpiring();
-    fetchNextCheck();
-  }, [fetchExpiring, fetchNextCheck]);
+  }, [fetchExpiring]);
 
   async function handleExpireNow() {
     setRunning(true);
@@ -203,15 +186,46 @@ export default function EstimatesFollowupPage() {
     }
   }
 
+  function renderRows(rows: ExpiringEstimate[]) {
+    return rows.map((e) => {
+      const days = daysUntil(e.expirationDate);
+      return (
+        <Tr key={e.id}>
+          <Td className="font-bold">{e.estimateNumber}</Td>
+          <Td>{e.customerName}</Td>
+          <Td>
+            <Badge tone={statusBadgeTone(e.status)}>{statusLabel(e.status)}</Badge>
+          </Td>
+          <Td>
+            <span className="mr-2 text-sm">{formatDate(e.expirationDate)}</span>
+            <Badge tone={expiryBadgeTone(days)}>
+              {days === 0
+                ? 'Today'
+                : days < 0
+                ? `${Math.abs(days)}d overdue`
+                : `${days}d left`}
+            </Badge>
+          </Td>
+          <Td numeric>{formatCurrency(e.total)}</Td>
+        </Tr>
+      );
+    });
+  }
+
+  const loadingBlock = (
+    <div className="flex items-center justify-center gap-2 text-sm text-navy/50 py-4">
+      <Spinner className="h-4 w-4" /> Loading…
+    </div>
+  );
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
       <PageHeader
         title="Estimates Follow-up"
-        icon={ClipboardList}
+        icon={Clock}
         action={
-          <Button onClick={handleExpireNow} disabled={running} variant="danger">
-            {running ? 'Processing…' : 'Expire Overdue Now'}
+          <Button onClick={handleExpireNow} loading={running} variant="danger">
+            Expire Overdue Now
           </Button>
         }
       />
@@ -223,29 +237,6 @@ export default function EstimatesFollowupPage() {
       )}
 
       {/* ------------------------------------------------------------------ */}
-      {/* Next Check Number                                                    */}
-      {/* ------------------------------------------------------------------ */}
-      <Card className="p-6 mb-8">
-        <h2 className="text-lg font-bold text-navy mb-2">Next Available Check Number</h2>
-        <p className="text-sm text-navy/60 mb-3">
-          Derived from the highest numeric reference across bill payments and
-          direct expenses. Use this number when writing the next check.
-        </p>
-        {loadingCheck ? (
-          <p className="text-sm text-navy/40">Loading…</p>
-        ) : (
-          <div className="flex items-center gap-3">
-            <span className="text-4xl font-extrabold text-electric font-mono">
-              {nextCheck ?? '—'}
-            </span>
-            <Button size="sm" variant="secondary" onClick={fetchNextCheck}>
-              Refresh
-            </Button>
-          </div>
-        )}
-      </Card>
-
-      {/* ------------------------------------------------------------------ */}
       {/* Expiring within 7 days                                              */}
       {/* ------------------------------------------------------------------ */}
       <Card className="p-6 mb-8">
@@ -253,13 +244,13 @@ export default function EstimatesFollowupPage() {
           <h2 className="text-lg font-bold text-navy">
             Expiring Within 7 Days
             {expiring7Days.length > 0 && (
-              <Badge tone="danger" children={String(expiring7Days.length)} />
+              <Badge tone="danger" className="ml-2">{expiring7Days.length}</Badge>
             )}
           </h2>
         </div>
 
         {loadingExpiring ? (
-          <p className="text-sm text-navy/50 py-4 text-center">Loading…</p>
+          loadingBlock
         ) : expiring7Days.length === 0 ? (
           <p className="text-sm text-navy/50 py-4 text-center">
             No estimates expiring in the next 7 days.
@@ -272,38 +263,10 @@ export default function EstimatesFollowupPage() {
                 <Th>Customer</Th>
                 <Th>Status</Th>
                 <Th>Expires</Th>
-                <Th className="text-right">Total</Th>
+                <Th numeric>Total</Th>
               </Tr>
             </thead>
-            <tbody>
-              {expiring7Days.map((e) => {
-                const days = daysUntil(e.expirationDate);
-                return (
-                  <Tr key={e.id}>
-                    <Td className="font-mono font-bold">{e.estimateNumber}</Td>
-                    <Td>{e.customerName}</Td>
-                    <Td>
-                      <Badge tone={statusBadgeTone(e.status)}>{e.status}</Badge>
-                    </Td>
-                    <Td>
-                      <span className="mr-2 text-sm">
-                        {new Date(e.expirationDate).toLocaleDateString()}
-                      </span>
-                      <Badge tone={expiryBadgeTone(days)}>
-                        {days === 0
-                          ? 'Today'
-                          : days < 0
-                          ? `${Math.abs(days)}d overdue`
-                          : `${days}d left`}
-                      </Badge>
-                    </Td>
-                    <Td className="text-right font-mono">
-                      {formatCurrency(e.total)}
-                    </Td>
-                  </Tr>
-                );
-              })}
-            </tbody>
+            <tbody>{renderRows(expiring7Days)}</tbody>
           </Table>
         )}
       </Card>
@@ -322,7 +285,7 @@ export default function EstimatesFollowupPage() {
         </div>
 
         {loadingExpiring ? (
-          <p className="text-sm text-navy/50 py-4 text-center">Loading…</p>
+          loadingBlock
         ) : expiring30.length === 0 ? (
           <p className="text-sm text-navy/50 py-4 text-center">
             No estimates expiring in the next 30 days.
@@ -335,38 +298,10 @@ export default function EstimatesFollowupPage() {
                 <Th>Customer</Th>
                 <Th>Status</Th>
                 <Th>Expires</Th>
-                <Th className="text-right">Total</Th>
+                <Th numeric>Total</Th>
               </Tr>
             </thead>
-            <tbody>
-              {expiring30.map((e) => {
-                const days = daysUntil(e.expirationDate);
-                return (
-                  <Tr key={e.id}>
-                    <Td className="font-mono font-bold">{e.estimateNumber}</Td>
-                    <Td>{e.customerName}</Td>
-                    <Td>
-                      <Badge tone={statusBadgeTone(e.status)}>{e.status}</Badge>
-                    </Td>
-                    <Td>
-                      <span className="mr-2 text-sm">
-                        {new Date(e.expirationDate).toLocaleDateString()}
-                      </span>
-                      <Badge tone={expiryBadgeTone(days)}>
-                        {days === 0
-                          ? 'Today'
-                          : days < 0
-                          ? `${Math.abs(days)}d overdue`
-                          : `${days}d left`}
-                      </Badge>
-                    </Td>
-                    <Td className="text-right font-mono">
-                      {formatCurrency(e.total)}
-                    </Td>
-                  </Tr>
-                );
-              })}
-            </tbody>
+            <tbody>{renderRows(expiring30)}</tbody>
           </Table>
         )}
       </Card>

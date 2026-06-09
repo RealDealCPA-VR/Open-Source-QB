@@ -1,10 +1,12 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { CreditCard, Plus } from 'lucide-react';
+import { HandCoins, Plus } from 'lucide-react';
 import {
   Button,
   Card,
+  ConfirmDialog,
+  EmptyState,
   Input,
   Select,
   Label,
@@ -15,11 +17,12 @@ import {
   Tr,
   Modal,
   PageHeader,
-  Toaster,
+  Spinner,
   toast,
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/format';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -33,11 +36,19 @@ interface Payment {
   amount: string;
   unapplied: string;
   reference: string | null;
+  voidedAt: string | null;
 }
 
 interface Customer {
   id: string;
   displayName: string;
+}
+
+interface Account {
+  id: string;
+  code: string;
+  name: string;
+  type: string;
 }
 
 interface Invoice {
@@ -83,11 +94,6 @@ function methodBadgeTone(
     default:
       return 'neutral';
   }
-}
-
-function formatDate(isoStr: string) {
-  const d = new Date(isoStr);
-  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
 // Sum the amountApplied values across all applications for display only (Number() per rules).
@@ -198,6 +204,7 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
 
   return (
     <Modal
+      size="lg"
       open={open}
       onClose={onClose}
       title="Receive Payment"
@@ -206,8 +213,8 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
-          <Button onClick={handleSubmit} disabled={saving}>
-            {saving ? 'Saving…' : 'Record Payment'}
+          <Button onClick={handleSubmit} loading={saving}>
+            Record Payment
           </Button>
         </>
       }
@@ -220,6 +227,7 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
             id="pm-customer"
             value={customerId}
             onChange={(e) => setCustomerId(e.target.value)}
+            autoFocus
           >
             <option value="">— Select customer —</option>
             {customers.map((c) => (
@@ -289,33 +297,33 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
           <div>
             <Label>Apply to Open Invoices</Label>
             {invoicesLoading ? (
-              <p className="text-sm text-navy/50 py-2">Loading invoices…</p>
+              <div className="flex items-center gap-2 py-2 text-sm text-navy/50">
+                <Spinner className="h-4 w-4" /> Loading invoices…
+              </div>
             ) : invoices.length === 0 ? (
               <p className="text-sm text-navy/40 py-2 italic">
                 No open invoices for this customer.
               </p>
             ) : (
               <div className="border border-slate-200 rounded-lg overflow-hidden mt-1">
-                <table className="w-full border-collapse text-sm">
+                <Table>
                   <thead>
-                    <tr className="bg-slate-50 border-b border-slate-200">
-                      <th className="py-2 px-3 text-left font-semibold text-navy/70">Date</th>
-                      <th className="py-2 px-3 text-right font-semibold text-navy/70">Invoice Total</th>
-                      <th className="py-2 px-3 text-right font-semibold text-navy/70">Balance Due</th>
-                      <th className="py-2 px-3 text-right font-semibold text-navy/70">Amount to Apply</th>
+                    <tr className="bg-slate-50">
+                      <Th>Date</Th>
+                      <Th numeric>Invoice Total</Th>
+                      <Th numeric>Balance Due</Th>
+                      <Th numeric>Amount to Apply</Th>
                     </tr>
                   </thead>
                   <tbody>
                     {invoices.map((inv) => (
-                      <tr key={inv.id} className="border-b border-slate-100 hover:bg-electric/5">
-                        <td className="py-2 px-3 text-navy">{formatDate(inv.date)}</td>
-                        <td className="py-2 px-3 text-right text-navy tabular-nums">
-                          {formatCurrency(inv.total)}
-                        </td>
-                        <td className="py-2 px-3 text-right font-semibold text-navy tabular-nums">
+                      <Tr key={inv.id}>
+                        <Td>{formatDate(inv.date)}</Td>
+                        <Td numeric>{formatCurrency(inv.total)}</Td>
+                        <Td numeric className="font-semibold">
                           {formatCurrency(inv.balanceDue)}
-                        </td>
-                        <td className="py-2 px-3">
+                        </Td>
+                        <Td numeric>
                           <Input
                             type="number"
                             min="0"
@@ -326,11 +334,11 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
                             onChange={(e) => setAppAmount(inv.id, e.target.value)}
                             className="text-right"
                           />
-                        </td>
-                      </tr>
+                        </Td>
+                      </Tr>
                     ))}
                   </tbody>
-                </table>
+                </Table>
               </div>
             )}
 
@@ -364,15 +372,270 @@ function ReceivePaymentModal({ open, onClose, onSaved, customers }: ReceivePayme
 }
 
 // ---------------------------------------------------------------------------
+// Apply Unapplied Modal — apply an overpaid/unapplied balance to open invoices
+// ---------------------------------------------------------------------------
+
+interface ApplyUnappliedModalProps {
+  open: boolean;
+  payment: Payment | null;
+  onClose: () => void;
+  onApplied: () => void;
+}
+
+function ApplyUnappliedModal({ open, payment, onClose, onApplied }: ApplyUnappliedModalProps) {
+  const [invoices, setInvoices] = useState<Invoice[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [amounts, setAmounts] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!open || !payment) return;
+    setAmounts({});
+    setLoading(true);
+    api
+      .get<{ invoices?: Invoice[] } | Invoice[]>(`/api/invoices?customerId=${payment.customerId}`)
+      .then((rows) => {
+        const list = Array.isArray(rows) ? rows : (rows as { invoices?: Invoice[] }).invoices ?? [];
+        setInvoices(list.filter((inv) => inv.status !== 'void' && Number(inv.balanceDue) > 0));
+      })
+      .catch(() => toast('Failed to load invoices.', 'danger'))
+      .finally(() => setLoading(false));
+  }, [open, payment]);
+
+  const applications: Application[] = Object.entries(amounts)
+    .filter(([, v]) => v && Number(v) > 0)
+    .map(([invoiceId, amountApplied]) => ({ invoiceId, amountApplied }));
+  const appliedTotal = sumApplications(applications);
+  const unapplied = Number(payment?.unapplied ?? 0);
+
+  async function handleApply() {
+    if (!payment) return;
+    if (applications.length === 0) { toast('Enter an amount to apply.', 'danger'); return; }
+    if (appliedTotal > unapplied + 0.005) {
+      toast('Total applied exceeds the unapplied balance.', 'danger');
+      return;
+    }
+    setSaving(true);
+    try {
+      await api.post(`/api/payments/${payment.id}`, { action: 'apply', applications });
+      toast('Unapplied balance applied to invoices.', 'success');
+      onApplied();
+      onClose();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to apply payment.';
+      toast(msg, 'danger');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal
+      size="lg"
+      open={open}
+      onClose={onClose}
+      title="Apply Unapplied Balance"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
+          <Button onClick={handleApply} loading={saving} disabled={loading}>
+            Apply
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        {payment && (
+          <div className="rounded-lg bg-navy/5 px-4 py-3 text-sm">
+            <span className="text-navy/60">Unapplied balance: </span>
+            <span className="font-bold text-navy tabular-nums">
+              {formatCurrency(payment.unapplied)}
+            </span>
+          </div>
+        )}
+
+        {loading ? (
+          <div className="flex items-center gap-2 py-2 text-sm text-navy/40">
+            <Spinner className="h-4 w-4" /> Loading invoices…
+          </div>
+        ) : invoices.length === 0 ? (
+          <p className="text-sm text-navy/40 py-2 italic">No open invoices for this customer.</p>
+        ) : (
+          <div className="border border-slate-200 rounded-lg overflow-hidden">
+            <Table>
+              <thead>
+                <tr className="bg-slate-50">
+                  <Th>Date</Th>
+                  <Th numeric>Balance Due</Th>
+                  <Th numeric>Amount to Apply</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {invoices.map((inv) => (
+                  <Tr key={inv.id}>
+                    <Td>{formatDate(inv.date)}</Td>
+                    <Td numeric className="font-semibold">
+                      {formatCurrency(inv.balanceDue)}
+                    </Td>
+                    <Td numeric>
+                      <Input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        max={inv.balanceDue}
+                        placeholder="0.00"
+                        value={amounts[inv.id] ?? ''}
+                        onChange={(e) =>
+                          setAmounts((prev) => ({ ...prev, [inv.id]: e.target.value }))
+                        }
+                        className="text-right"
+                      />
+                    </Td>
+                  </Tr>
+                ))}
+              </tbody>
+            </Table>
+          </div>
+        )}
+
+        {applications.length > 0 && (
+          <div className="flex justify-between items-center px-1 text-sm">
+            <span className="text-navy/60">Total to apply</span>
+            <span
+              className={
+                'font-semibold tabular-nums ' +
+                (appliedTotal > unapplied ? 'text-red-500' : 'text-navy')
+              }
+            >
+              {formatCurrency(appliedTotal)}
+            </span>
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Refund Modal — refund an unapplied balance back to the customer
+// ---------------------------------------------------------------------------
+
+interface RefundPaymentModalProps {
+  open: boolean;
+  payment: Payment | null;
+  accounts: Account[];
+  onClose: () => void;
+  onRefunded: () => void;
+}
+
+function RefundPaymentModal({ open, payment, accounts, onClose, onRefunded }: RefundPaymentModalProps) {
+  const [bankAccountId, setBankAccountId] = useState('');
+  const [amount, setAmount] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (open && payment) {
+      setBankAccountId('');
+      setAmount(Number(payment.unapplied).toFixed(2));
+    }
+  }, [open, payment]);
+
+  const bankAccounts = accounts.filter((a) => a.type === 'asset');
+
+  async function handleRefund() {
+    if (!payment) return;
+    if (!bankAccountId) { toast('Select a bank account.', 'danger'); return; }
+    if (!amount || Number(amount) <= 0) { toast('Enter a valid refund amount.', 'danger'); return; }
+    setSaving(true);
+    try {
+      await api.post(`/api/payments/${payment.id}`, {
+        action: 'refund',
+        bankAccountId,
+        amount,
+      });
+      toast('Refund recorded.', 'success');
+      onRefunded();
+      onClose();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to record refund.';
+      toast(msg, 'danger');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Refund Unapplied Payment"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
+          <Button onClick={handleRefund} loading={saving}>
+            Record Refund
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        {payment && (
+          <div className="rounded-lg bg-gold/10 border border-gold/30 px-4 py-3 text-sm text-navy/80">
+            Unapplied balance available to refund:{' '}
+            <span className="font-bold">{formatCurrency(payment.unapplied)}</span>
+          </div>
+        )}
+
+        <div>
+          <Label htmlFor="rf-bank">Refund From (Bank Account) *</Label>
+          <Select
+            id="rf-bank"
+            value={bankAccountId}
+            onChange={(e) => setBankAccountId(e.target.value)}
+            autoFocus
+          >
+            <option value="">Select a bank account…</option>
+            {bankAccounts.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.code} — {a.name}
+              </option>
+            ))}
+          </Select>
+        </div>
+
+        <div>
+          <Label htmlFor="rf-amount">Refund Amount *</Label>
+          <Input
+            id="rf-amount"
+            type="number"
+            min="0.01"
+            step="0.01"
+            max={payment?.unapplied}
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+          />
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main Page
 // ---------------------------------------------------------------------------
 
 export default function PaymentsPage() {
   const [payments, setPayments] = useState<Payment[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
+  const [accounts, setAccounts] = useState<Account[]>([]);
   const [customerMap, setCustomerMap] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
+
+  const [applyTarget, setApplyTarget] = useState<Payment | null>(null);
+  const [refundTarget, setRefundTarget] = useState<Payment | null>(null);
+  const [voidTarget, setVoidTarget] = useState<Payment | null>(null);
+  const [voiding, setVoiding] = useState(false);
 
   const fetchPayments = useCallback(async () => {
     setLoading(true);
@@ -401,18 +664,42 @@ export default function PaymentsPage() {
     }
   }, []);
 
+  const fetchAccounts = useCallback(async () => {
+    try {
+      const list = await api.get<Account[]>('/api/accounts');
+      setAccounts(Array.isArray(list) ? list : []);
+    } catch {
+      // Non-fatal; refund modal will show an empty account list.
+    }
+  }, []);
+
   useEffect(() => {
     fetchPayments();
     fetchCustomers();
-  }, [fetchPayments, fetchCustomers]);
+    fetchAccounts();
+  }, [fetchPayments, fetchCustomers, fetchAccounts]);
+
+  async function handleVoid() {
+    if (!voidTarget) return;
+    setVoiding(true);
+    try {
+      await api.del(`/api/payments/${voidTarget.id}`);
+      toast('Payment voided.', 'success');
+      setVoidTarget(null);
+      fetchPayments();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to void payment.';
+      toast(msg, 'danger');
+    } finally {
+      setVoiding(false);
+    }
+  }
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
-
       <PageHeader
         title="Receive Payments"
-        icon={CreditCard}
+        icon={HandCoins}
         action={
           <Button onClick={() => setModalOpen(true)}>
             <Plus className="h-4 w-4" />
@@ -423,15 +710,20 @@ export default function PaymentsPage() {
 
       <Card className="p-0 overflow-hidden">
         {loading ? (
-          <div className="p-12 text-center text-navy/40 text-sm">Loading payments…</div>
-        ) : payments.length === 0 ? (
-          <div className="p-12 text-center">
-            <CreditCard className="h-12 w-12 text-navy/20 mx-auto mb-3" />
-            <p className="text-navy/50 font-medium">No payments recorded yet.</p>
-            <p className="text-navy/35 text-sm mt-1">
-              Click &quot;Receive Payment&quot; to record a customer payment.
-            </p>
+          <div className="flex items-center justify-center py-20 text-navy/40">
+            <Spinner className="h-6 w-6" />
           </div>
+        ) : payments.length === 0 ? (
+          <EmptyState
+            icon={HandCoins}
+            title="No payments recorded yet"
+            message="Record your first customer payment to get started."
+            action={
+              <Button onClick={() => setModalOpen(true)}>
+                <Plus className="h-4 w-4" /> Receive Payment
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -440,16 +732,18 @@ export default function PaymentsPage() {
                 <Th>Customer</Th>
                 <Th>Method</Th>
                 <Th>Reference</Th>
-                <Th className="text-right">Amount</Th>
-                <Th className="text-right">Unapplied</Th>
+                <Th numeric>Amount</Th>
+                <Th numeric>Unapplied</Th>
+                <Th>Status</Th>
+                <Th className="text-right">Actions</Th>
               </tr>
             </thead>
             <tbody>
               {payments.map((p) => (
-                <Tr key={p.id}>
+                <Tr key={p.id} className={p.voidedAt ? 'opacity-50' : undefined}>
                   <Td className="whitespace-nowrap text-navy/70">{formatDate(p.date)}</Td>
                   <Td className="font-medium text-navy">
-                    {customerMap[p.customerId] ?? p.customerId}
+                    {customerMap[p.customerId] ?? '—'}
                   </Td>
                   <Td>
                     <Badge tone={methodBadgeTone(p.method)}>
@@ -457,10 +751,10 @@ export default function PaymentsPage() {
                     </Badge>
                   </Td>
                   <Td className="text-navy/60 text-sm">{p.reference ?? '—'}</Td>
-                  <Td className="text-right font-semibold text-navy tabular-nums">
+                  <Td numeric className="font-semibold">
                     {formatCurrency(p.amount)}
                   </Td>
-                  <Td className="text-right tabular-nums">
+                  <Td numeric>
                     {Number(p.unapplied) > 0 ? (
                       <span className="text-gold font-medium">
                         {formatCurrency(p.unapplied)}
@@ -468,6 +762,48 @@ export default function PaymentsPage() {
                     ) : (
                       <span className="text-emerald font-medium">
                         {formatCurrency(p.unapplied)}
+                      </span>
+                    )}
+                  </Td>
+                  <Td>
+                    {p.voidedAt ? (
+                      <Badge tone="neutral">Void</Badge>
+                    ) : (
+                      <Badge tone="success">Posted</Badge>
+                    )}
+                  </Td>
+                  <Td className="text-right">
+                    {!p.voidedAt && (
+                      <span className="inline-flex items-center gap-1">
+                        {Number(p.unapplied) > 0 && (
+                          <>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => setApplyTarget(p)}
+                              title="Apply unapplied balance to open invoices"
+                            >
+                              Apply
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => setRefundTarget(p)}
+                              title="Refund unapplied balance to the customer"
+                            >
+                              Refund
+                            </Button>
+                          </>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setVoidTarget(p)}
+                          className="text-red-500 hover:bg-red-50"
+                          title="Void this payment"
+                        >
+                          Void
+                        </Button>
                       </span>
                     )}
                   </Td>
@@ -483,6 +819,42 @@ export default function PaymentsPage() {
         onClose={() => setModalOpen(false)}
         onSaved={fetchPayments}
         customers={customers}
+      />
+
+      <ApplyUnappliedModal
+        open={!!applyTarget}
+        payment={applyTarget}
+        onClose={() => setApplyTarget(null)}
+        onApplied={fetchPayments}
+      />
+
+      <RefundPaymentModal
+        open={!!refundTarget}
+        payment={refundTarget}
+        accounts={accounts}
+        onClose={() => setRefundTarget(null)}
+        onRefunded={fetchPayments}
+      />
+
+      <ConfirmDialog
+        open={!!voidTarget}
+        title="Void Payment"
+        message={
+          <>
+            Are you sure you want to void the{' '}
+            <strong>{formatCurrency(voidTarget?.amount ?? '0')}</strong> payment from{' '}
+            <strong>
+              {voidTarget ? customerMap[voidTarget.customerId] ?? 'this customer' : ''}
+            </strong>
+            ? This reverses the journal entry and restores the balance due on every invoice it was
+            applied to. This cannot be undone.
+          </>
+        }
+        confirmLabel="Void Payment"
+        tone="danger"
+        loading={voiding}
+        onConfirm={handleVoid}
+        onClose={() => setVoidTarget(null)}
       />
     </main>
   );

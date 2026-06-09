@@ -6,14 +6,15 @@
  * computing an exact weighted COGS from the actually-consumed layer quantities and
  * costs rather than a running average.
  *
- * GL impact:
+ * GL impact (the inventory side honors item.assetAccountId when configured,
+ * falling back to account code 1300, matching the average-cost services):
  *   receiveStock:
- *     Dr 1300 Inventory     qty * unitCost
+ *     Dr Inventory Asset (item.assetAccountId ?? 1300)   qty * unitCost
  *     Cr 3000 Owner's Equity  qty * unitCost   (opening/adjustment offset)
  *
  *   consumeStock:
  *     Dr 5000 COGS           computed COGS (exact FIFO cost)
- *     Cr 1300 Inventory      computed COGS
+ *     Cr Inventory Asset (item.assetAccountId ?? 1300)   computed COGS
  */
 import { and, asc, eq, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
@@ -88,12 +89,12 @@ export async function receiveStock(
   if (unitCost.isNegative()) throw validation('unitCost cannot be negative.');
 
   // Validate item exists in company scope
-  await loadItem(ctx, input.itemId);
+  const item = await loadItem(ctx, input.itemId);
 
   const totalCost = Money.round2(qty.times(unitCost));
 
   return inTransaction(ctx, async (tx) => {
-    const inventoryAccountId = await accountIdByCode(tx, '1300');
+    const inventoryAccountId = item.assetAccountId ?? (await accountIdByCode(tx, '1300'));
     const offsetAccountId = await accountIdByCode(tx, '3000');
 
     // Post GL: Dr Inventory, Cr Owner's Equity
@@ -199,7 +200,7 @@ export async function consumeStock(
   if (needQty.lessThanOrEqualTo(0)) throw validation('quantity must be positive.');
 
   // Validate item exists
-  await loadItem(ctx, input.itemId);
+  const item = await loadItem(ctx, input.itemId);
 
   return inTransaction(ctx, async (tx) => {
     // Load all layers for this item with remaining qty > 0, oldest first
@@ -267,7 +268,7 @@ export async function consumeStock(
 
     // Post GL: Dr COGS, Cr Inventory
     const cogsAmount = Money.round2(totalCOGS);
-    const inventoryAccountId = await accountIdByCode(tx, '1300');
+    const inventoryAccountId = item.assetAccountId ?? (await accountIdByCode(tx, '1300'));
     const cogsAccountId = await accountIdByCode(tx, '5000');
 
     const entry = await postJournalEntry(tx, {

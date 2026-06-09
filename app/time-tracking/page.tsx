@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { Clock, Plus } from 'lucide-react';
+import { Timer, Plus } from 'lucide-react';
 import {
   Button,
   Card,
@@ -15,11 +15,14 @@ import {
   Tr,
   Modal,
   PageHeader,
+  ConfirmDialog,
+  EmptyState,
+  Spinner,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { formatCurrency } from '@/lib/money';
+import { formatCurrency, Money } from '@/lib/money';
+import { formatDate } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -67,23 +70,22 @@ const emptyForm: LogTimeForm = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function entryAmount(entry: TimeEntry): number {
-  const h = parseFloat(entry.hours) || 0;
-  const r = parseFloat(entry.rate ?? '0') || 0;
-  return h * r;
+/** Decimal-safe hours x rate (never float math for money). */
+function entryAmount(entry: TimeEntry) {
+  return Money.mul(entry.hours, entry.rate ?? '0');
 }
 
 /** Group entries by customerId, returning only billable + uninvoiced ones */
 function unbilledByCustomer(entries: TimeEntry[], customers: Customer[]) {
   const custMap = new Map(customers.map((c) => [c.id, c.displayName]));
-  const groups = new Map<string, { name: string; total: number }>();
+  const groups = new Map<string, { name: string; total: ReturnType<typeof entryAmount> }>();
 
   for (const e of entries) {
     if (!e.billable || e.invoicedInvoiceId || !e.customerId) continue;
     const prev = groups.get(e.customerId);
     const amount = entryAmount(e);
     if (prev) {
-      prev.total += amount;
+      prev.total = prev.total.plus(amount);
     } else {
       groups.set(e.customerId, { name: custMap.get(e.customerId) ?? e.customerId, total: amount });
     }
@@ -103,6 +105,9 @@ export default function TimeTrackingPage() {
   const [form, setForm] = useState<LogTimeForm>(emptyForm);
   const [saving, setSaving] = useState(false);
   const [billing, setBilling] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [pendingBill, setPendingBill] = useState<string | null>(null);
 
   // Filters
   const [filterBillable, setFilterBillable] = useState<'all' | 'yes' | 'no'>('all');
@@ -159,21 +164,27 @@ export default function TimeTrackingPage() {
 
   // ---- Delete ----
 
-  async function handleDelete(id: string) {
-    if (!confirm('Delete this time entry?')) return;
+  async function handleDelete() {
+    const id = pendingDelete;
+    if (!id) return;
+    setDeleting(true);
     try {
       await api.del(`/api/time-entries/${id}`);
       toast('Entry deleted', 'success');
+      setPendingDelete(null);
       load();
     } catch (e) {
       toast(e instanceof ApiError ? e.message : 'Failed to delete entry', 'danger');
+    } finally {
+      setDeleting(false);
     }
   }
 
   // ---- Bill to Invoice ----
 
-  async function handleBill(customerId: string) {
-    if (!confirm('Create an invoice from all unbilled time for this customer?')) return;
+  async function handleBill() {
+    const customerId = pendingBill;
+    if (!customerId) return;
     setBilling(customerId);
     try {
       const inv = await api.post<{ invoiceNumber: number; total: string }>(
@@ -181,6 +192,7 @@ export default function TimeTrackingPage() {
         { customerId },
       );
       toast(`Invoice #${inv.invoiceNumber} created for ${formatCurrency(inv.total)}`, 'success');
+      setPendingBill(null);
       load();
     } catch (e) {
       toast(e instanceof ApiError ? e.message : 'Failed to create invoice', 'danger');
@@ -196,11 +208,10 @@ export default function TimeTrackingPage() {
   const unbilled = unbilledByCustomer(entries, customers);
 
   return (
-    <main className="min-h-screen bg-offwhite p-6">
-      <Toaster />
+    <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
         title="Time Tracking"
-        icon={Clock}
+        icon={Timer}
         action={
           <Button onClick={() => { setForm(emptyForm); setShowLog(true); }}>
             <Plus className="h-4 w-4" />
@@ -217,7 +228,7 @@ export default function TimeTrackingPage() {
             <thead>
               <tr>
                 <Th>Customer</Th>
-                <Th className="text-right">Unbilled Amount</Th>
+                <Th numeric>Unbilled Amount</Th>
                 <Th />
               </tr>
             </thead>
@@ -225,15 +236,15 @@ export default function TimeTrackingPage() {
               {unbilled.map((g) => (
                 <Tr key={g.id}>
                   <Td>{g.name}</Td>
-                  <Td className="text-right font-mono">{formatCurrency(g.total)}</Td>
-                  <Td className="text-right">
+                  <Td numeric>{formatCurrency(g.total)}</Td>
+                  <Td numeric>
                     <Button
                       size="sm"
                       variant="secondary"
-                      disabled={billing === g.id}
-                      onClick={() => handleBill(g.id)}
+                      loading={billing === g.id}
+                      onClick={() => setPendingBill(g.id)}
                     >
-                      {billing === g.id ? 'Creating Invoice...' : 'Create Invoice from Billable Time'}
+                      Create Invoice from Billable Time
                     </Button>
                   </Td>
                 </Tr>
@@ -274,9 +285,21 @@ export default function TimeTrackingPage() {
       {/* Time Entries Table */}
       <Card className="p-4">
         {loading ? (
-          <p className="text-navy/50 text-sm p-4">Loading...</p>
+          <div className="flex items-center gap-2 text-navy/50 text-sm p-4">
+            <Spinner className="h-4 w-4" /> Loading...
+          </div>
         ) : entries.length === 0 ? (
-          <p className="text-navy/50 text-sm p-4 text-center">No time entries found. Log your first entry above.</p>
+          <EmptyState
+            icon={Timer}
+            title="No time entries yet"
+            message="Log your first time entry to start tracking billable hours."
+            action={
+              <Button onClick={() => { setForm(emptyForm); setShowLog(true); }}>
+                <Plus className="h-4 w-4" />
+                Log Time
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -284,9 +307,9 @@ export default function TimeTrackingPage() {
                 <Th>Date</Th>
                 <Th>Customer</Th>
                 <Th>Description</Th>
-                <Th className="text-right">Hours</Th>
-                <Th className="text-right">Rate</Th>
-                <Th className="text-right">Amount</Th>
+                <Th numeric>Hours</Th>
+                <Th numeric>Rate</Th>
+                <Th numeric>Amount</Th>
                 <Th>Billable</Th>
                 <Th>Status</Th>
                 <Th />
@@ -295,14 +318,14 @@ export default function TimeTrackingPage() {
             <tbody>
               {entries.map((e) => (
                 <Tr key={e.id}>
-                  <Td>{e.date ? new Date(e.date).toLocaleDateString() : '—'}</Td>
+                  <Td>{e.date ? formatDate(e.date) : '—'}</Td>
                   <Td>{e.customerId ? (custMap.get(e.customerId) ?? '—') : '—'}</Td>
                   <Td className="max-w-xs truncate">{e.description ?? '—'}</Td>
-                  <Td className="text-right font-mono">{parseFloat(e.hours).toFixed(2)}</Td>
-                  <Td className="text-right font-mono">
+                  <Td numeric>{parseFloat(e.hours).toFixed(2)}</Td>
+                  <Td numeric>
                     {e.rate ? formatCurrency(e.rate) : '—'}
                   </Td>
-                  <Td className="text-right font-mono">
+                  <Td numeric>
                     {e.rate ? formatCurrency(entryAmount(e)) : '—'}
                   </Td>
                   <Td>
@@ -321,12 +344,14 @@ export default function TimeTrackingPage() {
                   </Td>
                   <Td>
                     {!e.invoicedInvoiceId && (
-                      <button
-                        className="text-red-400 hover:text-red-600 text-xs"
-                        onClick={() => handleDelete(e.id)}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-red-500 hover:bg-red-50"
+                        onClick={() => setPendingDelete(e.id)}
                       >
                         Delete
-                      </button>
+                      </Button>
                     )}
                   </Td>
                 </Tr>
@@ -346,16 +371,24 @@ export default function TimeTrackingPage() {
             <Button variant="secondary" onClick={() => setShowLog(false)}>
               Cancel
             </Button>
-            <Button onClick={handleLogTime} disabled={saving}>
-              {saving ? 'Saving...' : 'Log Time'}
+            <Button type="submit" form="log-time-form" loading={saving}>
+              Log Time
             </Button>
           </>
         }
       >
-        <div className="space-y-4">
+        <form
+          id="log-time-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleLogTime();
+          }}
+          className="space-y-4"
+        >
           <div>
             <Label>Customer</Label>
             <Select
+              autoFocus
               value={form.customerId}
               onChange={(e) => setForm((f) => ({ ...f, customerId: e.target.value }))}
             >
@@ -404,7 +437,7 @@ export default function TimeTrackingPage() {
 
           {form.hours && form.rate && (
             <p className="text-sm text-navy/70">
-              Amount: <span className="font-semibold">{formatCurrency(parseFloat(form.hours || '0') * parseFloat(form.rate || '0'))}</span>
+              Amount: <span className="font-semibold">{formatCurrency(Money.mul(form.hours || '0', form.rate || '0'))}</span>
             </p>
           )}
 
@@ -429,8 +462,31 @@ export default function TimeTrackingPage() {
               Billable to customer
             </label>
           </div>
-        </div>
+        </form>
       </Modal>
+
+      {/* Confirmations */}
+      <ConfirmDialog
+        open={!!pendingDelete}
+        title="Delete time entry?"
+        message="This cannot be undone."
+        confirmLabel="Delete"
+        tone="danger"
+        loading={deleting}
+        onConfirm={handleDelete}
+        onClose={() => setPendingDelete(null)}
+      />
+      <ConfirmDialog
+        open={!!pendingBill}
+        title="Create invoice from billable time?"
+        message={`Create an invoice from all unbilled time for ${
+          pendingBill ? (custMap.get(pendingBill) ?? 'this customer') : 'this customer'
+        }?`}
+        confirmLabel="Create Invoice"
+        loading={!!pendingBill && billing === pendingBill}
+        onConfirm={handleBill}
+        onClose={() => setPendingBill(null)}
+      />
     </main>
   );
 }

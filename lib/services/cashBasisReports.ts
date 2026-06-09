@@ -133,6 +133,11 @@ export async function profitAndLossCashBasis(
   range?: { from?: Date; to?: Date },
 ): Promise<ProfitAndLossCashBasis> {
   // 1. Accrual P&L (delegate to the canonical report — do NOT edit reports.ts).
+  //    Year-end closing entries (sourceRef 'fiscal-close:<year>') cannot leak in
+  //    here: profitAndLoss already excludes them via notFiscalCloseEntry(), and
+  //    the AR/AP adjustments below are immune by construction — closing entries
+  //    only touch revenue/expense accounts and Retained Earnings (3900), never
+  //    AR (1200) or AP (2000).
   const accrual = await profitAndLoss(ctx, range);
 
   // 2. Period boundaries. Default: 1970-01-01 → now (covers all history).

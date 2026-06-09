@@ -13,10 +13,9 @@ import {
   Tr,
   PageHeader,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { formatCurrency } from '@/lib/money';
+import { formatCurrency, Money } from '@/lib/money';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -111,8 +110,6 @@ export default function Form1099EfilePage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
-
       <PageHeader
         title="1099-NEC E-file Export"
         icon={FileCode2}
@@ -133,7 +130,7 @@ export default function Form1099EfilePage() {
       {/* ------------------------------------------------------------------ */}
       {/* Year picker + run                                                    */}
       {/* ------------------------------------------------------------------ */}
-      <Card className="mb-6">
+      <Card className="p-4 mb-6">
         <div className="flex flex-wrap items-end gap-4">
           <div>
             <Label htmlFor="year">Calendar Year</Label>
@@ -164,7 +161,7 @@ export default function Form1099EfilePage() {
       {/* Summary + download call-to-action                                   */}
       {/* ------------------------------------------------------------------ */}
       {!loading && rows !== null && (
-        <Card className="mb-6 border border-blue-200 bg-blue-50/60">
+        <Card className="p-4 mb-6 border border-electric/30 bg-electric/5">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="text-sm font-semibold text-navy">
@@ -189,8 +186,8 @@ export default function Form1099EfilePage() {
       {/* ------------------------------------------------------------------ */}
       {/* IRS FIRE disclaimer                                                  */}
       {/* ------------------------------------------------------------------ */}
-      <Card className="mb-6 border border-amber-200 bg-amber-50/60">
-        <p className="text-xs text-amber-800 leading-relaxed">
+      <Card className="p-4 mb-6 border border-gold/30 bg-gold/10">
+        <p className="text-xs text-navy/70 leading-relaxed">
           <strong>Disclaimer:</strong> This tool generates the 1099-NEC data file for review
           purposes. Actual transmission to the IRS must be performed via the IRS FIRE (Filing
           Information Returns Electronically) system at{' '}
@@ -248,7 +245,7 @@ export default function Form1099EfilePage() {
                   <Td className="font-semibold text-navy">{row.vendorName}</Td>
                   <Td className="tabular-nums text-navy/70">
                     {row.taxId ?? (
-                      <span className="italic text-amber-600 text-xs">Not on file</span>
+                      <span className="italic text-gold text-xs">Not on file</span>
                     )}
                   </Td>
                   <Td className="text-right tabular-nums font-semibold">
@@ -263,9 +260,7 @@ export default function Form1099EfilePage() {
                   Total — {rows.length} vendor{rows.length !== 1 ? 's' : ''}
                 </td>
                 <td className="py-3 px-4 text-right tabular-nums">
-                  {formatCurrency(
-                    rows.reduce((sum, r) => sum + parseFloat(r.total), 0).toFixed(2),
-                  )}
+                  {formatCurrency(Money.add(...rows.map((r) => r.total)))}
                 </td>
               </tr>
             </tfoot>

@@ -406,7 +406,7 @@ export async function renderStatementPdf(
 
       drawTableRow(
         fmtDate(line.date),
-        isInvoice ? 'Invoice' : 'Payment',
+        isInvoice ? 'Invoice' : line.type === 'credit_memo' ? 'Credit Memo' : 'Payment',
         refStr,
         isInvoice ? fmt(line.amount) : '',
         isInvoice ? '' : fmt(line.amount),

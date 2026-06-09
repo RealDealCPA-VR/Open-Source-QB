@@ -2,9 +2,9 @@
 
 import { useEffect, useState } from 'react';
 import { BarChart2 } from 'lucide-react';
-import { Button, Card, Badge, PageHeader, Toaster, toast } from '@/components/ui';
+import { Button, Card, Badge, Input, Label, PageHeader, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { formatCurrency } from '@/lib/money';
+import { formatCurrency, Money } from '@/lib/money';
 
 // ---------------------------------------------------------------------------
 // Types (must match ClassifiedBalanceSheet from the service)
@@ -103,7 +103,7 @@ function GroupCard({
         <h2 className="text-base font-bold text-navy">{title}</h2>
       </div>
       <div className="divide-y divide-slate-50">{children}</div>
-      <div className="flex items-center justify-between px-4 py-3 bg-navy/3 border-t-2 border-navy/15">
+      <div className="flex items-center justify-between px-4 py-3 bg-navy/5 border-t-2 border-navy/15">
         <span className="font-bold text-navy">{totalLabel}</span>
         <span className="tabular-nums font-extrabold text-navy text-base">{formatCurrency(total)}</span>
       </div>
@@ -145,24 +145,32 @@ export default function ClassifiedBalanceSheetPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader
-        title="Classified Balance Sheet"
-        icon={BarChart2}
-        action={
-          <div className="flex items-center gap-3">
-            <input
+      <PageHeader title="Classified Balance Sheet" icon={BarChart2} />
+
+      {/* As-of filter */}
+      <Card className="p-4 mb-6 max-w-3xl">
+        <form
+          className="flex items-end gap-3 flex-wrap"
+          onSubmit={(e) => {
+            e.preventDefault();
+            fetchReport();
+          }}
+        >
+          <div>
+            <Label htmlFor="asOf">As of</Label>
+            <Input
+              id="asOf"
               type="date"
               value={asOf}
               onChange={(e) => setAsOf(e.target.value)}
-              className="rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy outline-none focus:border-electric focus:ring-2 focus:ring-electric/30"
-              placeholder="As of date"
+              className="w-44"
             />
-            <Button onClick={fetchReport} disabled={loading} variant="secondary">
-              {loading ? 'Loading...' : 'Run'}
-            </Button>
           </div>
-        }
-      />
+          <Button type="submit" variant="secondary" size="sm" loading={loading} className="mb-0.5">
+            Run Report
+          </Button>
+        </form>
+      </Card>
 
       {/* Balance status + as-of date */}
       {!loading && report && (
@@ -237,7 +245,7 @@ export default function ClassifiedBalanceSheetPage() {
                 {formatCurrency(report.retainedEarnings)}
               </span>
             </div>
-            <div className="flex items-center justify-between px-4 py-3 bg-navy/3 border-t-2 border-navy/15">
+            <div className="flex items-center justify-between px-4 py-3 bg-navy/5 border-t-2 border-navy/15">
               <span className="font-bold text-navy">Total Equity</span>
               <span className="tabular-nums font-extrabold text-navy text-base">
                 {formatCurrency(report.totalEquity)}
@@ -249,15 +257,11 @@ export default function ClassifiedBalanceSheetPage() {
           <div className="rounded-2xl bg-navy text-white px-5 py-4 flex items-center justify-between shadow-lg">
             <span className="font-bold">Total Liabilities + Equity</span>
             <span className="tabular-nums text-lg font-extrabold">
-              {formatCurrency(
-                (parseFloat(report.totalLiabilities) + parseFloat(report.totalEquity)).toFixed(2),
-              )}
+              {formatCurrency(Money.add(report.totalLiabilities, report.totalEquity))}
             </span>
           </div>
         </div>
       )}
-
-      <Toaster />
     </main>
   );
 }

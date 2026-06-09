@@ -186,6 +186,8 @@ export async function salesTaxByAgency(
   const conds = [eq(invoices.companyId, ctx.companyId)];
   if (range?.from) conds.push(gte(invoices.date, range.from));
   if (range?.to) conds.push(lte(invoices.date, range.to));
+  // Exclude void/draft invoices: their tax was never collected / was reversed.
+  conds.push(sql`${invoices.status} NOT IN ('void', 'draft')`);
 
   const invoiceRows = await ctx.db
     .select({

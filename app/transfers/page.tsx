@@ -5,9 +5,11 @@ import { ArrowLeftRight, Plus } from 'lucide-react';
 import {
   Button,
   Card,
+  EmptyState,
   Input,
   Select,
   Label,
+  Spinner,
   Table,
   Th,
   Td,
@@ -18,6 +20,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/dates';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -106,8 +109,8 @@ function NewTransferModal({ open, onClose, accounts, onCreated }: NewTransferMod
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
-          <Button onClick={handleSubmit} disabled={saving}>
-            {saving ? 'Saving…' : 'Record Transfer'}
+          <Button onClick={handleSubmit} loading={saving}>
+            Record Transfer
           </Button>
         </>
       }
@@ -119,6 +122,7 @@ function NewTransferModal({ open, onClose, accounts, onCreated }: NewTransferMod
           <Input
             id="tr-date"
             type="date"
+            autoFocus
             value={date}
             onChange={(e) => setDate(e.target.value)}
           />
@@ -237,14 +241,20 @@ export default function TransfersPage() {
 
       <Card className="p-0 overflow-hidden">
         {loading ? (
-          <div className="flex items-center justify-center py-20 text-navy/40 text-sm">
-            Loading transfers…
+          <div className="py-20 flex justify-center">
+            <Spinner className="text-electric" />
           </div>
         ) : transfers.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-20 gap-3 text-navy/40">
-            <ArrowLeftRight className="h-10 w-10 opacity-30" />
-            <p className="text-sm">No transfers yet. Record one to move money between accounts.</p>
-          </div>
+          <EmptyState
+            icon={ArrowLeftRight}
+            title="No transfers yet"
+            message="Record one to move money between accounts."
+            action={
+              <Button onClick={() => setShowNew(true)}>
+                <Plus className="h-4 w-4" /> New Transfer
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -252,23 +262,21 @@ export default function TransfersPage() {
                 <Th>Date</Th>
                 <Th>From</Th>
                 <Th>To</Th>
-                <Th className="text-right">Amount</Th>
+                <Th numeric>Amount</Th>
                 <Th>Memo</Th>
               </Tr>
             </thead>
             <tbody>
               {transfers.map((tr) => (
                 <Tr key={tr.id}>
-                  <Td className="text-navy/70 tabular-nums">
-                    {tr.date ? tr.date.slice(0, 10) : '—'}
-                  </Td>
+                  <Td className="text-navy/70">{formatDate(tr.date)}</Td>
                   <Td className="text-navy/80">
                     {accountMap[tr.fromAccountId] ?? tr.fromAccountId}
                   </Td>
                   <Td className="text-navy/80">
                     {accountMap[tr.toAccountId] ?? tr.toAccountId}
                   </Td>
-                  <Td className="text-right tabular-nums font-semibold text-navy">
+                  <Td numeric className="font-semibold text-navy">
                     {formatCurrency(tr.amount)}
                   </Td>
                   <Td className="text-navy/50 text-sm">{tr.memo ?? '—'}</Td>

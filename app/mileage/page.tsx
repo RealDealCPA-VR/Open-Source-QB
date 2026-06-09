@@ -5,10 +5,13 @@ import { Car, Plus, Trash2 } from 'lucide-react';
 import {
   Button,
   Card,
+  ConfirmDialog,
+  EmptyState,
   Input,
   Select,
   Label,
   Badge,
+  Spinner,
   Table,
   Th,
   Td,
@@ -16,10 +19,10 @@ import {
   Modal,
   PageHeader,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -67,7 +70,9 @@ interface LogMilesForm {
 }
 
 const EMPTY_FORM: LogMilesForm = {
-  date: new Date().toISOString().slice(0, 10),
+  // date is set fresh each time the modal opens (see openLogModal) so a long-running
+  // session never defaults to a stale day.
+  date: '',
   miles: '',
   ratePerMile: '0.67',
   customerId: '',
@@ -106,7 +111,7 @@ function SummaryCard({ summary }: { summary: MileageSummary | null }) {
           <p className="text-xs font-semibold text-navy/50 uppercase tracking-wider mb-1">
             Total Deduction
           </p>
-          <p className="text-3xl font-extrabold text-emerald-600">
+          <p className="text-3xl font-extrabold text-emerald">
             {formatCurrency(summary.totalAmount)}
           </p>
         </div>
@@ -139,6 +144,7 @@ function LogMilesForm({
           <Input
             id="ml-date"
             type="date"
+            autoFocus
             value={form.date}
             onChange={(e) => onChange('date', e.target.value)}
             required
@@ -259,7 +265,7 @@ export default function MileagePage() {
   // ---------------------------------------------------------------------------
 
   function openLogModal() {
-    setLogForm(EMPTY_FORM);
+    setLogForm({ ...EMPTY_FORM, date: new Date().toISOString().slice(0, 10) });
     setLogOpen(true);
   }
 
@@ -320,11 +326,7 @@ export default function MileagePage() {
   // ---------------------------------------------------------------------------
 
   function fmtDate(iso: string) {
-    return new Date(iso).toLocaleDateString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-    });
+    return formatDate(iso, 'MMM d, yyyy');
   }
 
   function fmtMiles(m: string) {
@@ -357,14 +359,20 @@ export default function MileagePage() {
       {/* Log table */}
       <Card>
         {loading ? (
-          <div className="p-12 text-center text-navy/40 text-sm">Loading mileage logs...</div>
-        ) : logs.length === 0 ? (
-          <div className="p-12 text-center">
-            <Car className="mx-auto h-10 w-10 text-navy/20 mb-3" />
-            <p className="text-navy/50 text-sm">
-              No mileage logs yet. Click &quot;Log Miles&quot; to get started.
-            </p>
+          <div className="p-12 flex items-center justify-center gap-2 text-navy/40 text-sm">
+            <Spinner className="h-4 w-4" /> Loading mileage logs...
           </div>
+        ) : logs.length === 0 ? (
+          <EmptyState
+            icon={Car}
+            title="No mileage logs yet"
+            message="Log your business miles to track your deduction."
+            action={
+              <Button onClick={openLogModal}>
+                <Plus className="h-4 w-4" /> Log Miles
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -372,9 +380,9 @@ export default function MileagePage() {
                 <Th>Date</Th>
                 <Th>Customer</Th>
                 <Th>Purpose</Th>
-                <Th className="text-right">Miles</Th>
-                <Th className="text-right">Rate</Th>
-                <Th className="text-right">Amount</Th>
+                <Th numeric>Miles</Th>
+                <Th numeric>Rate</Th>
+                <Th numeric>Amount</Th>
                 <Th>Billable</Th>
                 <Th className="text-right">Actions</Th>
               </tr>
@@ -396,11 +404,11 @@ export default function MileagePage() {
                     )}
                   </Td>
                   <Td className="text-navy/70">{log.purpose ?? <span className="text-navy/30">—</span>}</Td>
-                  <Td className="text-right font-mono text-navy">{fmtMiles(log.miles)}</Td>
-                  <Td className="text-right font-mono text-navy/70">
+                  <Td numeric className="text-navy">{fmtMiles(log.miles)}</Td>
+                  <Td numeric className="text-navy/70">
                     ${parseFloat(log.ratePerMile).toFixed(4)}
                   </Td>
-                  <Td className="text-right font-mono font-semibold text-navy">
+                  <Td numeric className="font-semibold text-navy">
                     {formatCurrency(log.amount)}
                   </Td>
                   <Td>
@@ -439,8 +447,8 @@ export default function MileagePage() {
             <Button variant="secondary" onClick={() => setLogOpen(false)} disabled={logSaving}>
               Cancel
             </Button>
-            <Button onClick={handleLog} disabled={logSaving}>
-              {logSaving ? 'Saving...' : 'Log Miles'}
+            <Button onClick={handleLog} loading={logSaving}>
+              Log Miles
             </Button>
           </>
         }
@@ -448,43 +456,32 @@ export default function MileagePage() {
         <LogMilesForm form={logForm} customers={customers} onChange={updateForm} />
       </Modal>
 
-      {/* ---- Delete confirm modal ---- */}
-      <Modal
+      {/* ---- Delete confirm ---- */}
+      <ConfirmDialog
         open={!!deleteTarget}
-        onClose={() => setDeleteTarget(null)}
         title="Delete Mileage Log"
-        footer={
+        message={
           <>
-            <Button
-              variant="secondary"
-              onClick={() => setDeleteTarget(null)}
-              disabled={deleting}
-            >
-              Cancel
-            </Button>
-            <Button variant="danger" onClick={handleDelete} disabled={deleting}>
-              {deleting ? 'Deleting...' : 'Yes, Delete'}
-            </Button>
+            Are you sure you want to delete this mileage log entry?{' '}
+            {deleteTarget && (
+              <>
+                <strong className="text-navy">
+                  {fmtMiles(deleteTarget.miles)} mi
+                </strong>{' '}
+                on{' '}
+                <strong className="text-navy">{fmtDate(deleteTarget.date)}</strong>
+                {deleteTarget.purpose ? ` — ${deleteTarget.purpose}` : ''}.
+              </>
+            )}{' '}
+            This action cannot be undone.
           </>
         }
-      >
-        <p className="text-navy/70 text-sm">
-          Are you sure you want to delete this mileage log entry?{' '}
-          {deleteTarget && (
-            <>
-              <strong className="text-navy">
-                {fmtMiles(deleteTarget.miles)} mi
-              </strong>{' '}
-              on{' '}
-              <strong className="text-navy">{fmtDate(deleteTarget.date)}</strong>
-              {deleteTarget.purpose ? ` — ${deleteTarget.purpose}` : ''}.
-            </>
-          )}{' '}
-          This action cannot be undone.
-        </p>
-      </Modal>
-
-      <Toaster />
+        confirmLabel="Yes, Delete"
+        tone="danger"
+        loading={deleting}
+        onConfirm={handleDelete}
+        onClose={() => setDeleteTarget(null)}
+      />
     </main>
   );
 }

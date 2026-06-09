@@ -1,10 +1,12 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { FileX, Plus, PlusCircle, MinusCircle } from 'lucide-react';
+import { RotateCcw, Plus, PlusCircle, MinusCircle } from 'lucide-react';
 import {
   Button,
   Card,
+  ConfirmDialog,
+  EmptyState,
   Input,
   Select,
   Label,
@@ -15,10 +17,12 @@ import {
   Tr,
   Modal,
   PageHeader,
+  Spinner,
   toast,
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/format';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -46,13 +50,39 @@ interface CreditMemo {
   status: 'open' | 'paid' | 'void';
   total: string;
   unapplied: string;
+  refundedAmount: string;
   memo: string | null;
 }
 
+interface Account {
+  id: string;
+  code: string;
+  name: string;
+  type: string;
+}
+
+interface Item {
+  id: string;
+  name: string;
+  type: 'service' | 'inventory' | 'non_inventory' | 'bundle';
+  salesPrice: string | null;
+  taxable: boolean;
+}
+
+interface TaxRate {
+  id: string;
+  name: string;
+  rate: string; // fraction, e.g. "0.082500"
+}
+
 interface LineRow {
+  itemId: string;
   description: string;
   quantity: string;
   rate: string;
+  taxable: boolean;
+  /** Inventory items only: true = return to stock, false = damaged write-off. */
+  restock: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -75,11 +105,27 @@ function computeLineTotal(line: LineRow): number {
   return (parseFloat(line.quantity) || 0) * (parseFloat(line.rate) || 0);
 }
 
-function computeTotal(lines: LineRow[]): number {
+function computeSubtotal(lines: LineRow[]): number {
   return lines.reduce((sum, l) => sum + computeLineTotal(l), 0);
 }
 
-const EMPTY_LINE: LineRow = { description: '', quantity: '', rate: '' };
+/** Mirror the service math: tax applies to taxable lines only. */
+function computeTax(lines: LineRow[], taxRate: number): number {
+  const taxableSubtotal = lines.reduce(
+    (sum, l) => sum + (l.taxable ? computeLineTotal(l) : 0),
+    0,
+  );
+  return taxableSubtotal * taxRate;
+}
+
+const EMPTY_LINE: LineRow = {
+  itemId: '',
+  description: '',
+  quantity: '',
+  rate: '',
+  taxable: true,
+  restock: true,
+};
 
 // ---------------------------------------------------------------------------
 // New Credit Memo Modal
@@ -89,13 +135,16 @@ interface NewMemoModalProps {
   open: boolean;
   onClose: () => void;
   customers: Customer[];
+  items: Item[];
+  taxRates: TaxRate[];
   onCreated: () => void;
 }
 
-function NewMemoModal({ open, onClose, customers, onCreated }: NewMemoModalProps) {
+function NewMemoModal({ open, onClose, customers, items, taxRates, onCreated }: NewMemoModalProps) {
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [memoNote, setMemoNote] = useState('');
+  const [taxRateId, setTaxRateId] = useState('');
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
   const [saving, setSaving] = useState(false);
 
@@ -104,19 +153,41 @@ function NewMemoModal({ open, onClose, customers, onCreated }: NewMemoModalProps
       setCustomerId('');
       setDate(new Date().toISOString().slice(0, 10));
       setMemoNote('');
+      setTaxRateId('');
       setLines([{ ...EMPTY_LINE }]);
     }
   }, [open]);
 
-  function updateLine(idx: number, field: keyof LineRow, value: string) {
+  const itemMap = new Map(items.map((i) => [i.id, i]));
+
+  function updateLine(idx: number, patch: Partial<LineRow>) {
     setLines((prev) => {
       const next = [...prev];
-      next[idx] = { ...next[idx], [field]: value };
+      next[idx] = { ...next[idx], ...patch };
       return next;
     });
   }
 
-  const liveTotal = computeTotal(lines);
+  /** Selecting an item pre-fills description/rate/taxable like the invoice modal. */
+  function selectItem(idx: number, itemId: string) {
+    const item = itemMap.get(itemId);
+    if (!item) {
+      updateLine(idx, { itemId: '' });
+      return;
+    }
+    updateLine(idx, {
+      itemId,
+      description: lines[idx].description || item.name,
+      rate: lines[idx].rate || (item.salesPrice ?? ''),
+      taxable: item.taxable,
+      restock: true,
+    });
+  }
+
+  const selectedRate = taxRates.find((t) => t.id === taxRateId);
+  const liveSubtotal = computeSubtotal(lines);
+  const liveTax = selectedRate ? computeTax(lines, parseFloat(selectedRate.rate) || 0) : 0;
+  const liveTotal = liveSubtotal + liveTax;
 
   async function handleSubmit() {
     if (!customerId) { toast('Please select a customer.', 'danger'); return; }
@@ -139,10 +210,14 @@ function NewMemoModal({ open, onClose, customers, onCreated }: NewMemoModalProps
         customerId,
         date,
         memo: memoNote || null,
+        taxRateId: taxRateId || null,
         lines: validLines.map((l) => ({
+          itemId: l.itemId || null,
           description: l.description || null,
           quantity: l.quantity,
           rate: l.rate,
+          taxable: l.taxable,
+          restock: l.restock,
         })),
       });
       toast('Credit memo created.', 'success');
@@ -158,14 +233,15 @@ function NewMemoModal({ open, onClose, customers, onCreated }: NewMemoModalProps
 
   return (
     <Modal
+      size="lg"
       open={open}
       onClose={onClose}
       title="New Credit Memo"
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
-          <Button onClick={handleSubmit} disabled={saving}>
-            {saving ? 'Saving…' : 'Create Credit Memo'}
+          <Button onClick={handleSubmit} loading={saving}>
+            Create Credit Memo
           </Button>
         </>
       }
@@ -178,6 +254,7 @@ function NewMemoModal({ open, onClose, customers, onCreated }: NewMemoModalProps
             id="cm-customer"
             value={customerId}
             onChange={(e) => setCustomerId(e.target.value)}
+            autoFocus
           >
             <option value="">Select a customer…</option>
             {customers.map((c) => (
@@ -211,50 +288,107 @@ function NewMemoModal({ open, onClose, customers, onCreated }: NewMemoModalProps
           </div>
 
           <div className="rounded-lg border border-slate-200 overflow-hidden">
-            <div className="grid grid-cols-[1fr_80px_90px_32px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
+            <div className="grid grid-cols-[minmax(110px,1fr)_minmax(110px,1fr)_64px_80px_40px_56px_32px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
+              <span>Item</span>
               <span>Description</span>
               <span>Qty</span>
               <span>Rate</span>
+              <span title="Line participates in sales tax">Tax</span>
+              <span title="Return inventory to stock (uncheck for damaged write-off)">Restock</span>
               <span />
             </div>
-            {lines.map((line, idx) => (
-              <div
-                key={idx}
-                className="grid grid-cols-[1fr_80px_90px_32px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
-              >
-                <Input
-                  placeholder="Description"
-                  value={line.description}
-                  onChange={(e) => updateLine(idx, 'description', e.target.value)}
-                />
-                <Input
-                  placeholder="1"
-                  type="number"
-                  min="0"
-                  step="any"
-                  value={line.quantity}
-                  onChange={(e) => updateLine(idx, 'quantity', e.target.value)}
-                />
-                <Input
-                  placeholder="0.00"
-                  type="number"
-                  min="0"
-                  step="any"
-                  value={line.rate}
-                  onChange={(e) => updateLine(idx, 'rate', e.target.value)}
-                />
-                <button
-                  type="button"
-                  onClick={() => setLines((prev) => prev.filter((_, i) => i !== idx))}
-                  disabled={lines.length === 1}
-                  className="text-navy/30 hover:text-red-500 disabled:opacity-20 transition-colors flex items-center justify-center"
-                  aria-label="Remove line"
+            {lines.map((line, idx) => {
+              const lineItem = line.itemId ? itemMap.get(line.itemId) : undefined;
+              const isInventory = lineItem?.type === 'inventory';
+              return (
+                <div
+                  key={idx}
+                  className="grid grid-cols-[minmax(110px,1fr)_minmax(110px,1fr)_64px_80px_40px_56px_32px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
                 >
-                  <MinusCircle className="h-4 w-4" />
-                </button>
-              </div>
-            ))}
+                  <Select
+                    value={line.itemId}
+                    onChange={(e) => selectItem(idx, e.target.value)}
+                    aria-label={`Line ${idx + 1} item`}
+                  >
+                    <option value="">— No item —</option>
+                    {items.map((it) => (
+                      <option key={it.id} value={it.id}>{it.name}</option>
+                    ))}
+                  </Select>
+                  <Input
+                    placeholder="Description"
+                    value={line.description}
+                    onChange={(e) => updateLine(idx, { description: e.target.value })}
+                  />
+                  <Input
+                    placeholder="1"
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={line.quantity}
+                    onChange={(e) => updateLine(idx, { quantity: e.target.value })}
+                  />
+                  <Input
+                    placeholder="0.00"
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={line.rate}
+                    onChange={(e) => updateLine(idx, { rate: e.target.value })}
+                  />
+                  <span className="flex items-center justify-center">
+                    <input
+                      type="checkbox"
+                      checked={line.taxable}
+                      onChange={(e) => updateLine(idx, { taxable: e.target.checked })}
+                      className="h-4 w-4 accent-electric"
+                      aria-label={`Line ${idx + 1} taxable`}
+                    />
+                  </span>
+                  <span className="flex items-center justify-center">
+                    {isInventory ? (
+                      <input
+                        type="checkbox"
+                        checked={line.restock}
+                        onChange={(e) => updateLine(idx, { restock: e.target.checked })}
+                        className="h-4 w-4 accent-electric"
+                        aria-label={`Line ${idx + 1} restock`}
+                        title="Checked: return to stock. Unchecked: damaged write-off (cost stays in COGS)."
+                      />
+                    ) : (
+                      <span className="text-navy/20 text-xs">—</span>
+                    )}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setLines((prev) => prev.filter((_, i) => i !== idx))}
+                    disabled={lines.length === 1}
+                    className="text-navy/30 hover:text-red-500 disabled:opacity-20 transition-colors flex items-center justify-center"
+                    aria-label="Remove line"
+                  >
+                    <MinusCircle className="h-4 w-4" />
+                  </button>
+                </div>
+              );
+            })}
           </div>
+        </div>
+
+        {/* Tax rate */}
+        <div>
+          <Label htmlFor="cm-taxrate">Sales Tax Rate</Label>
+          <Select
+            id="cm-taxrate"
+            value={taxRateId}
+            onChange={(e) => setTaxRateId(e.target.value)}
+          >
+            <option value="">No tax</option>
+            {taxRates.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.name} ({(parseFloat(t.rate) * 100).toFixed(2)}%)
+              </option>
+            ))}
+          </Select>
         </div>
 
         {/* Memo note */}
@@ -268,12 +402,22 @@ function NewMemoModal({ open, onClose, customers, onCreated }: NewMemoModalProps
           />
         </div>
 
-        {/* Live total */}
-        <div className="flex items-center justify-between rounded-lg bg-navy/5 px-4 py-3">
-          <span className="text-sm font-semibold text-navy/70">Credit Total</span>
-          <span className="text-lg font-bold text-navy tabular-nums">
-            {formatCurrency(liveTotal.toFixed(2))}
-          </span>
+        {/* Live totals */}
+        <div className="rounded-lg bg-navy/5 px-4 py-3 space-y-1">
+          <div className="flex items-center justify-between text-sm text-navy/60">
+            <span>Subtotal</span>
+            <span className="tabular-nums">{formatCurrency(liveSubtotal.toFixed(2))}</span>
+          </div>
+          <div className="flex items-center justify-between text-sm text-navy/60">
+            <span>Sales Tax{selectedRate ? ` (${(parseFloat(selectedRate.rate) * 100).toFixed(2)}%)` : ''}</span>
+            <span className="tabular-nums">{formatCurrency(liveTax.toFixed(2))}</span>
+          </div>
+          <div className="flex items-center justify-between pt-1 border-t border-navy/10">
+            <span className="text-sm font-semibold text-navy/70">Credit Total</span>
+            <span className="text-lg font-bold text-navy tabular-nums">
+              {formatCurrency(liveTotal.toFixed(2))}
+            </span>
+          </div>
         </div>
       </div>
     </Modal>
@@ -349,15 +493,15 @@ function ApplyModal({ open, memo, onClose, onApplied }: ApplyModalProps) {
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={applying}>Cancel</Button>
-          <Button onClick={handleApply} disabled={applying || loading}>
-            {applying ? 'Applying…' : 'Apply Credit'}
+          <Button onClick={handleApply} loading={applying} disabled={loading}>
+            Apply Credit
           </Button>
         </>
       }
     >
       <div className="space-y-4">
         {memo && (
-          <div className="rounded-lg bg-emerald-50 border border-emerald-200 px-4 py-3 text-sm text-emerald-800">
+          <div className="rounded-lg bg-emerald/10 border border-emerald/30 px-4 py-3 text-sm text-navy/80">
             Unapplied balance:{' '}
             <span className="font-bold">{formatCurrency(memo.unapplied)}</span>
           </div>
@@ -366,7 +510,9 @@ function ApplyModal({ open, memo, onClose, onApplied }: ApplyModalProps) {
         <div>
           <Label htmlFor="apply-inv">Invoice to Apply To *</Label>
           {loading ? (
-            <p className="text-sm text-navy/40 py-2">Loading invoices…</p>
+            <div className="flex items-center gap-2 py-2 text-sm text-navy/40">
+              <Spinner className="h-4 w-4" /> Loading invoices…
+            </div>
           ) : invoices.length === 0 ? (
             <p className="text-sm text-navy/40 py-2">No open invoices for this customer.</p>
           ) : (
@@ -403,37 +549,105 @@ function ApplyModal({ open, memo, onClose, onApplied }: ApplyModalProps) {
 }
 
 // ---------------------------------------------------------------------------
-// Void confirmation modal
+// Refund Modal — issue a refund check for the unapplied balance
 // ---------------------------------------------------------------------------
 
-interface VoidModalProps {
+interface RefundModalProps {
   open: boolean;
-  memoNumber: number | null;
-  onConfirm: () => void;
+  memo: CreditMemo | null;
+  accounts: Account[];
   onClose: () => void;
-  voiding: boolean;
+  onRefunded: () => void;
 }
 
-function VoidModal({ open, memoNumber, onConfirm, onClose, voiding }: VoidModalProps) {
+function RefundModal({ open, memo, accounts, onClose, onRefunded }: RefundModalProps) {
+  const [bankAccountId, setBankAccountId] = useState('');
+  const [amount, setAmount] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (open && memo) {
+      setBankAccountId('');
+      setAmount(Number(memo.unapplied).toFixed(2));
+    }
+  }, [open, memo]);
+
+  const bankAccounts = accounts.filter((a) => a.type === 'asset');
+
+  async function handleRefund() {
+    if (!memo) return;
+    if (!bankAccountId) { toast('Select a bank account.', 'danger'); return; }
+    if (!amount || parseFloat(amount) <= 0) { toast('Enter a valid refund amount.', 'danger'); return; }
+
+    setSaving(true);
+    try {
+      await api.post(`/api/credit-memos/${memo.id}`, {
+        action: 'refund',
+        bankAccountId,
+        amount,
+      });
+      toast('Refund check recorded.', 'success');
+      onRefunded();
+      onClose();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to record refund.';
+      toast(msg, 'danger');
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <Modal
       open={open}
       onClose={onClose}
-      title="Void Credit Memo"
+      title={`Refund Credit Memo #${memo?.memoNumber ?? ''}`}
       footer={
         <>
-          <Button variant="secondary" onClick={onClose} disabled={voiding}>Cancel</Button>
-          <Button variant="danger" onClick={onConfirm} disabled={voiding}>
-            {voiding ? 'Voiding…' : 'Void Credit Memo'}
+          <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
+          <Button onClick={handleRefund} loading={saving}>
+            Record Refund
           </Button>
         </>
       }
     >
-      <p className="text-navy/80 text-sm">
-        Are you sure you want to void{' '}
-        <strong>Credit Memo #{memoNumber}</strong>? This will reverse the GL
-        entry and cannot be undone.
-      </p>
+      <div className="space-y-4">
+        {memo && (
+          <div className="rounded-lg bg-emerald/10 border border-emerald/30 px-4 py-3 text-sm text-navy/80">
+            Unapplied balance available to refund:{' '}
+            <span className="font-bold">{formatCurrency(memo.unapplied)}</span>
+          </div>
+        )}
+
+        <div>
+          <Label htmlFor="refund-bank">Refund From (Bank Account) *</Label>
+          <Select
+            id="refund-bank"
+            value={bankAccountId}
+            onChange={(e) => setBankAccountId(e.target.value)}
+          >
+            <option value="">Select a bank account…</option>
+            {bankAccounts.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.code} — {a.name}
+              </option>
+            ))}
+          </Select>
+        </div>
+
+        <div>
+          <Label htmlFor="refund-amt">Refund Amount *</Label>
+          <Input
+            id="refund-amt"
+            type="number"
+            min="0.01"
+            step="0.01"
+            max={memo?.unapplied}
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+          />
+        </div>
+      </div>
     </Modal>
   );
 }
@@ -445,10 +659,14 @@ function VoidModal({ open, memoNumber, onConfirm, onClose, voiding }: VoidModalP
 export default function CreditMemosPage() {
   const [memos, setMemos] = useState<CreditMemo[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [items, setItems] = useState<Item[]>([]);
+  const [taxRates, setTaxRates] = useState<TaxRate[]>([]);
   const [loading, setLoading] = useState(true);
   const [showNew, setShowNew] = useState(false);
 
   const [applyTarget, setApplyTarget] = useState<CreditMemo | null>(null);
+  const [refundTarget, setRefundTarget] = useState<CreditMemo | null>(null);
   const [voidTarget, setVoidTarget] = useState<CreditMemo | null>(null);
   const [voiding, setVoiding] = useState(false);
 
@@ -457,12 +675,18 @@ export default function CreditMemosPage() {
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
-      const [memoList, custList] = await Promise.all([
+      const [memoList, custList, acctList, itemRes, rateList] = await Promise.all([
         api.get<CreditMemo[]>('/api/credit-memos'),
         api.get<Customer[]>('/api/customers'),
+        api.get<Account[]>('/api/accounts').catch(() => [] as Account[]),
+        api.get<{ items: Item[] }>('/api/items').catch(() => ({ items: [] as Item[] })),
+        api.get<TaxRate[]>('/api/tax-rates').catch(() => [] as TaxRate[]),
       ]);
       setMemos(memoList);
       setCustomers(custList);
+      setAccounts(Array.isArray(acctList) ? acctList : []);
+      setItems(Array.isArray(itemRes?.items) ? itemRes.items : []);
+      setTaxRates(Array.isArray(rateList) ? rateList : []);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to load credit memos.';
       toast(msg, 'danger');
@@ -499,7 +723,7 @@ export default function CreditMemosPage() {
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
         title="Credit Memos"
-        icon={FileX}
+        icon={RotateCcw}
         action={
           <Button onClick={() => setShowNew(true)}>
             <Plus className="h-4 w-4" /> New Credit Memo
@@ -509,14 +733,20 @@ export default function CreditMemosPage() {
 
       <Card className="p-0 overflow-hidden">
         {loading ? (
-          <div className="flex items-center justify-center py-20 text-navy/40 text-sm">
-            Loading credit memos…
+          <div className="flex items-center justify-center py-20 text-navy/40">
+            <Spinner className="h-6 w-6" />
           </div>
         ) : memos.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-20 gap-3 text-navy/40">
-            <FileX className="h-10 w-10 opacity-30" />
-            <p className="text-sm">No credit memos yet. Create one to get started.</p>
-          </div>
+          <EmptyState
+            icon={RotateCcw}
+            title="No credit memos yet"
+            message="Create your first credit memo to get started."
+            action={
+              <Button onClick={() => setShowNew(true)}>
+                <Plus className="h-4 w-4" /> New Credit Memo
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -524,8 +754,8 @@ export default function CreditMemosPage() {
                 <Th>Memo #</Th>
                 <Th>Customer</Th>
                 <Th>Date</Th>
-                <Th className="text-right">Total</Th>
-                <Th className="text-right">Unapplied</Th>
+                <Th numeric>Total</Th>
+                <Th numeric>Unapplied</Th>
                 <Th>Status</Th>
                 <Th className="text-right">Actions</Th>
               </Tr>
@@ -534,36 +764,49 @@ export default function CreditMemosPage() {
               {memos.map((m) => (
                 <Tr key={m.id}>
                   <Td className="font-semibold text-navy">#{m.memoNumber}</Td>
-                  <Td>{customerMap[m.customerId] ?? m.customerId}</Td>
-                  <Td className="text-navy/70">{m.date ? m.date.slice(0, 10) : '—'}</Td>
-                  <Td className="text-right tabular-nums font-medium">
+                  <Td>{customerMap[m.customerId] ?? '—'}</Td>
+                  <Td className="text-navy/70">{formatDate(m.date)}</Td>
+                  <Td numeric className="font-medium">
                     {formatCurrency(m.total)}
                   </Td>
-                  <Td className="text-right tabular-nums font-medium">
+                  <Td numeric className="font-medium">
                     {formatCurrency(m.unapplied)}
                   </Td>
                   <Td>
                     <Badge tone={statusTone(m.status)}>{statusLabel(m.status)}</Badge>
                   </Td>
                   <Td className="text-right">
-                    <span className="inline-flex items-center gap-3">
+                    <span className="inline-flex items-center gap-1">
                       {m.status === 'open' && Number(m.unapplied) > 0 && (
-                        <button
+                        <Button
+                          variant="ghost"
+                          size="sm"
                           onClick={() => setApplyTarget(m)}
-                          className="inline-flex items-center gap-1 text-xs text-navy/40 hover:text-electric transition-colors font-medium"
                           title="Apply to Invoice"
                         >
                           Apply
-                        </button>
+                        </Button>
+                      )}
+                      {m.status !== 'void' && Number(m.unapplied) > 0 && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setRefundTarget(m)}
+                          title="Refund by check"
+                        >
+                          Refund
+                        </Button>
                       )}
                       {m.status !== 'void' && (
-                        <button
+                        <Button
+                          variant="ghost"
+                          size="sm"
                           onClick={() => setVoidTarget(m)}
-                          className="inline-flex items-center gap-1 text-xs text-navy/40 hover:text-red-500 transition-colors font-medium"
+                          className="text-red-500 hover:bg-red-50"
                           title="Void credit memo"
                         >
                           Void
-                        </button>
+                        </Button>
                       )}
                     </span>
                   </Td>
@@ -592,6 +835,8 @@ export default function CreditMemosPage() {
         open={showNew}
         onClose={() => setShowNew(false)}
         customers={customers}
+        items={items}
+        taxRates={taxRates}
         onCreated={fetchData}
       />
 
@@ -602,12 +847,29 @@ export default function CreditMemosPage() {
         onApplied={fetchData}
       />
 
-      <VoidModal
+      <RefundModal
+        open={!!refundTarget}
+        memo={refundTarget}
+        accounts={accounts}
+        onClose={() => setRefundTarget(null)}
+        onRefunded={fetchData}
+      />
+
+      <ConfirmDialog
         open={!!voidTarget}
-        memoNumber={voidTarget?.memoNumber ?? null}
+        title="Void Credit Memo"
+        message={
+          <>
+            Are you sure you want to void{' '}
+            <strong>Credit Memo #{voidTarget?.memoNumber}</strong>? This will reverse the GL
+            entry and cannot be undone.
+          </>
+        }
+        confirmLabel="Void Credit Memo"
+        tone="danger"
+        loading={voiding}
         onConfirm={handleVoid}
         onClose={() => setVoidTarget(null)}
-        voiding={voiding}
       />
     </main>
   );

@@ -6,11 +6,13 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { getCompany } from '@/lib/services/company';
+import { getPortalEmployeeId } from '@/lib/auth';
+import { getDb } from '@/lib/db';
 import { ServiceError } from '@/lib/services/_base';
 import { renderPaystubPdf } from '@/lib/pdf/paystub';
+import { payStubData } from '@/lib/services/payroll';
 import { and, eq } from 'drizzle-orm';
-import { paychecks, paycheckLines, employees } from '@/lib/db/schema';
+import { paychecks, employees, companies } from '@/lib/db/schema';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -35,7 +37,6 @@ function fmtDate(value: Date | string | null | undefined): string {
 
 export async function GET(req: NextRequest) {
   try {
-    const ctx = await getServerContext();
     const { searchParams } = req.nextUrl;
 
     const paycheckId = searchParams.get('paycheckId');
@@ -46,39 +47,59 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // Load the paycheck — scoped to company.
-    const [paycheck] = await ctx.db
-      .select()
-      .from(paychecks)
-      .where(and(eq(paychecks.id, paycheckId), eq(paychecks.companyId, ctx.companyId)));
+    const db = await getDb();
+
+    // Two authorized callers:
+    //  - An employee in the self-service portal (bka_portal): may fetch ONLY their own stubs.
+    //  - A main-app user / employer (bka_session): may fetch any stub in their company.
+    // Anyone else (no valid session) is rejected: getServerContext() throws FORBIDDEN -> 403.
+    const portalEmployeeId = await getPortalEmployeeId();
+
+    let companyId: string;
+    let paycheck:
+      | typeof paychecks.$inferSelect
+      | undefined;
+
+    if (portalEmployeeId) {
+      const [emp] = await db
+        .select()
+        .from(employees)
+        .where(eq(employees.id, portalEmployeeId));
+      if (!emp) {
+        return NextResponse.json({ error: 'Employee not found.', code: 'NOT_FOUND' }, { status: 404 });
+      }
+      companyId = emp.companyId;
+      // Scope by employeeId so one employee can never read another's pay stub.
+      [paycheck] = await db
+        .select()
+        .from(paychecks)
+        .where(and(eq(paychecks.id, paycheckId), eq(paychecks.employeeId, portalEmployeeId)));
+    } else {
+      const ctx = await getServerContext();
+      companyId = ctx.companyId;
+      [paycheck] = await db
+        .select()
+        .from(paychecks)
+        .where(and(eq(paychecks.id, paycheckId), eq(paychecks.companyId, companyId)));
+    }
 
     if (!paycheck) {
       return NextResponse.json({ error: 'Paycheck not found.', code: 'NOT_FOUND' }, { status: 404 });
     }
 
-    // Load the employee — also scoped to company.
-    const [employee] = await ctx.db
-      .select()
-      .from(employees)
-      .where(and(eq(employees.id, paycheck.employeeId), eq(employees.companyId, ctx.companyId)));
-
-    if (!employee) {
-      return NextResponse.json({ error: 'Employee not found.', code: 'NOT_FOUND' }, { status: 404 });
-    }
-
-    // Load paycheck lines.
-    const lines = await ctx.db
-      .select()
-      .from(paycheckLines)
-      .where(eq(paycheckLines.paycheckId, paycheckId));
-
     // Load company.
-    const company = await getCompany(ctx);
+    const [company] = await db.select().from(companies).where(eq(companies.id, companyId));
     if (!company) {
       return NextResponse.json({ error: 'Company not found.', code: 'NOT_FOUND' }, { status: 404 });
     }
 
-    // Render PDF.
+    // Load the stub with calendar-YTD aggregates (posted, non-void checks of the
+    // same year through this stub's pay date). Read-only context; authorization
+    // was already enforced above for both portal and main-app sessions.
+    const stub = await payStubData({ db, companyId, userId: null }, paycheckId);
+    const { employee } = stub;
+
+    // Render PDF (with YTD column).
     const pdfBytes = await renderPaystubPdf({
       company: { name: company.name },
       employee: {
@@ -91,11 +112,14 @@ export async function GET(req: NextRequest) {
         periodEnd:   paycheck.periodEnd   ? fmtDate(paycheck.periodEnd)   : null,
         grossPay:    paycheck.grossPay,
         netPay:      paycheck.netPay,
+        ytdGross:    stub.ytd.gross,
+        ytdNet:      stub.ytd.net,
       },
-      lines: lines.map((l) => ({
-        kind:   l.kind as 'earning' | 'tax' | 'deduction' | 'employer_contribution',
-        name:   l.name,
-        amount: l.amount,
+      lines: stub.lines.map((l) => ({
+        kind:      l.kind as 'earning' | 'tax' | 'deduction' | 'employer_contribution',
+        name:      l.name,
+        amount:    l.amount,
+        ytdAmount: l.ytdAmount,
       })),
     });
 

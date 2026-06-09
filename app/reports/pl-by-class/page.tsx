@@ -15,7 +15,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api } from '@/lib/client';
-import { formatCurrency } from '@/lib/money';
+import { formatCurrency, Money, toAmountString } from '@/lib/money';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -90,6 +90,18 @@ export default function PLByClassPage() {
   const expenseRows = report?.rows.filter((r) => r.type === 'expense') ?? [];
   const classes = report?.classes ?? [];
 
+  // Per-class section totals computed from the section rows (the API's
+  // totalsByClass is the combined revenue+expense sum, not per-section).
+  function sectionTotals(rows: PLByClassRow[]): Record<string, string> {
+    const totals: Record<string, string> = {};
+    for (const c of classes) {
+      totals[c.classId] = toAmountString(Money.add(...rows.map((r) => r.byClass[c.classId])));
+    }
+    return totals;
+  }
+  const incomeTotals = sectionTotals(incomeRows);
+  const expenseTotals = sectionTotals(expenseRows);
+
   function amtCell(row: PLByClassRow, col: PLClassColumn) {
     const raw = row.byClass[col.classId] ?? '0.00';
     const n = parseFloat(raw);
@@ -119,7 +131,7 @@ export default function PLByClassPage() {
       <Td
         key={classId}
         className={`text-right tabular-nums font-bold text-base ${
-          positive ? 'text-emerald-600' : 'text-red-600'
+          positive ? 'text-emerald' : 'text-red-600'
         }`}
       >
         {n === 0 ? '—' : formatCurrency(raw)}
@@ -216,7 +228,7 @@ export default function PLByClassPage() {
                     <td className="px-4 py-2 font-bold text-navy text-sm" colSpan={2}>
                       Total Income
                     </td>
-                    {classes.map((c) => totalCell(c.classId, report.totalsByClass))}
+                    {classes.map((c) => totalCell(c.classId, incomeTotals))}
                   </tr>
                 </>
               )}
@@ -243,7 +255,7 @@ export default function PLByClassPage() {
                     <td className="px-4 py-2 font-bold text-navy text-sm" colSpan={2}>
                       Total Expenses
                     </td>
-                    {classes.map((c) => totalCell(c.classId, report.totalsByClass))}
+                    {classes.map((c) => totalCell(c.classId, expenseTotals))}
                   </tr>
                 </>
               )}

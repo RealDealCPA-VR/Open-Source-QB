@@ -2,12 +2,13 @@
  * GET  /api/backup  — download a .bka backup of the active company data dir.
  * POST /api/backup  — restore from a .bka file (raw bytes in request body).
  *
- * NOTE (POST): After a successful restore the running PGlite instance is NOT
- * automatically restarted. The restored data files are now on disk but the
- * in-memory database still reflects the old state. A server restart (or an
- * explicit closeDb + openDb call) is required before queries will see the
- * restored data. In the Electron build, the main process should relaunch the
- * renderer/server after receiving a restore confirmation.
+ * SECURITY: middleware excludes /api from the session check, so both handlers
+ * must fail closed themselves via getServerContext() (FORBIDDEN → 403) before
+ * reading or writing any backup bytes.
+ *
+ * NOTE (POST): restoreBackup validates the archive, closes the live PGlite
+ * handle, and atomically swaps the data directory. The next getDb() call
+ * reopens the restored data — no process restart is required.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -25,9 +26,9 @@ function errorResponse(err: unknown) {
       : 500;
     return NextResponse.json({ error: err.message, code: err.code }, { status });
   }
-  const message = err instanceof Error ? err.message : 'Internal server error';
+  // Do not leak raw error text (may contain absolute data-dir paths / OS details).
   console.error('[backup] unexpected error:', err);
-  return NextResponse.json({ error: message }, { status: 500 });
+  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
 }
 
 // ---------------------------------------------------------------------------
@@ -36,14 +37,17 @@ function errorResponse(err: unknown) {
 
 export async function GET(_req: NextRequest) {
   try {
-    // Resolve the active company name for the filename.
+    // Auth: fail closed BEFORE producing any backup bytes. A FORBIDDEN throw
+    // here propagates to errorResponse() and returns 403.
+    const ctx = await getServerContext();
+
+    // Resolve the active company name for the filename (cosmetic only).
     let companyName: string | undefined;
     try {
-      const ctx = await getServerContext();
       const company = await getCompany(ctx);
       companyName = company?.name ?? undefined;
     } catch {
-      // If context resolution fails (e.g. first run), proceed without a name.
+      // The name lookup is cosmetic; proceed without it.
     }
 
     const { buffer, filename } = createBackup(companyName);
@@ -73,15 +77,19 @@ export async function GET(_req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   try {
+    // Auth: restore is destructive — fail closed before even reading the body.
+    await getServerContext();
+
     const arrayBuffer = await req.arrayBuffer();
     if (!arrayBuffer.byteLength) {
       return NextResponse.json({ error: 'Request body is empty.' }, { status: 400 });
     }
 
     const buffer = Buffer.from(arrayBuffer);
-    const result = restoreBackup(buffer);
+    // Validates the archive, closes the live DB handle, and swaps the data dir
+    // atomically; the next getDb() reopens the restored data.
+    const result = await restoreBackup(buffer);
 
-    // NOTE: A restart/db reopen is needed before the restored data is visible.
     return NextResponse.json(result, { status: 200 });
   } catch (err) {
     return errorResponse(err);

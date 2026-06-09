@@ -40,8 +40,8 @@ export default function PortalLoginPage() {
             <Label>Password</Label>
             <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
           </div>
-          <Button type="submit" className="w-full" disabled={busy}>
-            {busy ? 'Signing in…' : 'Sign in'}
+          <Button type="submit" className="w-full" loading={busy}>
+            Sign in
           </Button>
         </form>
         <p className="mt-6 text-center text-xs text-navy/40">

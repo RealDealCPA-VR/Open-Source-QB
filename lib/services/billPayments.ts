@@ -11,7 +11,7 @@
  * Multi-tenant safety: every query is scoped by ctx.companyId.
  * Money: all arithmetic uses Money/toAmountString — never JS floats.
  */
-import { and, eq } from 'drizzle-orm';
+import { and, desc, eq, sql } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
 import {
   accounts,
@@ -28,7 +28,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { postJournalEntry } from './posting';
+import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -38,8 +38,14 @@ export type PaymentMethod = 'cash' | 'check' | 'credit_card' | 'ach' | 'bank_tra
 
 export interface BillApplication {
   billId: string;
-  /** Amount to apply from this payment toward that bill (decimal string). */
+  /** CASH amount to apply from this payment toward that bill (decimal string). */
   amountApplied: string | number;
+  /**
+   * Early-payment discount taken on this bill (QB "Set Discount").
+   * The bill is settled for amountApplied + discountTaken, but only amountApplied
+   * leaves the bank; discountTaken is credited to input.discountAccountId.
+   */
+  discountTaken?: string | number | null;
 }
 
 export interface PayBillsInput {
@@ -49,6 +55,11 @@ export interface PayBillsInput {
   reference?: string | null;
   /** GL account that funds come from — e.g. Checking (1000), Credit Card (2100). */
   paymentAccountId: string;
+  /**
+   * Account credited with discounts taken (income "Discounts Taken" or an
+   * expense contra account). Required when any application has discountTaken > 0.
+   */
+  discountAccountId?: string | null;
   applications: BillApplication[];
 }
 
@@ -71,14 +82,14 @@ async function resolveApAccount(ctx: ServiceContext): Promise<string> {
   return apRow.id;
 }
 
-/** Map a bills.status-style string back to a docStatus value. */
+/** Derive a bill's docStatus from its post-payment balances. */
 function deriveBillStatus(
-  total: string | number,
+  balanceDue: string | number,
   amountPaid: string | number,
+  amountCredited: string | number,
 ): 'open' | 'partial' | 'paid' {
-  const balance = Money.sub(total, amountPaid);
-  if (balance.lessThanOrEqualTo(0)) return 'paid';
-  if (Money.of(amountPaid).greaterThan(0)) return 'partial';
+  if (Money.of(balanceDue).lessThanOrEqualTo(0)) return 'paid';
+  if (Money.add(amountPaid, amountCredited).greaterThan(0)) return 'partial';
   return 'open';
 }
 
@@ -93,9 +104,10 @@ function deriveBillStatus(
  *  1. Validate vendor belongs to company.
  *  2. Validate payment account belongs to company.
  *  3. Validate each bill: belongs to company + same vendor + has remaining balance.
- *  4. Validate amountApplied <= bill.balanceDue for each bill.
- *  5. Compute total = sum(applications[].amountApplied).
- *  6. Post GL: Dr A/P (total), Cr paymentAccountId (total).
+ *  4. Validate amountApplied + discountTaken <= bill.balanceDue for each bill.
+ *  5. Compute cash total = sum(amountApplied) and discount total = sum(discountTaken).
+ *  6. Post GL: Dr A/P (cash + discounts), Cr paymentAccountId (cash),
+ *     Cr discountAccountId (discounts, when any were taken).
  *  7. Insert billPayments row.
  *  8. Insert billPaymentApplications rows.
  *  9. Update each bill's amountPaid / balanceDue / status.
@@ -107,39 +119,63 @@ export async function payBills(ctx: ServiceContext, input: PayBillsInput) {
     throw validation('At least one bill application is required.');
   }
 
+  // Reject duplicate billIds — two applications against the same bill would each be
+  // validated against the bill's ORIGINAL balance, bypassing the over-application guard.
+  const appBillIds = input.applications.map((a) => a.billId);
+  if (new Set(appBillIds).size !== appBillIds.length) {
+    throw validation('Duplicate billId in applications. Combine amounts into a single application per bill.');
+  }
+
   // ── vendor ownership check ───────────────────────────────────────────────
   const [vendor] = await ctx.db
-    .select({ id: vendors.id })
+    .select({ id: vendors.id, name: vendors.displayName })
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
 
-  // ── payment account ownership check ─────────────────────────────────────
+  // ── payment account ownership + type check ──────────────────────────────
   const [payAcct] = await ctx.db
-    .select({ id: accounts.id })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype })
     .from(accounts)
     .where(
       and(eq(accounts.id, input.paymentAccountId), eq(accounts.companyId, ctx.companyId)),
     );
   if (!payAcct) throw notFound('Payment account');
+  // The funding source must be a bank/cash asset or a credit-card liability — not, say, A/R
+  // or a revenue account, which would post a nonsensical bill-payment credit.
+  const isFundable =
+    (payAcct.type === 'asset' &&
+      payAcct.subtype !== 'accounts_receivable' &&
+      payAcct.subtype !== 'inventory') ||
+    (payAcct.type === 'liability' && payAcct.subtype === 'credit_card');
+  if (!isFundable) {
+    throw validation('Payment account must be a bank/cash or credit-card account.');
+  }
 
   // ── A/P account ─────────────────────────────────────────────────────────
   const apAccountId = await resolveApAccount(ctx);
 
-  // ── validate each bill + accumulate total ────────────────────────────────
-  let total = Money.zero();
+  // ── validate each bill + accumulate totals ──────────────────────────────
+  let total = Money.zero(); // cash leaving the payment account
+  let discountTotal = Money.zero(); // early-payment discounts taken
   const billRows: Array<{
     id: string;
     total: string;
     amountPaid: string;
     balanceDue: string;
-    applied: string; // from this payment
+    applied: string; // cash from this payment
+    discount: string; // discount taken on this bill
+    settled: string; // applied + discount — total reduction of balanceDue
   }> = [];
 
   for (const app of input.applications) {
     const applied = Money.of(app.amountApplied);
+    const discount = Money.of(app.discountTaken ?? 0);
     if (applied.lessThanOrEqualTo(0)) {
       throw validation(`amountApplied must be positive for bill ${app.billId}.`);
+    }
+    if (discount.lessThan(0)) {
+      throw validation(`discountTaken cannot be negative for bill ${app.billId}.`);
     }
 
     const [bill] = await ctx.db
@@ -167,20 +203,24 @@ export async function payBills(ctx: ServiceContext, input: PayBillsInput) {
     }
 
     const balance = Money.of(bill.balanceDue);
-    if (applied.greaterThan(balance)) {
+    const settled = applied.plus(discount);
+    if (settled.greaterThan(balance)) {
       throw validation(
-        `Amount applied (${toAmountString(applied)}) exceeds balance due ` +
+        `Amount applied plus discount (${toAmountString(settled)}) exceeds balance due ` +
           `(${toAmountString(balance)}) on bill ${app.billId}.`,
       );
     }
 
     total = total.plus(applied);
+    discountTotal = discountTotal.plus(discount);
     billRows.push({
       id: bill.id,
       total: bill.total,
       amountPaid: bill.amountPaid,
       balanceDue: bill.balanceDue,
       applied: toAmountString(applied),
+      discount: toAmountString(discount),
+      settled: toAmountString(settled),
     });
   }
 
@@ -188,30 +228,56 @@ export async function payBills(ctx: ServiceContext, input: PayBillsInput) {
     throw validation('Total payment amount must be greater than zero.');
   }
 
+  // ── discount account (required only when discounts were taken) ───────────
+  if (discountTotal.greaterThan(0)) {
+    if (!input.discountAccountId) {
+      throw validation('discountAccountId is required when a discount is taken.');
+    }
+    const [discAcct] = await ctx.db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(
+        and(eq(accounts.id, input.discountAccountId), eq(accounts.companyId, ctx.companyId)),
+      );
+    if (!discAcct) throw notFound('Discount account');
+  }
+
   const totalStr = toAmountString(total);
+  const discountTotalStr = toAmountString(discountTotal);
+  /** Total A/P relieved = cash + discounts. */
+  const settledTotalStr = toAmountString(total.plus(discountTotal));
 
   // ── all good — run inside one transaction ────────────────────────────────
   return inTransaction(ctx, async (tx) => {
     // 1. Post the journal entry
-    //    Dr A/P (reduces liability — debit a credit-normal account)
-    //    Cr Payment Account (reduces asset)
+    //    Dr A/P full settlement (cash + discounts) — reduces liability
+    //    Cr Payment Account (cash only)
+    //    Cr Discount Account (discounts taken, if any)
+    const entryLines: PostingLine[] = [
+      {
+        accountId: apAccountId,
+        debit: settledTotalStr,
+        memo: `A/P payment to vendor ${vendor.name}`,
+      },
+      {
+        accountId: input.paymentAccountId,
+        credit: totalStr,
+        memo: `Bill payment — ref: ${input.reference ?? 'n/a'}`,
+      },
+    ];
+    if (discountTotal.greaterThan(0) && input.discountAccountId) {
+      entryLines.push({
+        accountId: input.discountAccountId,
+        credit: discountTotalStr,
+        memo: `Early-payment discounts taken — ${vendor.name}`,
+      });
+    }
     const entry = await postJournalEntry(tx, {
       date: input.date,
-      description: `Bill payment — ${vendor.id}`,
+      description: `Bill payment — ${vendor.name}`,
       reference: input.reference ?? null,
       sourceRef: `vendor:${input.vendorId}`,
-      lines: [
-        {
-          accountId: apAccountId,
-          debit: totalStr,
-          memo: `A/P payment to vendor ${input.vendorId}`,
-        },
-        {
-          accountId: input.paymentAccountId,
-          credit: totalStr,
-          memo: `Bill payment — ref: ${input.reference ?? 'n/a'}`,
-        },
-      ],
+      lines: entryLines,
     });
 
     // 2. Insert billPayments header
@@ -231,27 +297,39 @@ export async function payBills(ctx: ServiceContext, input: PayBillsInput) {
 
     // 3. Insert applications + update each bill
     for (const row of billRows) {
-      // Insert the application link
+      // Insert the application link. amountApplied stores the FULL settlement
+      // (cash + discount) so voidBillPayment reverses the bill's balanceDue and
+      // amountPaid symmetrically; the cash/discount split lives in the GL entry
+      // and the audit log.
       await tx.db.insert(billPaymentApplications).values({
         billPaymentId: payment.id,
         billId: row.id,
-        amountApplied: row.applied,
+        amountApplied: row.settled,
       });
 
-      // Update the bill: amountPaid += applied, balanceDue -= applied, status
-      const newAmountPaid = toAmountString(Money.add(row.amountPaid, row.applied));
-      const newBalanceDue = toAmountString(Money.sub(row.total, newAmountPaid));
-      const newStatus = deriveBillStatus(row.total, newAmountPaid);
-
-      await tx.db
+      // Update the bill with RELATIVE increments (amountPaid += settled,
+      // balanceDue -= settled) so a concurrent/duplicate path can never clobber
+      // the row from a stale snapshot; status is derived from the post-update row.
+      const [updatedBill] = await tx.db
         .update(bills)
         .set({
-          amountPaid: newAmountPaid,
-          balanceDue: newBalanceDue,
-          status: newStatus,
+          amountPaid: sql`${bills.amountPaid} + ${row.settled}`,
+          balanceDue: sql`${bills.balanceDue} - ${row.settled}`,
           updatedAt: new Date(),
         })
-        .where(eq(bills.id, row.id));
+        .where(eq(bills.id, row.id))
+        .returning({
+          amountPaid: bills.amountPaid,
+          amountCredited: bills.amountCredited,
+          balanceDue: bills.balanceDue,
+        });
+
+      const newStatus = deriveBillStatus(
+        updatedBill.balanceDue,
+        updatedBill.amountPaid,
+        updatedBill.amountCredited,
+      );
+      await tx.db.update(bills).set({ status: newStatus }).where(eq(bills.id, row.id));
     }
 
     // 4. Audit log
@@ -262,10 +340,17 @@ export async function payBills(ctx: ServiceContext, input: PayBillsInput) {
       newValues: {
         vendorId: input.vendorId,
         amount: totalStr,
+        discountTotal: discountTotalStr,
+        discountAccountId: discountTotal.greaterThan(0) ? input.discountAccountId : null,
         method: input.method,
         reference: input.reference,
         postedEntryId: entry.id,
-        applications: billRows.map((r) => ({ billId: r.id, amountApplied: r.applied })),
+        applications: billRows.map((r) => ({
+          billId: r.id,
+          amountApplied: r.applied,
+          discountTaken: r.discount,
+          settled: r.settled,
+        })),
       },
     });
 
@@ -303,7 +388,124 @@ export async function listBillPayments(
     .where(and(...conditions))
     .limit(opts?.limit ?? 100)
     .offset(opts?.offset ?? 0)
-    .orderBy(billPayments.date, billPayments.createdAt);
+    .orderBy(desc(billPayments.date), desc(billPayments.createdAt));
 
   return rows;
+}
+
+// ---------------------------------------------------------------------------
+// getBillPayment
+// ---------------------------------------------------------------------------
+
+/** Fetch a single bill payment (with its bill applications). Throws NOT_FOUND. */
+export async function getBillPayment(ctx: ServiceContext, id: string) {
+  const [payment] = await ctx.db
+    .select()
+    .from(billPayments)
+    .where(and(eq(billPayments.id, id), eq(billPayments.companyId, ctx.companyId)));
+  if (!payment) throw notFound('Bill payment');
+
+  const applications = await ctx.db
+    .select()
+    .from(billPaymentApplications)
+    .where(eq(billPaymentApplications.billPaymentId, id));
+
+  return { ...payment, applications };
+}
+
+// ---------------------------------------------------------------------------
+// voidBillPayment
+// ---------------------------------------------------------------------------
+
+/**
+ * Void a bill payment — the symmetric correction path to voidPayment (A/R).
+ *
+ * Steps (all inside one transaction):
+ *  1. Reverse the GL entry via voidJournalEntry (guards closed periods and lines
+ *     cleared in a completed reconciliation).
+ *  2. Roll back each applied bill with RELATIVE SQL increments
+ *     (amountPaid -= applied, balanceDue += applied) and re-derive its status.
+ *  3. Delete the application rows (history preserved in the audit log).
+ *  4. Stamp voidedAt on the bill payment.
+ */
+export async function voidBillPayment(ctx: ServiceContext, id: string) {
+  const [payment] = await ctx.db
+    .select()
+    .from(billPayments)
+    .where(and(eq(billPayments.id, id), eq(billPayments.companyId, ctx.companyId)));
+  if (!payment) throw notFound('Bill payment');
+  if (payment.voidedAt) return { ...payment, applications: [] }; // idempotent
+
+  const applications = await ctx.db
+    .select()
+    .from(billPaymentApplications)
+    .where(eq(billPaymentApplications.billPaymentId, id));
+
+  return inTransaction(ctx, async (tx) => {
+    // 1. Reverse the GL entry.
+    if (payment.postedEntryId) {
+      await voidJournalEntry(tx, payment.postedEntryId);
+    }
+
+    // 2. Roll back each bill with relative increments.
+    for (const app of applications) {
+      const [updatedBill] = await tx.db
+        .update(bills)
+        .set({
+          amountPaid: sql`${bills.amountPaid} - ${app.amountApplied}`,
+          balanceDue: sql`${bills.balanceDue} + ${app.amountApplied}`,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(bills.id, app.billId), eq(bills.companyId, tx.companyId)))
+        .returning({
+          amountPaid: bills.amountPaid,
+          amountCredited: bills.amountCredited,
+          balanceDue: bills.balanceDue,
+        });
+      if (!updatedBill) throw notFound(`Bill ${app.billId}`);
+      if (Money.of(updatedBill.amountPaid).lessThan(0)) {
+        // Should be impossible unless the subledger was already desynced; refuse
+        // to persist a negative amountPaid (the transaction rolls back).
+        throw new ServiceError(
+          'CONFLICT',
+          `Voiding this payment would make bill ${app.billId} amountPaid negative.`,
+        );
+      }
+
+      const newStatus = deriveBillStatus(
+        updatedBill.balanceDue,
+        updatedBill.amountPaid,
+        updatedBill.amountCredited,
+      );
+      await tx.db.update(bills).set({ status: newStatus }).where(eq(bills.id, app.billId));
+    }
+
+    // 3. Delete application rows.
+    await tx.db
+      .delete(billPaymentApplications)
+      .where(eq(billPaymentApplications.billPaymentId, id));
+
+    // 4. Stamp the payment void.
+    const [updated] = await tx.db
+      .update(billPayments)
+      .set({ voidedAt: new Date() })
+      .where(eq(billPayments.id, id))
+      .returning();
+
+    await writeAudit(tx, {
+      action: 'void',
+      entityType: 'bill_payment',
+      entityId: id,
+      oldValues: {
+        amount: payment.amount,
+        applications: applications.map((a) => ({
+          billId: a.billId,
+          amountApplied: a.amountApplied,
+        })),
+      },
+      newValues: { voided: true },
+    });
+
+    return { ...updated, applications: [] };
+  });
 }

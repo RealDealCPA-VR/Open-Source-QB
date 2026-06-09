@@ -1,10 +1,11 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { FileText, Plus, ArrowRight, Trash2, Download } from 'lucide-react';
+import { ClipboardList, Plus, ArrowRight, Trash2, Download, Percent } from 'lucide-react';
 import {
   Button,
   Card,
+  EmptyState,
   Input,
   Select,
   Label,
@@ -15,11 +16,12 @@ import {
   Tr,
   Modal,
   PageHeader,
+  Spinner,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/format';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -37,11 +39,29 @@ interface Estimate {
   total: string;
   memo: string | null;
   convertedInvoiceId: string | null;
+  /** Total billed via progress invoicing so far (≤ total). */
+  amountInvoiced: string;
+}
+
+interface EstimateDetailLine {
+  id: string;
+  itemId: string | null;
+  description: string | null;
+  quantity: string;
+  rate: string;
+  amount: string;
+  taxable: boolean;
 }
 
 interface Customer {
   id: string;
   displayName: string;
+}
+
+interface TaxRate {
+  id: string;
+  name: string;
+  rate: string; // fraction, e.g. "0.082500"
 }
 
 interface EstimateLineForm {
@@ -56,6 +76,7 @@ interface EstimateForm {
   customerId: string;
   date: string;
   expirationDate: string;
+  taxRateId: string;
   memo: string;
   lines: EstimateLineForm[];
 }
@@ -74,6 +95,7 @@ const EMPTY_FORM: EstimateForm = {
   customerId: '',
   date: today(),
   expirationDate: '',
+  taxRateId: '',
   memo: '',
   lines: [{ ...EMPTY_LINE }],
 };
@@ -86,6 +108,7 @@ function statusTone(status: string): 'neutral' | 'success' | 'warning' | 'danger
   switch (status) {
     case 'draft': return 'neutral';
     case 'accepted': return 'success';
+    case 'partial': return 'warning';
     case 'rejected': return 'danger';
     case 'closed': return 'info';
     default: return 'neutral';
@@ -119,7 +142,7 @@ function LineRow({
 
   return (
     <div className="grid grid-cols-12 gap-2 items-center mb-2">
-      <div className="col-span-5">
+      <div className="col-span-4">
         <Input
           placeholder="Description"
           value={line.description}
@@ -146,7 +169,18 @@ function LineRow({
           onChange={(e) => onChange(index, 'rate', e.target.value)}
         />
       </div>
-      <div className="col-span-2 text-right text-sm font-mono text-navy font-semibold">
+      <div className="col-span-1 flex justify-center">
+        <label className="flex items-center gap-1 text-xs text-navy/60 select-none">
+          <input
+            type="checkbox"
+            checked={line.taxable}
+            onChange={(e) => onChange(index, 'taxable', e.target.checked)}
+            className="accent-electric"
+            title="Taxable line"
+          />
+        </label>
+      </div>
+      <div className="col-span-2 text-right text-sm tabular-nums text-navy font-semibold">
         {formatCurrency(amount)}
       </div>
       <div className="col-span-1 flex justify-end">
@@ -172,6 +206,7 @@ function LineRow({
 function EstimateFormBody({
   form,
   customers,
+  taxRates,
   onChange,
   onLineChange,
   onAddLine,
@@ -179,6 +214,7 @@ function EstimateFormBody({
 }: {
   form: EstimateForm;
   customers: Customer[];
+  taxRates: TaxRate[];
   onChange: (field: keyof EstimateForm, value: string) => void;
   onLineChange: (idx: number, field: keyof EstimateLineForm, value: string | boolean) => void;
   onAddLine: () => void;
@@ -188,6 +224,14 @@ function EstimateFormBody({
     (sum, l) => sum + (parseFloat(l.quantity) || 0) * (parseFloat(l.rate) || 0),
     0,
   );
+  // Mirror the service/invoice math: tax applies to taxable lines only.
+  const taxableSubtotal = form.lines.reduce(
+    (sum, l) => sum + (l.taxable ? (parseFloat(l.quantity) || 0) * (parseFloat(l.rate) || 0) : 0),
+    0,
+  );
+  const selectedRate = taxRates.find((t) => t.id === form.taxRateId);
+  const taxAmount = taxableSubtotal * (selectedRate ? parseFloat(selectedRate.rate) || 0 : 0);
+  const total = subtotal + taxAmount;
 
   return (
     <div className="flex flex-col gap-4">
@@ -199,6 +243,7 @@ function EstimateFormBody({
             value={form.customerId}
             onChange={(e) => onChange('customerId', e.target.value)}
             required
+            autoFocus
           >
             <option value="">Select customer...</option>
             {customers.map((c) => (
@@ -220,26 +265,42 @@ function EstimateFormBody({
         </div>
       </div>
 
-      <div>
-        <Label htmlFor="expirationDate">Expiration Date</Label>
-        <Input
-          id="expirationDate"
-          type="date"
-          value={form.expirationDate}
-          onChange={(e) => onChange('expirationDate', e.target.value)}
-        />
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <Label htmlFor="expirationDate">Expiration Date</Label>
+          <Input
+            id="expirationDate"
+            type="date"
+            value={form.expirationDate}
+            onChange={(e) => onChange('expirationDate', e.target.value)}
+          />
+        </div>
+        <div>
+          <Label htmlFor="est-taxrate">Sales Tax</Label>
+          <Select
+            id="est-taxrate"
+            value={form.taxRateId}
+            onChange={(e) => onChange('taxRateId', e.target.value)}
+          >
+            <option value="">No tax</option>
+            {taxRates.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.name} ({(parseFloat(t.rate) * 100).toFixed(2)}%)
+              </option>
+            ))}
+          </Select>
+        </div>
       </div>
 
       <div>
-        <div className="flex items-center justify-between mb-2">
-          <Label className="mb-0">Line Items *</Label>
-          <div className="grid grid-cols-12 gap-2 text-xs font-semibold text-navy/50 w-full mt-1">
-            <div className="col-span-5">Description</div>
-            <div className="col-span-2">Qty</div>
-            <div className="col-span-2">Rate</div>
-            <div className="col-span-2 text-right">Amount</div>
-            <div className="col-span-1" />
-          </div>
+        <Label>Line Items *</Label>
+        <div className="grid grid-cols-12 gap-2 text-xs font-semibold text-navy/50 mb-2">
+          <div className="col-span-4">Description</div>
+          <div className="col-span-2">Qty</div>
+          <div className="col-span-2">Rate</div>
+          <div className="col-span-1 text-center">Tax</div>
+          <div className="col-span-2 text-right">Amount</div>
+          <div className="col-span-1" />
         </div>
 
         {form.lines.map((line, idx) => (
@@ -264,10 +325,13 @@ function EstimateFormBody({
           Add Line
         </Button>
 
-        <div className="flex justify-end mt-3 pt-3 border-t border-slate-100">
-          <span className="text-sm font-bold text-navy">
-            Total: {formatCurrency(subtotal)}
+        <div className="flex flex-col items-end gap-0.5 mt-3 pt-3 border-t border-slate-100 text-sm">
+          <span className="text-navy/60">Subtotal: {formatCurrency(subtotal)}</span>
+          <span className="text-navy/60">
+            Sales Tax{selectedRate ? ` (${(parseFloat(selectedRate.rate) * 100).toFixed(2)}%)` : ''}:{' '}
+            {formatCurrency(taxAmount)}
           </span>
+          <span className="font-bold text-navy">Total: {formatCurrency(total)}</span>
         </div>
       </div>
 
@@ -293,6 +357,7 @@ function EstimateFormBody({
 export default function EstimatesPage() {
   const [estimates, setEstimates] = useState<Estimate[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
+  const [taxRates, setTaxRates] = useState<TaxRate[]>([]);
   const [loading, setLoading] = useState(true);
   const [customerMap, setCustomerMap] = useState<Map<string, string>>(new Map());
 
@@ -304,6 +369,17 @@ export default function EstimatesPage() {
   // Convert confirm modal.
   const [convertTarget, setConvertTarget] = useState<Estimate | null>(null);
   const [converting, setConverting] = useState(false);
+
+  // Row whose Accept/Reject/Draft PATCH is in flight (disables that row's status buttons).
+  const [pendingStatusId, setPendingStatusId] = useState<string | null>(null);
+
+  // Progress invoicing modal.
+  const [progressTarget, setProgressTarget] = useState<Estimate | null>(null);
+  const [progressLines, setProgressLines] = useState<EstimateDetailLine[]>([]);
+  const [progressMode, setProgressMode] = useState<'percent' | 'lines'>('percent');
+  const [progressPercent, setProgressPercent] = useState('');
+  const [progressLineAmounts, setProgressLineAmounts] = useState<Record<string, string>>({});
+  const [progressSaving, setProgressSaving] = useState(false);
 
   // ---------------------------------------------------------------------------
   // Data fetching
@@ -331,10 +407,20 @@ export default function EstimatesPage() {
     }
   }, []);
 
+  const fetchTaxRates = useCallback(async () => {
+    try {
+      const data = await api.get<TaxRate[]>('/api/tax-rates');
+      setTaxRates(data);
+    } catch {
+      // Non-fatal; the tax dropdown just won't populate.
+    }
+  }, []);
+
   useEffect(() => {
     fetchEstimates();
     fetchCustomers();
-  }, [fetchEstimates, fetchCustomers]);
+    fetchTaxRates();
+  }, [fetchEstimates, fetchCustomers, fetchTaxRates]);
 
   // ---------------------------------------------------------------------------
   // New estimate
@@ -388,6 +474,7 @@ export default function EstimatesPage() {
         customerId: addForm.customerId,
         date: addForm.date,
         expirationDate: addForm.expirationDate || null,
+        taxRateId: addForm.taxRateId || null,
         memo: addForm.memo || null,
         lines: addForm.lines.map((l) => ({
           itemId: l.itemId || null,
@@ -412,12 +499,15 @@ export default function EstimatesPage() {
   // ---------------------------------------------------------------------------
 
   async function handleStatusChange(estimate: Estimate, status: string) {
+    setPendingStatusId(estimate.id);
     try {
       await api.patch(`/api/estimates/${estimate.id}`, { status });
       toast(`Estimate #${estimate.estimateNumber} marked ${status}`, 'success');
       await fetchEstimates();
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to update status', 'danger');
+    } finally {
+      setPendingStatusId(null);
     }
   }
 
@@ -441,6 +531,64 @@ export default function EstimatesPage() {
   }
 
   // ---------------------------------------------------------------------------
+  // Progress invoicing
+  // ---------------------------------------------------------------------------
+
+  async function openProgressModal(estimate: Estimate) {
+    setProgressTarget(estimate);
+    setProgressMode('percent');
+    setProgressPercent('');
+    setProgressLineAmounts({});
+    setProgressLines([]);
+    try {
+      const detail = await api.get<Estimate & { lines: EstimateDetailLine[] }>(
+        `/api/estimates/${estimate.id}`,
+      );
+      setProgressLines(detail.lines ?? []);
+    } catch {
+      // Per-line mode just won't have rows; percent mode still works.
+    }
+  }
+
+  async function handleProgressInvoice() {
+    if (!progressTarget) return;
+
+    const payload: Record<string, unknown> = { action: 'progress' };
+    if (progressMode === 'percent') {
+      const pct = parseFloat(progressPercent);
+      if (!pct || pct <= 0 || pct > 100) {
+        toast('Enter a percentage between 0 and 100', 'danger');
+        return;
+      }
+      payload.percent = progressPercent;
+    } else {
+      const lineAmounts = Object.entries(progressLineAmounts)
+        .filter(([, amount]) => parseFloat(amount) > 0)
+        .map(([lineId, amount]) => ({ lineId, amount }));
+      if (lineAmounts.length === 0) {
+        toast('Enter an amount for at least one line', 'danger');
+        return;
+      }
+      payload.lineAmounts = lineAmounts;
+    }
+
+    setProgressSaving(true);
+    try {
+      await api.post(`/api/estimates/${progressTarget.id}`, payload);
+      toast(
+        `Progress invoice created for estimate EST-${String(progressTarget.estimateNumber).padStart(4, '0')}`,
+        'success',
+      );
+      setProgressTarget(null);
+      await fetchEstimates();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to create progress invoice', 'danger');
+    } finally {
+      setProgressSaving(false);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Render
   // ---------------------------------------------------------------------------
 
@@ -448,7 +596,7 @@ export default function EstimatesPage() {
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
         title="Estimates"
-        icon={FileText}
+        icon={ClipboardList}
         action={
           <Button onClick={openAddModal}>
             <Plus className="h-4 w-4" />
@@ -459,14 +607,20 @@ export default function EstimatesPage() {
 
       <Card>
         {loading ? (
-          <div className="p-12 text-center text-navy/40 text-sm">Loading estimates...</div>
-        ) : estimates.length === 0 ? (
-          <div className="p-12 text-center">
-            <FileText className="mx-auto h-10 w-10 text-navy/20 mb-3" />
-            <p className="text-navy/50 text-sm">
-              No estimates yet. Click "New Estimate" to create your first quote.
-            </p>
+          <div className="flex items-center justify-center py-20 text-navy/40">
+            <Spinner className="h-6 w-6" />
           </div>
+        ) : estimates.length === 0 ? (
+          <EmptyState
+            icon={ClipboardList}
+            title="No estimates yet"
+            message="Create your first quote to get started."
+            action={
+              <Button onClick={openAddModal}>
+                <Plus className="h-4 w-4" /> New Estimate
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -475,7 +629,8 @@ export default function EstimatesPage() {
                 <Th>Customer</Th>
                 <Th>Date</Th>
                 <Th>Expires</Th>
-                <Th className="text-right">Total</Th>
+                <Th numeric>Total</Th>
+                <Th numeric>Invoiced</Th>
                 <Th>Status</Th>
                 <Th className="text-right">Actions</Th>
               </tr>
@@ -487,18 +642,15 @@ export default function EstimatesPage() {
                     EST-{String(e.estimateNumber).padStart(4, '0')}
                   </Td>
                   <Td className="font-semibold text-navy">
-                    {customerMap.get(e.customerId) ?? e.customerId}
+                    {customerMap.get(e.customerId) ?? '—'}
                   </Td>
-                  <Td className="text-navy/70">
-                    {new Date(e.date).toLocaleDateString()}
-                  </Td>
-                  <Td className="text-navy/70">
-                    {e.expirationDate
-                      ? new Date(e.expirationDate).toLocaleDateString()
-                      : '-'}
-                  </Td>
-                  <Td className="text-right font-mono font-semibold text-navy">
+                  <Td className="text-navy/70">{formatDate(e.date)}</Td>
+                  <Td className="text-navy/70">{formatDate(e.expirationDate)}</Td>
+                  <Td numeric className="font-semibold text-navy">
                     {formatCurrency(e.total)}
+                  </Td>
+                  <Td numeric className="text-navy/70">
+                    {Number(e.amountInvoiced) > 0 ? formatCurrency(e.amountInvoiced) : '-'}
                   </Td>
                   <Td>
                     <Badge tone={statusTone(e.status)}>{statusLabel(e.status)}</Badge>
@@ -515,14 +667,15 @@ export default function EstimatesPage() {
                         <Download className="h-3.5 w-3.5" />
                         PDF
                       </Button>
-                      {/* Status transitions for non-closed estimates */}
-                      {e.status !== 'closed' && (
+                      {/* Status transitions for non-closed, non-partial estimates */}
+                      {e.status !== 'closed' && e.status !== 'partial' && (
                         <>
                           {e.status !== 'accepted' && (
                             <Button
                               variant="ghost"
                               size="sm"
                               onClick={() => handleStatusChange(e, 'accepted')}
+                              disabled={pendingStatusId === e.id}
                               title="Mark accepted"
                             >
                               Accept
@@ -533,6 +686,7 @@ export default function EstimatesPage() {
                               variant="ghost"
                               size="sm"
                               onClick={() => handleStatusChange(e, 'rejected')}
+                              disabled={pendingStatusId === e.id}
                               className="text-red-500 hover:bg-red-50"
                               title="Mark rejected"
                             >
@@ -544,20 +698,36 @@ export default function EstimatesPage() {
                               variant="ghost"
                               size="sm"
                               onClick={() => handleStatusChange(e, 'draft')}
+                              disabled={pendingStatusId === e.id}
                               title="Reset to draft"
                             >
                               Draft
                             </Button>
                           )}
+                        </>
+                      )}
+                      {e.status !== 'closed' && e.status !== 'rejected' && (
+                        <>
                           <Button
-                            variant="secondary"
+                            variant="ghost"
                             size="sm"
-                            onClick={() => setConvertTarget(e)}
-                            title="Convert to invoice"
+                            onClick={() => openProgressModal(e)}
+                            title="Bill part of this estimate (progress invoicing)"
                           >
-                            <ArrowRight className="h-3.5 w-3.5" />
-                            Invoice
+                            <Percent className="h-3.5 w-3.5" />
+                            Progress
                           </Button>
+                          {e.status !== 'partial' && (
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              onClick={() => setConvertTarget(e)}
+                              title="Convert to invoice"
+                            >
+                              <ArrowRight className="h-3.5 w-3.5" />
+                              Invoice
+                            </Button>
+                          )}
                         </>
                       )}
                       {e.status === 'closed' && e.convertedInvoiceId && (
@@ -574,6 +744,7 @@ export default function EstimatesPage() {
 
       {/* ---- New Estimate modal ---- */}
       <Modal
+        size="lg"
         open={addOpen}
         onClose={() => setAddOpen(false)}
         title="New Estimate"
@@ -582,8 +753,8 @@ export default function EstimatesPage() {
             <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addSaving}>
               Cancel
             </Button>
-            <Button onClick={handleCreate} disabled={addSaving}>
-              {addSaving ? 'Saving...' : 'Create Estimate'}
+            <Button onClick={handleCreate} loading={addSaving}>
+              Create Estimate
             </Button>
           </>
         }
@@ -591,11 +762,157 @@ export default function EstimatesPage() {
         <EstimateFormBody
           form={addForm}
           customers={customers}
+          taxRates={taxRates}
           onChange={handleFormChange}
           onLineChange={handleLineChange}
           onAddLine={handleAddLine}
           onRemoveLine={handleRemoveLine}
         />
+      </Modal>
+
+      {/* ---- Progress Invoice modal ---- */}
+      <Modal
+        open={!!progressTarget}
+        onClose={() => setProgressTarget(null)}
+        title={`Progress Invoice — EST-${String(progressTarget?.estimateNumber ?? 0).padStart(4, '0')}`}
+        footer={
+          <>
+            <Button
+              variant="secondary"
+              onClick={() => setProgressTarget(null)}
+              disabled={progressSaving}
+            >
+              Cancel
+            </Button>
+            <Button onClick={handleProgressInvoice} loading={progressSaving}>
+              Create Progress Invoice
+            </Button>
+          </>
+        }
+      >
+        {progressTarget && (
+          <div className="flex flex-col gap-4">
+            {/* Remaining summary */}
+            <div className="rounded-lg bg-navy/5 px-4 py-3 grid grid-cols-3 gap-2 text-sm">
+              <div>
+                <div className="text-xs text-navy/50">Estimate Total</div>
+                <div className="font-semibold text-navy tabular-nums">
+                  {formatCurrency(progressTarget.total)}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-navy/50">Already Invoiced</div>
+                <div className="font-semibold text-navy tabular-nums">
+                  {formatCurrency(progressTarget.amountInvoiced)}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-navy/50">Remaining</div>
+                <div className="font-semibold text-electric tabular-nums">
+                  {formatCurrency(
+                    (Number(progressTarget.total) - Number(progressTarget.amountInvoiced)).toFixed(2),
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Mode toggle */}
+            <div className="flex rounded-lg border border-slate-200 overflow-hidden w-fit">
+              <button
+                type="button"
+                onClick={() => setProgressMode('percent')}
+                className={`px-3 py-2 text-xs font-semibold transition-colors ${
+                  progressMode === 'percent'
+                    ? 'bg-electric text-white'
+                    : 'bg-white text-navy/60 hover:bg-slate-50'
+                }`}
+              >
+                % of remaining
+              </button>
+              <button
+                type="button"
+                onClick={() => setProgressMode('lines')}
+                className={`px-3 py-2 text-xs font-semibold transition-colors ${
+                  progressMode === 'lines'
+                    ? 'bg-electric text-white'
+                    : 'bg-white text-navy/60 hover:bg-slate-50'
+                }`}
+              >
+                Per-line amounts
+              </button>
+            </div>
+
+            {progressMode === 'percent' ? (
+              <div>
+                <Label htmlFor="progress-pct">Percentage of remaining balance *</Label>
+                <Input
+                  id="progress-pct"
+                  type="number"
+                  min="0.01"
+                  max="100"
+                  step="any"
+                  placeholder="e.g. 50"
+                  value={progressPercent}
+                  onChange={(e) => setProgressPercent(e.target.value)}
+                />
+                {parseFloat(progressPercent) > 0 && (
+                  <p className="mt-1 text-xs text-navy/50">
+                    Will invoice{' '}
+                    <strong>
+                      {formatCurrency(
+                        (
+                          (Number(progressTarget.total) - Number(progressTarget.amountInvoiced)) *
+                          (parseFloat(progressPercent) / 100)
+                        ).toFixed(2),
+                      )}
+                    </strong>{' '}
+                    allocated across the estimate lines.
+                  </p>
+                )}
+              </div>
+            ) : (
+              <div>
+                <Label>Amount to bill per line</Label>
+                <div className="rounded-lg border border-slate-200 divide-y divide-slate-100">
+                  {progressLines.length === 0 ? (
+                    <div className="flex items-center gap-2 p-3 text-xs text-navy/40">
+                      <Spinner className="h-4 w-4" /> Loading estimate lines…
+                    </div>
+                  ) : (
+                    progressLines.map((l) => (
+                      <div key={l.id} className="flex items-center gap-2 px-3 py-2 text-sm">
+                        <span className="flex-1 truncate text-navy/80">
+                          {l.description ?? 'Line'}
+                          <span className="text-navy/40">
+                            {' '}
+                            ({formatCurrency(l.amount)} quoted)
+                          </span>
+                        </span>
+                        <Input
+                          type="number"
+                          min="0"
+                          step="any"
+                          placeholder="0.00"
+                          value={progressLineAmounts[l.id] ?? ''}
+                          onChange={(ev) =>
+                            setProgressLineAmounts((prev) => ({ ...prev, [l.id]: ev.target.value }))
+                          }
+                          className="w-28"
+                          aria-label={`Amount for ${l.description ?? 'line'}`}
+                        />
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+
+            <p className="text-xs text-navy/50">
+              A partial invoice will be posted to A/R and linked to this estimate. The estimate
+              stays open until the full {formatCurrency(progressTarget.total)} has been invoiced.
+            </p>
+          </div>
+        )}
       </Modal>
 
       {/* ---- Convert confirm modal ---- */}
@@ -612,8 +929,8 @@ export default function EstimatesPage() {
             >
               Cancel
             </Button>
-            <Button onClick={handleConvert} disabled={converting}>
-              {converting ? 'Converting...' : 'Convert to Invoice'}
+            <Button onClick={handleConvert} loading={converting}>
+              Convert to Invoice
             </Button>
           </>
         }
@@ -629,8 +946,6 @@ export default function EstimatesPage() {
           marked as closed.
         </p>
       </Modal>
-
-      <Toaster />
     </main>
   );
 }

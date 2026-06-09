@@ -52,26 +52,39 @@ export default function ResetPasswordPage() {
         </div>
 
         <div className="space-y-4">
-          <div>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              requestToken();
+            }}
+          >
             <Label>Email</Label>
             <div className="flex gap-2">
-              <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
-              <Button variant="secondary" onClick={requestToken} disabled={busy || !email}>
+              <Input type="email" autoFocus value={email} onChange={(e) => setEmail(e.target.value)} />
+              <Button type="submit" variant="secondary" loading={busy} disabled={!email}>
                 Get token
               </Button>
             </div>
-          </div>
-          <div>
-            <Label>Reset token</Label>
-            <Input value={token} onChange={(e) => setToken(e.target.value)} placeholder="paste token" />
-          </div>
-          <div>
-            <Label>New password</Label>
-            <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} minLength={6} />
-          </div>
-          <Button className="w-full" onClick={reset} disabled={busy || !token || password.length < 6}>
-            Set new password
-          </Button>
+          </form>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              reset();
+            }}
+            className="space-y-4"
+          >
+            <div>
+              <Label>Reset token</Label>
+              <Input value={token} onChange={(e) => setToken(e.target.value)} placeholder="paste token" />
+            </div>
+            <div>
+              <Label>New password</Label>
+              <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} minLength={6} />
+            </div>
+            <Button type="submit" className="w-full" loading={busy} disabled={!token || password.length < 6}>
+              Set new password
+            </Button>
+          </form>
         </div>
         <p className="mt-6 text-center text-sm text-navy/50">
           <Link href="/login" className="text-electric font-semibold hover:underline">Back to sign in</Link>

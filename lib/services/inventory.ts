@@ -16,9 +16,9 @@
  *
  * averageCost is maintained as a weighted average: updated on positive receipts only.
  */
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
-import { items, accounts } from '@/lib/db/schema';
+import { items, accounts, inventoryLayers } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
@@ -28,6 +28,24 @@ import {
   validation,
   writeAudit,
 } from './_base';
+
+/**
+ * Guard against costing-method mixing. The average-cost paths in this module (adjustInventory,
+ * recordCOGS) must never operate on an item that is tracked under FIFO (fifo.ts is the only code
+ * that maintains inventoryLayers). Doing so silently diverges quantityOnHand/GL from the FIFO
+ * layer valuation and values COGS at a null/zero averageCost. Route FIFO items through fifo.ts.
+ */
+export async function assertNotFifoTracked(ctx: ServiceContext, itemId: string): Promise<void> {
+  const [row] = await ctx.db
+    .select({ cnt: sql<number>`count(*)` })
+    .from(inventoryLayers)
+    .where(and(eq(inventoryLayers.companyId, ctx.companyId), eq(inventoryLayers.itemId, itemId)));
+  if (Number(row?.cnt ?? 0) > 0) {
+    throw validation(
+      'This item is FIFO-tracked; use the FIFO receive/consume endpoints rather than average-cost adjustments.',
+    );
+  }
+}
 import { postJournalEntry } from './posting';
 
 // ---------------------------------------------------------------------------
@@ -54,6 +72,66 @@ async function loadItem(ctx: ServiceContext, itemId: string) {
   return row;
 }
 
+/**
+ * Precondition guard for physical inventory counts: the item must be a stock-
+ * tracked ('inventory') item and must NOT be FIFO-tracked (physical counts are
+ * an average-cost operation — they value the delta at averageCost and do not
+ * touch inventoryLayers). Throws VALIDATION otherwise.
+ */
+export async function assertPhysicalCountable(ctx: ServiceContext, itemId: string): Promise<void> {
+  const item = await loadItem(ctx, itemId);
+  if (item.type !== 'inventory') {
+    throw validation(
+      `Physical counts can only be recorded for inventory-type items; "${item.name}" is type "${item.type}".`,
+    );
+  }
+  await assertNotFifoTracked(ctx, itemId);
+}
+
+// ---------------------------------------------------------------------------
+// setReorderPoint
+// ---------------------------------------------------------------------------
+
+/**
+ * Set (or clear) an item's reorder point — the threshold that drives the
+ * reorder report and low-stock alerts. Pass null to clear it.
+ */
+export async function setReorderPoint(
+  ctx: ServiceContext,
+  itemId: string,
+  reorderPoint: string | number | null,
+) {
+  const before = await loadItem(ctx, itemId);
+
+  let stored: string | null = null;
+  if (reorderPoint != null && reorderPoint !== '') {
+    let value: Decimal;
+    try {
+      value = Money.of(reorderPoint);
+    } catch {
+      throw validation(`reorderPoint must be a number (got "${reorderPoint}").`);
+    }
+    if (value.isNegative()) throw validation('reorderPoint cannot be negative.');
+    stored = value.toFixed(4);
+  }
+
+  const [row] = await ctx.db
+    .update(items)
+    .set({ reorderPoint: stored, updatedAt: new Date() })
+    .where(and(eq(items.companyId, ctx.companyId), eq(items.id, itemId)))
+    .returning();
+
+  await writeAudit(ctx, {
+    action: 'update',
+    entityType: 'item',
+    entityId: itemId,
+    oldValues: { reorderPoint: before.reorderPoint },
+    newValues: { reorderPoint: stored },
+  });
+
+  return row;
+}
+
 // ---------------------------------------------------------------------------
 // adjustInventory
 // ---------------------------------------------------------------------------
@@ -75,6 +153,7 @@ export async function adjustInventory(ctx: ServiceContext, input: AdjustInventor
   const qtyChange = Money.of(input.quantityChange);
   if (qtyChange.isZero()) throw validation('quantityChange cannot be zero.');
 
+  await assertNotFifoTracked(ctx, input.itemId);
   const item = await loadItem(ctx, input.itemId);
 
   const currentQty = Money.of(item.quantityOnHand ?? '0');
@@ -217,6 +296,7 @@ export async function recordCOGS(ctx: ServiceContext, input: RecordCOGSInput) {
   const qty = Money.of(input.quantity);
   if (qty.lessThanOrEqualTo(0)) throw validation('quantity must be positive for COGS recording.');
 
+  await assertNotFifoTracked(ctx, input.itemId);
   const item = await loadItem(ctx, input.itemId);
   const currentQty = Money.of(item.quantityOnHand ?? '0');
   const avgCost = Money.of(item.averageCost ?? '0');
@@ -286,8 +366,10 @@ export interface InventoryValuationRow {
   name: string;
   sku: string | null;
   quantityOnHand: string;
+  /** For FIFO items this is the effective unit cost (layer value / layer qty). */
   averageCost: string;
   totalValue: string;
+  costingMethod: 'fifo' | 'average';
 }
 
 export interface InventoryValuationResult {
@@ -295,6 +377,15 @@ export interface InventoryValuationResult {
   grandTotal: string;
 }
 
+/**
+ * Inventory valuation covering both costing methods so the grand total ties to
+ * the GL inventory asset account:
+ *   - FIFO-tracked items (those with inventoryLayers rows) are valued from
+ *     their remaining layers: SUM(quantityRemaining * unitCost).
+ *   - Average-cost items are valued at quantityOnHand * averageCost.
+ * Only active, inventory-type items are included (services/bundles/non-inventory
+ * items carry no stock value).
+ */
 export async function inventoryValuation(ctx: ServiceContext): Promise<InventoryValuationResult> {
   const rows = await ctx.db
     .select({
@@ -305,10 +396,47 @@ export async function inventoryValuation(ctx: ServiceContext): Promise<Inventory
       averageCost: items.averageCost,
     })
     .from(items)
-    .where(and(eq(items.companyId, ctx.companyId), eq(items.isActive, true)));
+    .where(
+      and(
+        eq(items.companyId, ctx.companyId),
+        eq(items.isActive, true),
+        eq(items.type, 'inventory'),
+      ),
+    );
+
+  // Aggregate remaining FIFO layers per item. Any item with layer rows is
+  // FIFO-tracked (same detection assertNotFifoTracked uses).
+  const layerAgg = await ctx.db
+    .select({
+      itemId: inventoryLayers.itemId,
+      layerQty: sql<string>`COALESCE(SUM(${inventoryLayers.quantityRemaining}), 0)`,
+      layerValue: sql<string>`COALESCE(SUM(${inventoryLayers.quantityRemaining} * ${inventoryLayers.unitCost}), 0)`,
+    })
+    .from(inventoryLayers)
+    .where(eq(inventoryLayers.companyId, ctx.companyId))
+    .groupBy(inventoryLayers.itemId);
+  const fifoByItem = new Map(layerAgg.map((r) => [r.itemId, r]));
 
   let grandTotal = Money.zero();
   const valuationRows: InventoryValuationRow[] = rows.map((r) => {
+    const fifo = fifoByItem.get(r.id);
+
+    if (fifo) {
+      const qty = Money.of(fifo.layerQty ?? '0');
+      const total = Money.round2(Money.of(fifo.layerValue ?? '0'));
+      const effectiveUnitCost = qty.isZero() ? Money.zero() : total.dividedBy(qty);
+      grandTotal = grandTotal.plus(total);
+      return {
+        id: r.id,
+        name: r.name,
+        sku: r.sku ?? null,
+        quantityOnHand: qty.toFixed(4),
+        averageCost: effectiveUnitCost.toFixed(4),
+        totalValue: toAmountString(total),
+        costingMethod: 'fifo' as const,
+      };
+    }
+
     const qty = Money.of(r.quantityOnHand ?? '0');
     const avg = Money.of(r.averageCost ?? '0');
     const total = Money.round2(qty.times(avg));
@@ -320,6 +448,7 @@ export async function inventoryValuation(ctx: ServiceContext): Promise<Inventory
       quantityOnHand: qty.toFixed(4),
       averageCost: avg.toFixed(4),
       totalValue: toAmountString(total),
+      costingMethod: 'average' as const,
     };
   });
 

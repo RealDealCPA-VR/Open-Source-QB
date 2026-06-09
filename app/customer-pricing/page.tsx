@@ -1,10 +1,12 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { Tags, Trash2, Plus, ChevronDown } from 'lucide-react';
+import { HandCoins, Trash2, Plus } from 'lucide-react';
 import {
   Button,
   Card,
+  ConfirmDialog,
+  EmptyState,
   Input,
   Select,
   Label,
@@ -14,8 +16,8 @@ import {
   Tr,
   Modal,
   PageHeader,
+  Spinner,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
@@ -116,7 +118,7 @@ export default function CustomerPricingPage() {
           return {
             id: cp.id,
             itemId: cp.itemId,
-            itemName: item?.name ?? cp.itemId,
+            itemName: item?.name ?? 'Unknown item',
             sku: item?.sku ?? null,
             customPrice: cp.price,
             defaultPrice: item?.salesPrice ?? null,
@@ -239,7 +241,7 @@ export default function CustomerPricingPage() {
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
         title="Customer Pricing"
-        icon={Tags}
+        icon={HandCoins}
         action={
           selectedCustomerId ? (
             <Button onClick={openAddModal} disabled={availableItems.length === 0}>
@@ -254,22 +256,19 @@ export default function CustomerPricingPage() {
       <Card className="mb-6 p-5">
         <div className="max-w-sm">
           <Label htmlFor="customerSelect">Customer</Label>
-          <div className="relative">
-            <Select
-              id="customerSelect"
-              value={selectedCustomerId}
-              onChange={(e) => setSelectedCustomerId(e.target.value)}
-            >
-              <option value="">-- select a customer --</option>
-              {customers.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.displayName}
-                  {c.companyName ? ` (${c.companyName})` : ''}
-                </option>
-              ))}
-            </Select>
-            <ChevronDown className="pointer-events-none absolute right-3 top-2.5 h-4 w-4 text-navy/40" />
-          </div>
+          <Select
+            id="customerSelect"
+            value={selectedCustomerId}
+            onChange={(e) => setSelectedCustomerId(e.target.value)}
+          >
+            <option value="">-- select a customer --</option>
+            {customers.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.displayName}
+                {c.companyName ? ` (${c.companyName})` : ''}
+              </option>
+            ))}
+          </Select>
         </div>
       </Card>
 
@@ -277,24 +276,28 @@ export default function CustomerPricingPage() {
       {selectedCustomer && (
         <Card>
           {loading ? (
-            <div className="p-12 text-center text-navy/40 text-sm">Loading prices...</div>
-          ) : priceRows.length === 0 ? (
-            <div className="p-12 text-center">
-              <Tags className="mx-auto h-10 w-10 text-navy/20 mb-3" />
-              <p className="text-navy/50 text-sm">
-                No custom prices for{' '}
-                <strong className="text-navy">{selectedCustomer.displayName}</strong>. All items
-                will use their default sales price. Click &ldquo;Set Price&rdquo; to add one.
-              </p>
+            <div className="flex items-center justify-center py-20 text-navy/40">
+              <Spinner className="h-6 w-6" />
             </div>
+          ) : priceRows.length === 0 ? (
+            <EmptyState
+              icon={HandCoins}
+              title="No custom prices yet"
+              message={`All items will use their default sales price for ${selectedCustomer.displayName}.`}
+              action={
+                <Button onClick={openAddModal} disabled={availableItems.length === 0}>
+                  <Plus className="h-4 w-4" /> Set Price
+                </Button>
+              }
+            />
           ) : (
             <Table>
               <thead>
                 <tr>
                   <Th>Item</Th>
                   <Th>SKU</Th>
-                  <Th className="text-right">Default Price</Th>
-                  <Th className="text-right">Custom Price</Th>
+                  <Th numeric>Default Price</Th>
+                  <Th numeric>Custom Price</Th>
                   <Th className="text-right">Actions</Th>
                 </tr>
               </thead>
@@ -308,20 +311,20 @@ export default function CustomerPricingPage() {
                     <Tr key={row.id}>
                       <Td className="font-semibold text-navy">{row.itemName}</Td>
                       <Td className="text-navy/50 font-mono text-xs">{row.sku ?? '-'}</Td>
-                      <Td className="text-right font-mono text-navy/60">
+                      <Td numeric className="text-navy/60">
                         {row.defaultPrice != null ? formatCurrency(row.defaultPrice) : '-'}
                       </Td>
-                      <Td className="text-right">
-                        <span className="font-mono font-semibold text-navy">
+                      <Td numeric>
+                        <span className="font-semibold text-navy">
                           {formatCurrency(row.customPrice)}
                         </span>
                         {savings != null && savings > 0 && (
-                          <span className="ml-2 text-xs text-emerald-600 font-semibold">
+                          <span className="ml-2 text-xs text-emerald font-semibold">
                             -{formatCurrency(savings)}
                           </span>
                         )}
                         {savings != null && savings < 0 && (
-                          <span className="ml-2 text-xs text-amber-600 font-semibold">
+                          <span className="ml-2 text-xs text-gold font-semibold">
                             +{formatCurrency(Math.abs(savings))}
                           </span>
                         )}
@@ -365,8 +368,8 @@ export default function CustomerPricingPage() {
             <Button variant="secondary" onClick={() => setModalOpen(false)} disabled={saving}>
               Cancel
             </Button>
-            <Button onClick={handleSave} disabled={saving}>
-              {saving ? 'Saving...' : editingId ? 'Update Price' : 'Set Price'}
+            <Button onClick={handleSave} loading={saving}>
+              {editingId ? 'Update Price' : 'Set Price'}
             </Button>
           </>
         }
@@ -379,6 +382,7 @@ export default function CustomerPricingPage() {
               value={formItemId}
               onChange={(e) => setFormItemId(e.target.value)}
               disabled={!!editingId}
+              autoFocus={!editingId}
             >
               <option value="">-- select an item --</option>
               {itemsForModal.map((i) => (
@@ -427,33 +431,22 @@ export default function CustomerPricingPage() {
       </Modal>
 
       {/* ---- Delete confirm modal ---- */}
-      <Modal
+      <ConfirmDialog
         open={!!deleteTarget}
-        onClose={() => setDeleteTarget(null)}
         title="Remove Custom Price"
-        footer={
+        message={
           <>
-            <Button
-              variant="secondary"
-              onClick={() => setDeleteTarget(null)}
-              disabled={deleting}
-            >
-              Cancel
-            </Button>
-            <Button variant="danger" onClick={handleDelete} disabled={deleting}>
-              {deleting ? 'Removing...' : 'Remove'}
-            </Button>
+            Remove the custom price for{' '}
+            <strong className="text-navy">{deleteTarget?.itemName}</strong>? The default item
+            sales price will be used instead.
           </>
         }
-      >
-        <p className="text-navy/70 text-sm">
-          Remove the custom price for{' '}
-          <strong className="text-navy">{deleteTarget?.itemName}</strong>? The default item
-          sales price will be used instead.
-        </p>
-      </Modal>
-
-      <Toaster />
+        confirmLabel="Remove"
+        tone="danger"
+        loading={deleting}
+        onConfirm={handleDelete}
+        onClose={() => setDeleteTarget(null)}
+      />
     </main>
   );
 }

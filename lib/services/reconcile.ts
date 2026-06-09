@@ -12,7 +12,7 @@
  * matching / confirmation step.  The GL lines being reconciled were already
  * posted by other services (invoices, expenses, transfers, etc.).
  */
-import { and, desc, eq, isNull, lte, ne } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, lt, lte, ne } from 'drizzle-orm';
 import {
   accounts,
   bankAccounts,
@@ -30,6 +30,8 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { postJournalEntry } from './posting';
+import { payCreditCard } from './liabilityPayments';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -94,11 +96,33 @@ async function loadReconciliation(ctx: ServiceContext, reconciliationId: string)
   return row;
 }
 
-/** Compute the sum of cleared line amounts (natural balance direction for an asset account). */
+/** Compute the sum of cleared line amounts (natural balance direction for the bank account's GL type). */
 async function computeClearedBalance(
   ctx: ServiceContext,
   reconciliationId: string,
 ): Promise<ReturnType<typeof Money.zero>> {
+  // Seed with the opening (prior-reconciled) balance. The bank-reconciliation identity is
+  //   openingBalance + clearedMovementsThisPeriod = statementEndingBalance,
+  // so the cleared total must include the carried-forward balance, not just this period's
+  // movements. lastReconciledBalance is null/absent for a first reconciliation (opening 0).
+  // The join to accounts pulls the GL type so liability (credit-card) accounts can be
+  // accumulated on their natural side (credit − debit) instead of the asset side.
+  let cleared = Money.zero();
+  let glType: string | null = null;
+  const [recon] = await ctx.db
+    .select({
+      opening: bankAccounts.lastReconciledBalance,
+      glType: accounts.type,
+    })
+    .from(reconciliations)
+    .innerJoin(bankAccounts, eq(reconciliations.bankAccountId, bankAccounts.id))
+    .innerJoin(accounts, eq(bankAccounts.accountId, accounts.id))
+    .where(eq(reconciliations.id, reconciliationId));
+  if (recon) {
+    glType = recon.glType;
+    if (recon.opening != null) cleared = Money.of(recon.opening);
+  }
+
   // Pull every cleared item for this reconciliation.
   const items = await ctx.db
     .select({
@@ -117,12 +141,16 @@ async function computeClearedBalance(
       ),
     );
 
-  // For a bank (asset) account the natural-side amount is debit − credit.
-  let cleared = Money.zero();
+  // For a bank (asset) account the natural-side amount is debit − credit; for a
+  // liability account (credit card) charges are CREDITS, so the natural side is
+  // credit − debit. Both keep the cleared total in positive statement terms
+  // (positive = balance held / amount owed), matching how users type the
+  // statement ending balance.
+  const isLiability = glType === 'liability';
   for (const item of items) {
     const d = Money.of(item.debit);
     const c = Money.of(item.credit);
-    cleared = cleared.plus(d).minus(c);
+    cleared = isLiability ? cleared.plus(c).minus(d) : cleared.plus(d).minus(c);
   }
   return cleared;
 }
@@ -313,6 +341,9 @@ export async function listClearable(
       )
       .where(
         and(
+          // Scope to the lines under consideration — without this the query is an
+          // unbounded cross-company scan of every cleared item ever recorded.
+          inArray(reconciliationItems.journalEntryLineId, lineIds),
           eq(reconciliations.status, 'completed'),
           eq(reconciliationItems.isCleared, true),
         ),
@@ -419,6 +450,96 @@ export async function getProgress(
 }
 
 /**
+ * Cancel (abandon) an in-progress reconciliation session.
+ *
+ * Hard-deletes the session's reconciliation_items and the reconciliations row
+ * itself, so the cleared toggles from this session are discarded and the bank
+ * account can start a fresh session. Only in_progress sessions can be cancelled —
+ * completed reconciliations are permanent.
+ */
+export async function cancelReconciliation(
+  ctx: ServiceContext,
+  reconciliationId: string,
+): Promise<void> {
+  const recon = await loadReconciliation(ctx, reconciliationId);
+  if (recon.status !== 'in_progress') {
+    throw validation(`Only an in-progress reconciliation can be cancelled (status: ${recon.status}).`);
+  }
+
+  await inTransaction(ctx, async (tx) => {
+    await tx.db
+      .delete(reconciliationItems)
+      .where(eq(reconciliationItems.reconciliationId, reconciliationId));
+    await tx.db.delete(reconciliations).where(eq(reconciliations.id, reconciliationId));
+
+    await writeAudit(tx, {
+      action: 'delete',
+      entityType: 'reconciliation',
+      entityId: reconciliationId,
+      oldValues: {
+        status: 'in_progress',
+        bankAccountId: recon.bankAccountId,
+        statementDate: recon.statementDate,
+        statementBalance: recon.statementBalance,
+      },
+      newValues: { cancelled: true },
+    });
+  });
+}
+
+export interface UpdateStatementInput {
+  statementBalance?: string | number;
+  statementDate?: Date;
+}
+
+/**
+ * Correct the statement balance and/or statement date of an in-progress
+ * reconciliation (e.g. the user mistyped the ending balance when starting).
+ */
+export async function updateStatement(
+  ctx: ServiceContext,
+  reconciliationId: string,
+  input: UpdateStatementInput,
+): Promise<typeof reconciliations.$inferSelect> {
+  const recon = await loadReconciliation(ctx, reconciliationId);
+  if (recon.status !== 'in_progress') {
+    throw validation('Cannot modify a reconciliation that is not in_progress.');
+  }
+  if (input.statementBalance == null && !input.statementDate) {
+    throw validation('Provide statementBalance and/or statementDate to update.');
+  }
+
+  return inTransaction(ctx, async (tx) => {
+    const [updated] = await tx.db
+      .update(reconciliations)
+      .set({
+        ...(input.statementBalance != null
+          ? { statementBalance: toAmountString(input.statementBalance) }
+          : {}),
+        ...(input.statementDate ? { statementDate: input.statementDate } : {}),
+      })
+      .where(eq(reconciliations.id, reconciliationId))
+      .returning();
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'reconciliation',
+      entityId: reconciliationId,
+      oldValues: {
+        statementBalance: recon.statementBalance,
+        statementDate: recon.statementDate,
+      },
+      newValues: {
+        statementBalance: updated.statementBalance,
+        statementDate: updated.statementDate,
+      },
+    });
+
+    return updated;
+  });
+}
+
+/**
  * Finalize the reconciliation.
  *
  * Requirements:
@@ -492,5 +613,611 @@ export async function completeReconciliation(
     });
 
     return updated;
+  });
+}
+
+// ===========================================================================
+// Reconciliation completion features:
+//   - getReconcileInfo        — beginning balance + discrepancy detection
+//   - addStatementAdjustments — service charge / interest earned (auto-cleared)
+//   - undoLastReconciliation  — revert the most recent completed session
+//   - getReconciliationReport — summary + detail + per-session discrepancies
+//   - reconciliationDiscrepancies — company-wide voided-after-reconcile report
+//   - payCreditCardBalance    — pay a credit card after reconciling it
+// ===========================================================================
+
+/** Natural-side amount of a GL line in statement terms (asset: Dr−Cr, liability: Cr−Dr). */
+function naturalAmount(
+  glType: string | null,
+  debit: string | null,
+  credit: string | null,
+) {
+  const d = Money.of(debit);
+  const c = Money.of(credit);
+  return glType === 'liability' ? c.minus(d) : d.minus(c);
+}
+
+export interface ReconcileInfo {
+  bankAccountId: string;
+  bankName: string;
+  accountNumber: string;
+  glAccountId: string;
+  glAccountName: string;
+  glAccountCode: string;
+  glType: string;
+  /** True when the linked GL account is a liability (credit card) account. */
+  isCreditCard: boolean;
+  lastReconciledDate: Date | null;
+  /** Carried-forward beginning balance (last statement balance; "0.00" when never reconciled). */
+  beginningBalance: string;
+  /** Beginning balance recomputed from still-posted cleared items of completed sessions. */
+  recomputedBalance: string;
+  /** beginningBalance − recomputedBalance. Non-zero ⇒ a reconciled transaction was voided/changed. */
+  discrepancy: string;
+}
+
+/**
+ * Begin-Reconciliation info for a bank account: the carried-forward beginning
+ * balance, the last reconciled date, and a beginning-balance discrepancy check
+ * (the QB "Locate Discrepancies" detection). The discrepancy compares the
+ * stamped lastReconciledBalance against the sum of cleared items from completed
+ * sessions whose journal entries are still posted — if a reconciled transaction
+ * was voided (historically, before posting.ts gained its guard), they differ.
+ */
+export async function getReconcileInfo(
+  ctx: ServiceContext,
+  bankAccountId: string,
+): Promise<ReconcileInfo> {
+  const [ba] = await ctx.db
+    .select({
+      id: bankAccounts.id,
+      bankName: bankAccounts.bankName,
+      accountNumber: bankAccounts.accountNumber,
+      lastReconciledDate: bankAccounts.lastReconciledDate,
+      lastReconciledBalance: bankAccounts.lastReconciledBalance,
+      glAccountId: bankAccounts.accountId,
+      glAccountName: accounts.name,
+      glAccountCode: accounts.code,
+      glType: accounts.type,
+    })
+    .from(bankAccounts)
+    .innerJoin(accounts, eq(bankAccounts.accountId, accounts.id))
+    .where(
+      and(eq(bankAccounts.id, bankAccountId), eq(bankAccounts.companyId, ctx.companyId)),
+    );
+  if (!ba) throw notFound('Bank account');
+
+  // Recompute the cleared balance from completed sessions, counting only lines
+  // whose journal entry is still 'posted' (voided lines drop out — that is the
+  // discrepancy we are detecting).
+  const rows = await ctx.db
+    .select({
+      debit: journalEntryLines.debit,
+      credit: journalEntryLines.credit,
+      jeStatus: journalEntries.status,
+    })
+    .from(reconciliationItems)
+    .innerJoin(reconciliations, eq(reconciliationItems.reconciliationId, reconciliations.id))
+    .innerJoin(journalEntryLines, eq(reconciliationItems.journalEntryLineId, journalEntryLines.id))
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(reconciliations.bankAccountId, bankAccountId),
+        eq(reconciliations.status, 'completed'),
+        eq(reconciliationItems.isCleared, true),
+      ),
+    );
+
+  let recomputed = Money.zero();
+  for (const r of rows) {
+    if (r.jeStatus !== 'posted') continue;
+    recomputed = recomputed.plus(naturalAmount(ba.glType, r.debit, r.credit));
+  }
+
+  const beginning = Money.of(ba.lastReconciledBalance ?? 0);
+
+  return {
+    bankAccountId: ba.id,
+    bankName: ba.bankName,
+    accountNumber: ba.accountNumber,
+    glAccountId: ba.glAccountId,
+    glAccountName: ba.glAccountName,
+    glAccountCode: ba.glAccountCode,
+    glType: ba.glType,
+    isCreditCard: ba.glType === 'liability',
+    lastReconciledDate: ba.lastReconciledDate,
+    beginningBalance: toAmountString(beginning),
+    recomputedBalance: toAmountString(recomputed),
+    discrepancy: toAmountString(beginning.minus(recomputed)),
+  };
+}
+
+export interface StatementAdjustmentsInput {
+  /** Bank fee on the statement: Dr expense / Cr bank, dated the statement date. */
+  serviceCharge?: { amount: string | number; accountId: string } | null;
+  /** Interest the bank paid: Dr bank / Cr income, dated the statement date. */
+  interestEarned?: { amount: string | number; accountId: string } | null;
+}
+
+/** Insert an auto-cleared reconciliation item for the bank-side line of a new entry. */
+async function autoClearBankLine(
+  ctx: ServiceContext,
+  reconciliationId: string,
+  journalEntryId: string,
+  glAccountId: string,
+): Promise<void> {
+  const [line] = await ctx.db
+    .select({ id: journalEntryLines.id })
+    .from(journalEntryLines)
+    .where(
+      and(
+        eq(journalEntryLines.journalEntryId, journalEntryId),
+        eq(journalEntryLines.accountId, glAccountId),
+      ),
+    );
+  if (!line) throw notFound('Bank journal entry line');
+  await ctx.db.insert(reconciliationItems).values({
+    reconciliationId,
+    journalEntryLineId: line.id,
+    isCleared: true,
+    clearedDate: new Date(),
+  });
+}
+
+/**
+ * Record statement-only adjustments (bank service charge and/or interest earned)
+ * during an in-progress reconciliation. Each adjustment posts a journal entry
+ * dated the statement date (sourceRef "reconciliation:<id>") and its bank-side
+ * line is automatically cleared into the current session, so the reconciliation
+ * still balances against the statement.
+ *
+ * Sign note: the same posting works for credit-card (liability) accounts — a
+ * finance charge credits the CC account, increasing the amount owed, which is
+ * how it appears on the card statement.
+ */
+export async function addStatementAdjustments(
+  ctx: ServiceContext,
+  reconciliationId: string,
+  input: StatementAdjustmentsInput,
+): Promise<ReconciliationProgress> {
+  const recon = await loadReconciliation(ctx, reconciliationId);
+  if (recon.status !== 'in_progress') {
+    throw validation('Adjustments can only be added to an in-progress reconciliation.');
+  }
+  if (!input.serviceCharge && !input.interestEarned) {
+    throw validation('Provide a service charge and/or interest earned amount.');
+  }
+
+  if (input.serviceCharge) {
+    const amt = Money.of(input.serviceCharge.amount);
+    if (!amt.greaterThan(0)) throw validation('Service charge amount must be greater than zero.');
+    if (!input.serviceCharge.accountId) {
+      throw validation('serviceCharge.accountId (expense account) is required.');
+    }
+    const amtStr = toAmountString(amt);
+    const entry = await postJournalEntry(ctx, {
+      date: recon.statementDate,
+      description: 'Bank service charge',
+      sourceRef: `reconciliation:${reconciliationId}`,
+      lines: [
+        { accountId: input.serviceCharge.accountId, debit: amtStr },
+        { accountId: recon.glAccountId, credit: amtStr },
+      ],
+    });
+    await autoClearBankLine(ctx, reconciliationId, entry.id, recon.glAccountId);
+  }
+
+  if (input.interestEarned) {
+    const amt = Money.of(input.interestEarned.amount);
+    if (!amt.greaterThan(0)) throw validation('Interest earned amount must be greater than zero.');
+    if (!input.interestEarned.accountId) {
+      throw validation('interestEarned.accountId (income account) is required.');
+    }
+    const amtStr = toAmountString(amt);
+    const entry = await postJournalEntry(ctx, {
+      date: recon.statementDate,
+      description: 'Interest earned',
+      sourceRef: `reconciliation:${reconciliationId}`,
+      lines: [
+        { accountId: recon.glAccountId, debit: amtStr },
+        { accountId: input.interestEarned.accountId, credit: amtStr },
+      ],
+    });
+    await autoClearBankLine(ctx, reconciliationId, entry.id, recon.glAccountId);
+  }
+
+  return getProgress(ctx, reconciliationId);
+}
+
+/**
+ * Undo the most recent COMPLETED reconciliation for a bank account
+ * (QB Banking ▸ Reconcile ▸ Undo Last Reconciliation).
+ *
+ * - The session row is kept with status 'undone' (audit record; its items stay
+ *   attached so the past-reconciliation report remains readable). Every query
+ *   that treats items as "permanently cleared" filters on status = 'completed',
+ *   so the lines become clearable again immediately.
+ * - bankAccounts.lastReconciledDate/Balance roll back to the previous completed
+ *   session's statement values, or null when there is none.
+ *
+ * Throws CONFLICT when an in-progress session exists (cancel it first) and
+ * NOT_FOUND when the account has no completed reconciliation to undo.
+ */
+export async function undoLastReconciliation(
+  ctx: ServiceContext,
+  bankAccountId: string,
+): Promise<typeof reconciliations.$inferSelect> {
+  const [ba] = await ctx.db
+    .select({ id: bankAccounts.id })
+    .from(bankAccounts)
+    .where(
+      and(eq(bankAccounts.id, bankAccountId), eq(bankAccounts.companyId, ctx.companyId)),
+    );
+  if (!ba) throw notFound('Bank account');
+
+  const [inProgress] = await ctx.db
+    .select({ id: reconciliations.id })
+    .from(reconciliations)
+    .where(
+      and(
+        eq(reconciliations.bankAccountId, bankAccountId),
+        eq(reconciliations.status, 'in_progress'),
+      ),
+    );
+  if (inProgress) {
+    throw new ServiceError(
+      'CONFLICT',
+      'Cancel the in-progress reconciliation before undoing the last completed one.',
+    );
+  }
+
+  const completed = await ctx.db
+    .select()
+    .from(reconciliations)
+    .where(
+      and(
+        eq(reconciliations.bankAccountId, bankAccountId),
+        eq(reconciliations.status, 'completed'),
+      ),
+    )
+    .orderBy(desc(reconciliations.completedAt))
+    .limit(2);
+  if (completed.length === 0) {
+    throw notFound('Completed reconciliation');
+  }
+  const [latest, previous] = completed;
+
+  return inTransaction(ctx, async (tx) => {
+    const now = new Date();
+
+    const [undone] = await tx.db
+      .update(reconciliations)
+      .set({ status: 'undone' })
+      .where(eq(reconciliations.id, latest.id))
+      .returning();
+
+    await tx.db
+      .update(bankAccounts)
+      .set({
+        lastReconciledDate: previous?.statementDate ?? null,
+        lastReconciledBalance: previous?.statementBalance ?? null,
+        updatedAt: now,
+      })
+      .where(eq(bankAccounts.id, bankAccountId));
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'reconciliation',
+      entityId: latest.id,
+      oldValues: {
+        status: 'completed',
+        statementDate: latest.statementDate,
+        statementBalance: latest.statementBalance,
+        reconciledBalance: latest.reconciledBalance,
+      },
+      newValues: {
+        status: 'undone',
+        restoredLastReconciledDate: previous?.statementDate ?? null,
+        restoredLastReconciledBalance: previous?.statementBalance ?? null,
+      },
+    });
+
+    return undone;
+  });
+}
+
+export interface ReconciliationReportLine {
+  lineId: string;
+  journalEntryId: string;
+  entryNumber: number;
+  date: Date;
+  description: string;
+  memo: string | null;
+  debit: string | null;
+  credit: string | null;
+  /** Natural-side signed amount in statement terms (positive = increases the statement balance). */
+  amount: string;
+  /** True when the journal entry was voided AFTER being cleared — a discrepancy. */
+  isVoided: boolean;
+}
+
+export interface ReconciliationReport {
+  id: string;
+  bankAccountId: string;
+  bankName: string;
+  accountNumber: string;
+  glAccountName: string;
+  glAccountCode: string;
+  glType: string;
+  status: string;
+  statementDate: Date;
+  statementBalance: string;
+  reconciledBalance: string | null;
+  createdAt: Date;
+  completedAt: Date | null;
+  /** Statement balance of the previous completed session ("0.00" for the first). */
+  beginningBalance: string;
+  /** Net cleared movement this session (sum of natural-side amounts). */
+  clearedTotal: string;
+  /** beginningBalance + clearedTotal. */
+  clearedBalance: string;
+  /** statementBalance − clearedBalance. */
+  difference: string;
+  /** Money-in lines (deposits/credits for a bank; charges for a credit card). */
+  depositsCount: number;
+  depositsTotal: string;
+  /** Money-out lines (checks/payments for a bank; payments/credits for a credit card). */
+  paymentsCount: number;
+  paymentsTotal: string;
+  lines: ReconciliationReportLine[];
+  /** Cleared lines whose journal entry is now void (reconciliation discrepancies). */
+  discrepancies: ReconciliationReportLine[];
+}
+
+/**
+ * Full report for one reconciliation session: summary numbers + the cleared
+ * transaction detail + discrepancies (cleared lines whose journal entry has
+ * since been voided). Works for completed, undone, and in-progress sessions.
+ */
+export async function getReconciliationReport(
+  ctx: ServiceContext,
+  reconciliationId: string,
+): Promise<ReconciliationReport> {
+  const recon = await loadReconciliation(ctx, reconciliationId);
+
+  const [meta] = await ctx.db
+    .select({
+      bankName: bankAccounts.bankName,
+      accountNumber: bankAccounts.accountNumber,
+      glAccountName: accounts.name,
+      glAccountCode: accounts.code,
+      glType: accounts.type,
+    })
+    .from(bankAccounts)
+    .innerJoin(accounts, eq(bankAccounts.accountId, accounts.id))
+    .where(eq(bankAccounts.id, recon.bankAccountId));
+  if (!meta) throw notFound('Bank account');
+
+  // Beginning balance = statement balance of the previous completed session
+  // (the session completed immediately before this one).
+  const anchor = recon.completedAt ?? new Date();
+  const [prev] = await ctx.db
+    .select({ statementBalance: reconciliations.statementBalance })
+    .from(reconciliations)
+    .where(
+      and(
+        eq(reconciliations.bankAccountId, recon.bankAccountId),
+        eq(reconciliations.status, 'completed'),
+        ne(reconciliations.id, recon.id),
+        lt(reconciliations.completedAt, anchor),
+      ),
+    )
+    .orderBy(desc(reconciliations.completedAt))
+    .limit(1);
+  const beginning = Money.of(prev?.statementBalance ?? 0);
+
+  // Cleared lines for this session.
+  const rows = await ctx.db
+    .select({
+      lineId: journalEntryLines.id,
+      journalEntryId: journalEntryLines.journalEntryId,
+      entryNumber: journalEntries.entryNumber,
+      date: journalEntries.date,
+      description: journalEntries.description,
+      memo: journalEntryLines.memo,
+      debit: journalEntryLines.debit,
+      credit: journalEntryLines.credit,
+      jeStatus: journalEntries.status,
+    })
+    .from(reconciliationItems)
+    .innerJoin(journalEntryLines, eq(reconciliationItems.journalEntryLineId, journalEntryLines.id))
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(reconciliationItems.reconciliationId, reconciliationId),
+        eq(reconciliationItems.isCleared, true),
+      ),
+    );
+
+  rows.sort((a, b) => a.date.getTime() - b.date.getTime() || a.entryNumber - b.entryNumber);
+
+  let clearedTotal = Money.zero();
+  let depositsTotal = Money.zero();
+  let paymentsTotal = Money.zero();
+  let depositsCount = 0;
+  let paymentsCount = 0;
+
+  const lines: ReconciliationReportLine[] = rows.map((r) => {
+    const amount = naturalAmount(meta.glType, r.debit, r.credit);
+    clearedTotal = clearedTotal.plus(amount);
+    if (amount.greaterThanOrEqualTo(0)) {
+      depositsCount += 1;
+      depositsTotal = depositsTotal.plus(amount);
+    } else {
+      paymentsCount += 1;
+      paymentsTotal = paymentsTotal.plus(amount.abs());
+    }
+    return {
+      lineId: r.lineId,
+      journalEntryId: r.journalEntryId,
+      entryNumber: r.entryNumber,
+      date: r.date,
+      description: r.description,
+      memo: r.memo,
+      debit: r.debit,
+      credit: r.credit,
+      amount: toAmountString(amount),
+      isVoided: r.jeStatus === 'void',
+    };
+  });
+
+  const clearedBalance = beginning.plus(clearedTotal);
+  const statementBalance = Money.of(recon.statementBalance);
+
+  return {
+    id: recon.id,
+    bankAccountId: recon.bankAccountId,
+    bankName: meta.bankName,
+    accountNumber: meta.accountNumber,
+    glAccountName: meta.glAccountName,
+    glAccountCode: meta.glAccountCode,
+    glType: meta.glType,
+    status: recon.status,
+    statementDate: recon.statementDate,
+    statementBalance: toAmountString(statementBalance),
+    reconciledBalance: recon.reconciledBalance,
+    createdAt: recon.createdAt,
+    completedAt: recon.completedAt,
+    beginningBalance: toAmountString(beginning),
+    clearedTotal: toAmountString(clearedTotal),
+    clearedBalance: toAmountString(clearedBalance),
+    difference: toAmountString(statementBalance.minus(clearedBalance)),
+    depositsCount,
+    depositsTotal: toAmountString(depositsTotal),
+    paymentsCount,
+    paymentsTotal: toAmountString(paymentsTotal),
+    lines,
+    discrepancies: lines.filter((l) => l.isVoided),
+  };
+}
+
+export interface DiscrepancyRow {
+  reconciliationId: string;
+  statementDate: Date;
+  bankAccountId: string;
+  bankName: string;
+  accountNumber: string;
+  journalEntryId: string;
+  entryNumber: number;
+  date: Date;
+  description: string;
+  debit: string | null;
+  credit: string | null;
+  /** Natural-side signed amount that the void removed from the reconciled balance. */
+  amount: string;
+  voidedAt: Date | null;
+}
+
+/**
+ * Reconciliation Discrepancy report: every line that was cleared in a COMPLETED
+ * reconciliation but whose journal entry is now void (i.e. it was voided after
+ * being reconciled — possible historically, before posting.ts gained its guard).
+ * Optionally filtered to one bank account.
+ */
+export async function reconciliationDiscrepancies(
+  ctx: ServiceContext,
+  bankAccountId?: string,
+): Promise<DiscrepancyRow[]> {
+  const conditions = [
+    eq(bankAccounts.companyId, ctx.companyId),
+    eq(reconciliations.status, 'completed'),
+    eq(reconciliationItems.isCleared, true),
+    eq(journalEntries.status, 'void'),
+  ];
+  if (bankAccountId) conditions.push(eq(reconciliations.bankAccountId, bankAccountId));
+
+  const rows = await ctx.db
+    .select({
+      reconciliationId: reconciliations.id,
+      statementDate: reconciliations.statementDate,
+      bankAccountId: bankAccounts.id,
+      bankName: bankAccounts.bankName,
+      accountNumber: bankAccounts.accountNumber,
+      glType: accounts.type,
+      journalEntryId: journalEntries.id,
+      entryNumber: journalEntries.entryNumber,
+      date: journalEntries.date,
+      description: journalEntries.description,
+      debit: journalEntryLines.debit,
+      credit: journalEntryLines.credit,
+      voidedAt: journalEntries.voidedAt,
+    })
+    .from(reconciliationItems)
+    .innerJoin(reconciliations, eq(reconciliationItems.reconciliationId, reconciliations.id))
+    .innerJoin(bankAccounts, eq(reconciliations.bankAccountId, bankAccounts.id))
+    .innerJoin(accounts, eq(bankAccounts.accountId, accounts.id))
+    .innerJoin(journalEntryLines, eq(reconciliationItems.journalEntryLineId, journalEntryLines.id))
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(and(...conditions))
+    .orderBy(desc(reconciliations.statementDate));
+
+  return rows.map((r) => ({
+    reconciliationId: r.reconciliationId,
+    statementDate: r.statementDate,
+    bankAccountId: r.bankAccountId,
+    bankName: r.bankName,
+    accountNumber: r.accountNumber,
+    journalEntryId: r.journalEntryId,
+    entryNumber: r.entryNumber,
+    date: r.date,
+    description: r.description,
+    debit: r.debit,
+    credit: r.credit,
+    amount: toAmountString(naturalAmount(r.glType, r.debit, r.credit)),
+    voidedAt: r.voidedAt,
+  }));
+}
+
+export interface PayCreditCardBalanceInput {
+  /** GL account (bank/checking asset) the payment is drawn from. */
+  paymentAccountId: string;
+  /** Defaults to the reconciliation's statement (ending) balance. */
+  amount?: string | number;
+  /** Defaults to today. */
+  date?: Date;
+  memo?: string | null;
+}
+
+/**
+ * QB "Write a check for the balance" step after completing a credit-card
+ * reconciliation: posts Dr CC liability / Cr bank for the statement balance via
+ * payCreditCard (sourceRef "cc-payment:<reconciliationId>", duplicate-guarded).
+ */
+export async function payCreditCardBalance(
+  ctx: ServiceContext,
+  reconciliationId: string,
+  input: PayCreditCardBalanceInput,
+) {
+  const recon = await loadReconciliation(ctx, reconciliationId);
+  if (recon.status !== 'completed') {
+    throw validation('Pay Credit Card is only available after the reconciliation is completed.');
+  }
+
+  const [gl] = await ctx.db
+    .select({ type: accounts.type, name: accounts.name })
+    .from(accounts)
+    .where(and(eq(accounts.id, recon.glAccountId), eq(accounts.companyId, ctx.companyId)));
+  if (!gl) throw notFound('Credit card GL account');
+  if (gl.type !== 'liability') {
+    throw validation('This reconciliation is not for a credit card (liability) account.');
+  }
+
+  return payCreditCard(ctx, {
+    creditCardAccountId: recon.glAccountId,
+    paymentAccountId: input.paymentAccountId,
+    amount: input.amount ?? recon.statementBalance,
+    date: input.date ?? new Date(),
+    reconciliationId,
+    memo: input.memo ?? `Credit card payment — ${gl.name}`,
   });
 }

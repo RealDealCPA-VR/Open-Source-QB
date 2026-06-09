@@ -6,6 +6,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { and, eq, ilike, or, sql } from 'drizzle-orm';
 import { getServerContext } from '@/lib/context';
 import { customers, vendors, items, invoices } from '@/lib/db/schema';
+import { buildResults } from './results';
 
 export async function GET(req: NextRequest) {
   const q = (new URL(req.url).searchParams.get('q') ?? '').trim();
@@ -37,11 +38,5 @@ export async function GET(req: NextRequest) {
       .limit(limit),
   ]);
 
-  const results = [
-    ...cust.map((c) => ({ type: 'Customer', label: c.label, href: '/customers' })),
-    ...vend.map((v) => ({ type: 'Vendor', label: v.label, href: '/vendors' })),
-    ...itm.map((i) => ({ type: 'Item', label: i.label, href: '/items' })),
-    ...inv.map((i) => ({ type: 'Invoice', label: `Invoice #${i.num}`, href: '/invoices' })),
-  ];
-  return NextResponse.json({ results });
+  return NextResponse.json({ results: buildResults({ cust, vend, itm, inv }) });
 }

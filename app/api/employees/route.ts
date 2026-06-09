@@ -24,13 +24,23 @@ function errorResponse(err: unknown) {
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
 }
 
+/** Never send the full SSN to the browser — mask to the last 4 digits. */
+function maskEmployee<T extends { ssn?: string | null }>(emp: T) {
+  const digits = (emp.ssn ?? '').replace(/\D/g, '');
+  return {
+    ...emp,
+    ssn: undefined,
+    ssnLast4: digits.length >= 4 ? digits.slice(-4) : null,
+  };
+}
+
 export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const { searchParams } = req.nextUrl;
     const includeInactive = searchParams.get('includeInactive') === 'true';
     const list = await listEmployees(ctx, { includeInactive });
-    return NextResponse.json(list);
+    return NextResponse.json(list.map(maskEmployee));
   } catch (err) {
     return errorResponse(err);
   }

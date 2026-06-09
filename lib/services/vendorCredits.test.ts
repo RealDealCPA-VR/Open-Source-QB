@@ -158,7 +158,9 @@ describe('vendorCredits service', () => {
     expect(result.credit.unapplied).toBe('100.00');
     expect(result.credit.status).toBe('partial');
 
-    expect(result.bill.amountPaid).toBe('200.00');
+    // Credits are tracked in amountCredited — NOT conflated with cash amountPaid.
+    expect(result.bill.amountCredited).toBe('200.00');
+    expect(result.bill.amountPaid).toBe('0.00');
     expect(result.bill.balanceDue).toBe('300.00');
     expect(result.bill.status).toBe('partial');
 

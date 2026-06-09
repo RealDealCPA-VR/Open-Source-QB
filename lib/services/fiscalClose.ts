@@ -16,14 +16,53 @@
  *     totalDebits(revenue zeroing) + 3900 debit = totalCredits(expense zeroing)  [loss]
  */
 import { and, eq, gte, lt, sql } from 'drizzle-orm';
-import { accounts, journalEntries, journalEntryLines } from '@/lib/db/schema';
+import { accounts, companies, journalEntries, journalEntryLines } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError } from './_base';
 import { type PostingLine, postJournalEntry } from './posting';
 
 export interface YearEndCloseInput {
-  /** Four-digit fiscal year, e.g. 2024. Entries from Jan 1 through Dec 31 are included. */
+  /**
+   * Four-digit fiscal year, e.g. 2024 — interpreted as the year in which the fiscal
+   * year ENDS (per the company's settings.fiscalYearEnd, default 12-31). For a
+   * calendar-year company this is Jan 1 through Dec 31 of that year; for a June 30
+   * year end, fiscalYear 2026 covers 2025-07-01 through 2026-06-30.
+   */
   fiscalYear: number;
+}
+
+/**
+ * Compute the UTC window [yearStart, yearEnd) and the closing-entry date for a
+ * fiscal year, honoring the company's configured fiscal year end ('MM-DD').
+ * `fiscalYear` is the year the fiscal year ends in. Defaults to 12-31 (calendar
+ * year). Feb-29 style edges are clamped to the month's last valid day.
+ */
+export function fiscalYearWindow(
+  fiscalYear: number,
+  fiscalYearEnd?: string | null,
+): { yearStart: Date; yearEnd: Date; closingDate: Date } {
+  let month = 12;
+  let day = 31;
+  const match = /^(\d{1,2})-(\d{1,2})$/.exec(fiscalYearEnd ?? '');
+  if (match) {
+    const m = Number(match[1]);
+    const d = Number(match[2]);
+    if (m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+      month = m;
+      day = d;
+    }
+  }
+  // Clamp the day to the month's last valid day for this year (e.g. Feb 29 -> 28).
+  const lastDay = new Date(Date.UTC(fiscalYear, month, 0)).getUTCDate();
+  const endDay = Math.min(day, lastDay);
+
+  const closingDate = new Date(Date.UTC(fiscalYear, month - 1, endDay, 23, 59, 59, 0));
+  // Exclusive upper bound: midnight after the fiscal year end (Date.UTC handles overflow).
+  const yearEnd = new Date(Date.UTC(fiscalYear, month - 1, endDay + 1));
+  const yearStart = new Date(
+    Date.UTC(yearEnd.getUTCFullYear() - 1, yearEnd.getUTCMonth(), yearEnd.getUTCDate()),
+  );
+  return { yearStart, yearEnd, closingDate };
 }
 
 export interface YearEndCloseResult {
@@ -52,8 +91,16 @@ export async function yearEndClose(
   input: YearEndCloseInput,
 ): Promise<YearEndCloseResult> {
   const { fiscalYear } = input;
-  const yearStart = new Date(`${fiscalYear}-01-01T00:00:00.000Z`);
-  const yearEnd = new Date(`${fiscalYear + 1}-01-01T00:00:00.000Z`); // exclusive upper bound
+
+  // Honor the company's configured fiscal year end (settings.fiscalYearEnd, 'MM-DD').
+  // Defaults to 12-31 (calendar year) when unset.
+  const [companyRow] = await ctx.db
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId))
+    .limit(1);
+  const fiscalYearEnd = companyRow?.settings?.fiscalYearEnd;
+  const { yearStart, yearEnd, closingDate } = fiscalYearWindow(fiscalYear, fiscalYearEnd);
 
   // 1. Aggregate posted P&L activity for the year, per account.
   const plRows = await ctx.db
@@ -198,7 +245,8 @@ export async function yearEndClose(
   // verify this via assertBalanced.
 
   // 5. Post through the engine (enforces balance, period-open check, audit log).
-  const closingDate = new Date(`${fiscalYear}-12-31T23:59:59.000Z`);
+  //    Dated at the fiscal year end (from company settings), tagged with a
+  //    machine-readable sourceRef so P&L-type reports can exclude it.
   const entry = await postJournalEntry(ctx, {
     date: closingDate,
     description: `Year-End Closing Entry — Fiscal Year ${fiscalYear}`,

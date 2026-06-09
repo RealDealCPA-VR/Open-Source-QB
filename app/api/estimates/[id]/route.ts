@@ -1,7 +1,10 @@
 /**
  * GET   /api/estimates/:id           — fetch estimate with lines.
  * PATCH /api/estimates/:id           — update status (body: { status }).
- * POST  /api/estimates/:id           — action dispatch (body: { action: 'convert' }).
+ * POST  /api/estimates/:id           — action dispatch:
+ *          { action: 'convert' }                              — one-shot full conversion
+ *          { action: 'progress', percent }                    — bill % of remaining balance
+ *          { action: 'progress', lineAmounts: [{lineId,amount}] } — per-line progress billing
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -9,6 +12,7 @@ import {
   getEstimate,
   updateEstimateStatus,
   convertToInvoice,
+  createProgressInvoice,
   type EstimateStatus,
 } from '@/lib/services/estimates';
 import { ServiceError } from '@/lib/services/_base';
@@ -69,6 +73,26 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     if (action === 'convert') {
       const invoice = await convertToInvoice(ctx, id);
       return NextResponse.json(invoice, { status: 201 });
+    }
+
+    if (action === 'progress') {
+      if (body.percent == null && !Array.isArray(body.lineAmounts)) {
+        return NextResponse.json(
+          { error: 'Provide percent or lineAmounts for progress invoicing', code: 'VALIDATION' },
+          { status: 400 },
+        );
+      }
+      const result = await createProgressInvoice(ctx, id, {
+        percent: body.percent ?? null,
+        lineAmounts: Array.isArray(body.lineAmounts)
+          ? body.lineAmounts.map((la: Record<string, unknown>) => ({
+              lineId: la.lineId as string,
+              amount: la.amount as string | number,
+            }))
+          : null,
+        date: body.date ? new Date(body.date) : null,
+      });
+      return NextResponse.json(result, { status: 201 });
     }
 
     return NextResponse.json({ error: `Unknown action: "${action}"` }, { status: 400 });

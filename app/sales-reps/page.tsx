@@ -1,11 +1,14 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Users, Pencil, UserX, Plus, BarChart2, Link2 } from 'lucide-react';
+import { BadgePercent, Pencil, UserX, Plus, BarChart2, Link2 } from 'lucide-react';
 import {
   Button,
   Card,
+  ConfirmDialog,
+  EmptyState,
   Input,
+  Select,
   Label,
   Badge,
   Table,
@@ -14,8 +17,8 @@ import {
   Tr,
   Modal,
   PageHeader,
+  Spinner,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
@@ -82,6 +85,7 @@ function RepForm({
           value={form.name}
           onChange={(e) => onChange('name', e.target.value)}
           required
+          autoFocus
         />
       </div>
       <div>
@@ -338,7 +342,7 @@ export default function SalesRepsPage() {
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
       <PageHeader
         title="Sales Reps"
-        icon={Users}
+        icon={BadgePercent}
         action={
           <div className="flex items-center gap-3">
             <label className="flex items-center gap-2 text-sm text-navy/60 cursor-pointer select-none">
@@ -361,23 +365,31 @@ export default function SalesRepsPage() {
       {/* ---- Reps table ---- */}
       <Card className="mb-8">
         {loading ? (
-          <div className="p-12 text-center text-navy/40 text-sm">Loading sales reps...</div>
-        ) : reps.length === 0 ? (
-          <div className="p-12 text-center">
-            <Users className="mx-auto h-10 w-10 text-navy/20 mb-3" />
-            <p className="text-navy/50 text-sm">
-              {includeInactive
-                ? 'No sales reps found.'
-                : 'No active sales reps yet. Click "Add Rep" to get started.'}
-            </p>
+          <div className="flex items-center justify-center py-20 text-navy/40">
+            <Spinner className="h-6 w-6" />
           </div>
+        ) : reps.length === 0 ? (
+          <EmptyState
+            icon={BadgePercent}
+            title={includeInactive ? 'No sales reps found' : 'No sales reps yet'}
+            message={
+              includeInactive
+                ? 'There are no sales reps, active or inactive.'
+                : 'Add your first sales rep to get started.'
+            }
+            action={
+              <Button onClick={openAddModal}>
+                <Plus className="h-4 w-4" /> Add Rep
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
               <tr>
                 <Th>Name</Th>
                 <Th>Email</Th>
-                <Th className="text-right">Commission Rate</Th>
+                <Th numeric>Commission Rate</Th>
                 <Th>Status</Th>
                 <Th className="text-right">Actions</Th>
               </tr>
@@ -395,7 +407,7 @@ export default function SalesRepsPage() {
                       '-'
                     )}
                   </Td>
-                  <Td className="text-right font-mono text-navy">{fmtRate(r.commissionRate)}</Td>
+                  <Td numeric className="text-navy">{fmtRate(r.commissionRate)}</Td>
                   <Td>
                     {r.isActive ? (
                       <Badge tone="success">Active</Badge>
@@ -463,8 +475,8 @@ export default function SalesRepsPage() {
                 className="w-40"
               />
             </div>
-            <Button onClick={fetchReport} disabled={reportLoading}>
-              {reportLoading ? 'Loading...' : 'Run Report'}
+            <Button onClick={fetchReport} loading={reportLoading}>
+              Run Report
             </Button>
           </div>
 
@@ -480,22 +492,22 @@ export default function SalesRepsPage() {
                     <thead>
                       <tr>
                         <Th>Rep Name</Th>
-                        <Th className="text-right">Sales Total</Th>
-                        <Th className="text-right">Rate</Th>
-                        <Th className="text-right">Commission</Th>
+                        <Th numeric>Sales Total</Th>
+                        <Th numeric>Rate</Th>
+                        <Th numeric>Commission</Th>
                       </tr>
                     </thead>
                     <tbody>
                       {report.rows.map((row) => (
                         <Tr key={row.repId}>
                           <Td className="font-semibold text-navy">{row.name}</Td>
-                          <Td className="text-right font-mono text-navy">
+                          <Td numeric className="text-navy">
                             {formatCurrency(row.salesTotal)}
                           </Td>
-                          <Td className="text-right font-mono text-navy">
+                          <Td numeric className="text-navy">
                             {fmtRate(row.commissionRate)}
                           </Td>
-                          <Td className="text-right font-mono font-semibold text-emerald-700">
+                          <Td numeric className="font-semibold text-emerald">
                             {formatCurrency(row.commission)}
                           </Td>
                         </Tr>
@@ -504,11 +516,11 @@ export default function SalesRepsPage() {
                     <tfoot>
                       <tr className="border-t-2 border-navy/20">
                         <Td className="font-bold text-navy">Totals</Td>
-                        <Td className="text-right font-bold font-mono text-navy">
+                        <Td numeric className="font-bold text-navy">
                           {formatCurrency(report.totals.salesTotal)}
                         </Td>
                         <Td />
-                        <Td className="text-right font-bold font-mono text-emerald-700">
+                        <Td numeric className="font-bold text-emerald">
                           {formatCurrency(report.totals.commission)}
                         </Td>
                       </tr>
@@ -531,11 +543,10 @@ export default function SalesRepsPage() {
           <div className="flex flex-wrap items-end gap-4">
             <div className="flex-1 min-w-48">
               <Label htmlFor="assign-invoice">Invoice</Label>
-              <select
+              <Select
                 id="assign-invoice"
                 value={assignInvoiceId}
                 onChange={(e) => setAssignInvoiceId(e.target.value)}
-                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy bg-white outline-none focus:border-electric focus:ring-2 focus:ring-electric/30"
               >
                 <option value="">-- Select invoice --</option>
                 {invoices.map((inv) => (
@@ -544,15 +555,14 @@ export default function SalesRepsPage() {
                     {inv.status !== 'open' ? `(${inv.status})` : ''}
                   </option>
                 ))}
-              </select>
+              </Select>
             </div>
             <div className="flex-1 min-w-48">
               <Label htmlFor="assign-rep">Sales Rep</Label>
-              <select
+              <Select
                 id="assign-rep"
                 value={assignRepId}
                 onChange={(e) => setAssignRepId(e.target.value)}
-                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy bg-white outline-none focus:border-electric focus:ring-2 focus:ring-electric/30"
               >
                 <option value="">-- None (clear) --</option>
                 {reps
@@ -562,10 +572,10 @@ export default function SalesRepsPage() {
                       {r.name} ({fmtRate(r.commissionRate)})
                     </option>
                   ))}
-              </select>
+              </Select>
             </div>
-            <Button onClick={handleAssign} disabled={assigning || !assignInvoiceId}>
-              {assigning ? 'Saving...' : 'Assign'}
+            <Button onClick={handleAssign} loading={assigning} disabled={!assignInvoiceId}>
+              Assign
             </Button>
           </div>
           {assignInvoiceId && (
@@ -586,8 +596,8 @@ export default function SalesRepsPage() {
             <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addSaving}>
               Cancel
             </Button>
-            <Button onClick={handleAdd} disabled={addSaving}>
-              {addSaving ? 'Saving...' : 'Create Rep'}
+            <Button onClick={handleAdd} loading={addSaving}>
+              Create Rep
             </Button>
           </>
         }
@@ -609,8 +619,8 @@ export default function SalesRepsPage() {
             >
               Cancel
             </Button>
-            <Button onClick={handleEdit} disabled={editSaving}>
-              {editSaving ? 'Saving...' : 'Save Changes'}
+            <Button onClick={handleEdit} loading={editSaving}>
+              Save Changes
             </Button>
           </>
         }
@@ -619,33 +629,22 @@ export default function SalesRepsPage() {
       </Modal>
 
       {/* ---- Deactivate confirm modal ---- */}
-      <Modal
+      <ConfirmDialog
         open={!!deactivateTarget}
-        onClose={() => setDeactivateTarget(null)}
         title="Deactivate Sales Rep"
-        footer={
+        message={
           <>
-            <Button
-              variant="secondary"
-              onClick={() => setDeactivateTarget(null)}
-              disabled={deactivating}
-            >
-              Cancel
-            </Button>
-            <Button variant="danger" onClick={handleDeactivate} disabled={deactivating}>
-              {deactivating ? 'Deactivating...' : 'Yes, Deactivate'}
-            </Button>
+            Are you sure you want to deactivate{' '}
+            <strong className="text-navy">{deactivateTarget?.name}</strong>? They will no longer
+            appear in active rep lists, but historical invoice assignments are preserved.
           </>
         }
-      >
-        <p className="text-navy/70 text-sm">
-          Are you sure you want to deactivate{' '}
-          <strong className="text-navy">{deactivateTarget?.name}</strong>? They will no longer
-          appear in active rep lists, but historical invoice assignments are preserved.
-        </p>
-      </Modal>
-
-      <Toaster />
+        confirmLabel="Yes, Deactivate"
+        tone="danger"
+        loading={deactivating}
+        onConfirm={handleDeactivate}
+        onClose={() => setDeactivateTarget(null)}
+      />
     </main>
   );
 }

@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState } from 'react';
 import { Building2, Plus, Check } from 'lucide-react';
-import { Button, Card, Input, Modal, PageHeader, toast } from '@/components/ui';
+import { Button, Card, EmptyState, Input, Label, Modal, PageHeader, PageSkeleton, toast } from '@/components/ui';
 import { api } from '@/lib/client';
 
 interface Company {
@@ -69,7 +69,20 @@ export default function CompaniesPage() {
         }
       />
       {loading ? (
-        <p className="text-navy/40">Loading…</p>
+        <PageSkeleton rows={4} />
+      ) : companies.length === 0 ? (
+        <Card>
+          <EmptyState
+            icon={Building2}
+            title="No companies yet"
+            message="Create your first company file to get started."
+            action={
+              <Button onClick={() => setOpen(true)}>
+                <Plus className="h-4 w-4" /> New Company
+              </Button>
+            }
+          />
+        </Card>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           {companies.map((c) => (
@@ -100,15 +113,23 @@ export default function CompaniesPage() {
             <Button variant="ghost" onClick={() => setOpen(false)}>
               Cancel
             </Button>
-            <Button onClick={create} disabled={saving}>
+            <Button type="submit" form="new-company-form" loading={saving}>
               Create
             </Button>
           </>
         }
       >
-        <label className="block text-sm font-medium text-navy/70 mb-1">Company name</label>
-        <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Acme Inc." autoFocus />
-        <p className="mt-2 text-xs text-navy/40">A default Chart of Accounts will be created for you.</p>
+        <form
+          id="new-company-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            create();
+          }}
+        >
+          <Label htmlFor="company-name">Company name</Label>
+          <Input id="company-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="Acme Inc." autoFocus />
+          <p className="mt-2 text-xs text-navy/40">A default Chart of Accounts will be created for you.</p>
+        </form>
       </Modal>
     </main>
   );

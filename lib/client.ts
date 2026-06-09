@@ -2,12 +2,52 @@
  * Tiny typed fetch client for the React UI -> Next API routes.
  * All calls are same-origin (the app and API are served by the same Next server, in the browser
  * or inside the Electron renderer). Throws ApiError on non-2xx so callers can surface messages.
+ *
+ * Closing-date override (QB "Set Closing Date" parity): mutating calls accept an optional
+ * `opts.closingPassword`, sent as the `x-closing-password` header that lib/context.ts verifies.
+ * Pages can also register a window-level prompt (setClosingPasswordPrompt or
+ * window.__bkaClosingPasswordPrompt); when a mutation fails with code PERIOD_CLOSED the client
+ * invokes the prompt once and retries with the supplied password.
  */
 export class ApiError extends Error {
   constructor(public status: number, message: string, public code?: string) {
     super(message);
     this.name = 'ApiError';
   }
+}
+
+/** Header verified by getServerContext (lib/context.ts CLOSING_PASSWORD_HEADER). */
+export const CLOSING_PASSWORD_HEADER = 'x-closing-password';
+
+/** Options accepted by mutating calls (post/patch/del). */
+export interface MutateOpts {
+  /** Closing-date override password, sent as x-closing-password. */
+  closingPassword?: string;
+  /** Extra headers to merge into the request. */
+  headers?: Record<string, string>;
+}
+
+/**
+ * Returns a closing-date password (or null to cancel). May be async (e.g. open a modal).
+ * Transaction pages can adopt this by calling setClosingPasswordPrompt(...) on mount, or by
+ * assigning window.__bkaClosingPasswordPrompt.
+ */
+export type ClosingPasswordPrompt = () => string | null | Promise<string | null>;
+
+let closingPasswordPrompt: ClosingPasswordPrompt | null = null;
+
+/** Register (or clear, with null) the app-wide closing-date password prompt. */
+export function setClosingPasswordPrompt(prompt: ClosingPasswordPrompt | null): void {
+  closingPasswordPrompt = prompt;
+}
+
+function resolvePrompt(): ClosingPasswordPrompt | null {
+  if (closingPasswordPrompt) return closingPasswordPrompt;
+  if (typeof window !== 'undefined') {
+    const w = window as unknown as { __bkaClosingPasswordPrompt?: ClosingPasswordPrompt };
+    if (typeof w.__bkaClosingPasswordPrompt === 'function') return w.__bkaClosingPasswordPrompt;
+  }
+  return null;
 }
 
 async function handle<T>(res: Response): Promise<T> {
@@ -19,19 +59,56 @@ async function handle<T>(res: Response): Promise<T> {
   return data as T;
 }
 
+function mutateHeaders(opts?: MutateOpts, hasBody?: boolean): Record<string, string> {
+  const headers: Record<string, string> = { ...(opts?.headers || {}) };
+  if (hasBody) headers['content-type'] = 'application/json';
+  if (opts?.closingPassword !== undefined) headers[CLOSING_PASSWORD_HEADER] = opts.closingPassword;
+  return headers;
+}
+
+/**
+ * Run a mutating request; on PERIOD_CLOSED, ask the registered prompt for the closing-date
+ * password and retry exactly once. Explicitly supplied passwords are never re-prompted.
+ */
+async function mutate<T>(
+  method: 'POST' | 'PATCH' | 'DELETE',
+  url: string,
+  body: unknown,
+  opts?: MutateOpts,
+): Promise<T> {
+  const hasBody = body !== undefined;
+  const run = (o?: MutateOpts) =>
+    fetch(url, {
+      method,
+      headers: mutateHeaders(o, hasBody),
+      body: hasBody ? JSON.stringify(body) : undefined,
+    }).then((r) => handle<T>(r));
+
+  try {
+    return await run(opts);
+  } catch (err) {
+    if (
+      err instanceof ApiError &&
+      err.code === 'PERIOD_CLOSED' &&
+      opts?.closingPassword === undefined
+    ) {
+      const prompt = resolvePrompt();
+      if (prompt) {
+        const password = await prompt();
+        if (password !== null && password !== undefined) {
+          return run({ ...opts, closingPassword: password });
+        }
+      }
+    }
+    throw err;
+  }
+}
+
 export const api = {
   get: <T = unknown>(url: string) => fetch(url, { cache: 'no-store' }).then((r) => handle<T>(r)),
-  post: <T = unknown>(url: string, body?: unknown) =>
-    fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    }).then((r) => handle<T>(r)),
-  patch: <T = unknown>(url: string, body?: unknown) =>
-    fetch(url, {
-      method: 'PATCH',
-      headers: { 'content-type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    }).then((r) => handle<T>(r)),
-  del: <T = unknown>(url: string) => fetch(url, { method: 'DELETE' }).then((r) => handle<T>(r)),
+  post: <T = unknown>(url: string, body?: unknown, opts?: MutateOpts) =>
+    mutate<T>('POST', url, body, opts),
+  patch: <T = unknown>(url: string, body?: unknown, opts?: MutateOpts) =>
+    mutate<T>('PATCH', url, body, opts),
+  del: <T = unknown>(url: string, opts?: MutateOpts) => mutate<T>('DELETE', url, undefined, opts),
 };

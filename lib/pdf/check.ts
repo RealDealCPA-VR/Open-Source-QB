@@ -96,6 +96,14 @@ export function numberToWords(amount: string | number): string {
 // Check PDF data types
 // ---------------------------------------------------------------------------
 
+export interface VoucherLine {
+  /** GL account label, e.g. "5000 – Office Supplies". */
+  account: string;
+  description?: string | null;
+  /** Decimal string, e.g. "120.50". */
+  amount: string;
+}
+
 export interface CheckPdfData {
   /** Payer / company name — printed top-left as the drawer. */
   company: { name: string };
@@ -111,6 +119,11 @@ export interface CheckPdfData {
   memo?: string | null;
   /** Optional check number — printed top-right. */
   checkNumber?: string | number | null;
+  /**
+   * Optional voucher stub lines (QB voucher-check style) — the expense/bill
+   * detail behind the check, printed in the lower portion of the page.
+   */
+  voucher?: VoucherLine[];
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +351,61 @@ export async function renderCheckPdf(data: CheckPdfData): Promise<Uint8Array> {
     size: 7,
     color: C_GRAY,
   });
+
+  // -------------------------------------------------------------------------
+  // Voucher stub — expense/bill detail behind the check (QB voucher checks)
+  // -------------------------------------------------------------------------
+
+  if (data.voucher && data.voucher.length > 0) {
+    let vy = STUB_Y - 36;
+
+    text('VOUCHER', ML, vy, { font: bold, size: 10, color: C_NAVY });
+    const headRight =
+      `${data.payee}` +
+      (data.checkNumber != null && String(data.checkNumber).trim() !== ''
+        ? `  —  Check #${data.checkNumber}`
+        : '') +
+      `  —  ${data.date}`;
+    text(headRight, MR, vy, { size: 8, color: C_GRAY, rightAlign: true });
+    vy -= 8;
+    hRule(vy, ML, MR, 0.75, C_NAVY);
+    vy -= 14;
+
+    // Column headers
+    const AMT_X = MR;
+    const DESC_X = ML + (MR - ML) * 0.45;
+    text('Account', ML, vy, { font: bold, size: 8, color: C_GRAY });
+    text('Description', DESC_X, vy, { font: bold, size: 8, color: C_GRAY });
+    text('Amount', AMT_X, vy, { font: bold, size: 8, color: C_GRAY, rightAlign: true });
+    vy -= 6;
+    hRule(vy, ML, MR, 0.5, C_LIGHT);
+    vy -= 12;
+
+    let voucherTotal = 0;
+    for (const line of data.voucher) {
+      if (vy < 48) break; // never run off the page
+      text(line.account.slice(0, 48), ML, vy, { size: 9, color: C_BLACK });
+      if (line.description) {
+        text(line.description.slice(0, 40), DESC_X, vy, { size: 9, color: C_GRAY });
+      }
+      const amtNum = parseFloat(line.amount);
+      voucherTotal += isNaN(amtNum) ? 0 : amtNum;
+      const amtDisplay = isNaN(amtNum)
+        ? line.amount
+        : amtNum.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      text(amtDisplay, AMT_X, vy, { size: 9, color: C_BLACK, rightAlign: true });
+      vy -= 14;
+    }
+
+    hRule(vy + 6, DESC_X, MR, 0.5, C_LIGHT);
+    text('Total', DESC_X, vy - 4, { font: bold, size: 9, color: C_NAVY });
+    text(
+      voucherTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+      AMT_X,
+      vy - 4,
+      { font: bold, size: 9, color: C_NAVY, rightAlign: true },
+    );
+  }
 
   // -------------------------------------------------------------------------
   // Finalize

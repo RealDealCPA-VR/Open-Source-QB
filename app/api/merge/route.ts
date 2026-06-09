@@ -1,21 +1,22 @@
 /**
  * POST /api/merge
  *
- * Merge duplicate customers or vendors.
+ * Merge duplicate customers, vendors, or GL accounts.
  *
  * Request body:
  *   {
- *     type:   'customer' | 'vendor',
+ *     type:   'customer' | 'vendor' | 'account',
  *     fromId: string,   // duplicate — will be deactivated
- *     toId:   string,   // master — survives
+ *     toId:   string,   // master — survives (accounts: must be the same type)
  *   }
  *
  * Response 200: { reassigned: {...}, deactivatedId: string }
+ *               (accounts also return newBalance — the survivor's recomputed balance)
  * Errors: 400 (validation), 404 (not found), 409 (conflict), 500.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { mergeCustomers, mergeVendors } from '@/lib/services/merge';
+import { mergeAccounts, mergeCustomers, mergeVendors } from '@/lib/services/merge';
 import { ServiceError } from '@/lib/services/_base';
 
 function errorResponse(err: unknown) {
@@ -50,9 +51,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (type !== 'customer' && type !== 'vendor') {
+    if (type !== 'customer' && type !== 'vendor' && type !== 'account') {
       return NextResponse.json(
-        { error: "type must be 'customer' or 'vendor'", code: 'VALIDATION' },
+        { error: "type must be 'customer', 'vendor', or 'account'", code: 'VALIDATION' },
         { status: 400 },
       );
     }
@@ -60,8 +61,10 @@ export async function POST(req: NextRequest) {
     let result;
     if (type === 'customer') {
       result = await mergeCustomers(ctx, { fromId, toId });
-    } else {
+    } else if (type === 'vendor') {
       result = await mergeVendors(ctx, { fromId, toId });
+    } else {
+      result = await mergeAccounts(ctx, { fromId, toId });
     }
 
     return NextResponse.json(result);

@@ -10,16 +10,186 @@
 const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const net = require('node:net');
 
 const isDev = !app.isPackaged;
 let mainWindow = null;
 let serverProcess = null;
+let serverUrl = null;
+/** Set once the quit-time auto-backup has run (or been skipped) so app.quit() proceeds. */
+let quittingAfterBackup = false;
+/** A .bka file the OS asked us to open (double-click / "Open with" / argv). */
+let pendingBkaPath = null;
+
+// Per-launch secret shared with the local Next server so the main process can make
+// authenticated "system" calls (e.g. the launch-time recurring run). The server is bound to
+// 127.0.0.1 and the token never leaves this machine.
+const internalToken = crypto.randomBytes(32).toString('hex');
 
 // --- single instance lock ---
 if (!app.requestSingleInstanceLock()) {
   app.quit();
+}
+
+// ---------------------------------------------------------------------------
+// .bka file association handling
+//
+// electron-builder fileAssociations config lives in package.json (frozen), so instead of
+// registry-level registration we handle the two OS entry points directly:
+//  - macOS: the 'open-file' app event (fires before 'ready' on cold start, so register early)
+//  - Windows/Linux: a .bka path in process.argv (first launch) or in the second instance's
+//    argv (forwarded to us via 'second-instance' thanks to the single-instance lock above)
+// The path is delivered to the renderer as /backup?file=<path> so the backup/restore page
+// can prefill the restore flow.
+// ---------------------------------------------------------------------------
+
+function extractBkaPath(argv) {
+  for (const arg of argv.slice(1)) {
+    if (typeof arg === 'string' && !arg.startsWith('-') && arg.toLowerCase().endsWith('.bka')) {
+      return arg;
+    }
+  }
+  return null;
+}
+
+function deliverPendingBka() {
+  if (!pendingBkaPath || !mainWindow) return;
+  const filePath = pendingBkaPath;
+  pendingBkaPath = null;
+  navigate(`/backup?file=${encodeURIComponent(filePath)}`);
+}
+
+pendingBkaPath = extractBkaPath(process.argv);
+
+app.on('open-file', (event, filePath) => {
+  if (!filePath || !filePath.toLowerCase().endsWith('.bka')) return;
+  event.preventDefault();
+  pendingBkaPath = filePath;
+  deliverPendingBka();
+});
+
+// ---------------------------------------------------------------------------
+// Window-state persistence (size/position/maximized) via JSON in userData
+// ---------------------------------------------------------------------------
+
+function windowStatePath() {
+  return path.join(app.getPath('userData'), 'window-state.json');
+}
+
+function loadWindowState() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(windowStatePath(), 'utf8'));
+    if (
+      raw &&
+      Number.isFinite(raw.width) && Number.isFinite(raw.height) &&
+      raw.width >= 400 && raw.height >= 300
+    ) {
+      return raw;
+    }
+  } catch {
+    // missing/corrupt state file — fall back to defaults
+  }
+  return null;
+}
+
+/** Is the saved rectangle at least partially on a connected display? */
+function boundsVisible(state) {
+  if (!Number.isFinite(state.x) || !Number.isFinite(state.y)) return false;
+  try {
+    const { screen } = require('electron');
+    return screen.getAllDisplays().some((d) => {
+      const a = d.workArea;
+      return (
+        state.x < a.x + a.width && state.x + state.width > a.x &&
+        state.y < a.y + a.height && state.y + state.height > a.y
+      );
+    });
+  } catch {
+    return false;
+  }
+}
+
+function saveWindowState(win) {
+  try {
+    if (!win || win.isDestroyed()) return;
+    const maximized = win.isMaximized();
+    // getNormalBounds = the restored rectangle even while maximized/fullscreen.
+    const bounds = win.getNormalBounds();
+    fs.writeFileSync(
+      windowStatePath(),
+      JSON.stringify({ ...bounds, maximized }, null, 2),
+    );
+  } catch (err) {
+    console.error('[window-state] save failed:', err);
+  }
+}
+
+/** Debounced save on move/resize so we survive crashes, not just clean closes. */
+function trackWindowState(win) {
+  let timer = null;
+  const queueSave = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => saveWindowState(win), 500);
+  };
+  win.on('resize', queueSave);
+  win.on('move', queueSave);
+  win.on('close', () => {
+    if (timer) clearTimeout(timer);
+    saveWindowState(win);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Quit-time auto-backup (rotating, keep last N in userData/backups)
+//
+// The main process has no session cookie, so it authenticates with the per-launch
+// internal token against POST /api/dashboard/auto-backup (same trusted-local pattern
+// as the launch-time recurring run). In dev the server was not spawned by us, the
+// token will not match, and the backup is skipped with a log line.
+// ---------------------------------------------------------------------------
+
+const AUTO_BACKUP_KEEP = 10;
+
+function backupsDir() {
+  const dir = path.join(app.getPath('userData'), 'backups');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+async function runAutoBackup() {
+  if (!serverUrl) return;
+  const res = await fetch(`${serverUrl}/api/dashboard/auto-backup`, {
+    method: 'POST',
+    headers: { 'x-bka-internal': internalToken },
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`HTTP ${res.status} ${body}`.trim());
+  }
+  const bytes = Buffer.from(await res.arrayBuffer());
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const dir = backupsDir();
+  const file = path.join(dir, `auto-backup-${ts}.bka`);
+  fs.writeFileSync(file, bytes);
+  rotateAutoBackups(dir);
+  console.log(`[auto-backup] wrote ${file} (${bytes.length} bytes)`);
+}
+
+function rotateAutoBackups(dir) {
+  try {
+    const files = fs
+      .readdirSync(dir)
+      .filter((f) => /^auto-backup-.*\.bka$/.test(f))
+      .sort(); // timestamped names sort chronologically
+    for (const f of files.slice(0, Math.max(files.length - AUTO_BACKUP_KEEP, 0))) {
+      fs.rmSync(path.join(dir, f), { force: true });
+    }
+  } catch (err) {
+    console.error('[auto-backup] rotation failed:', err);
+  }
 }
 
 function companiesRoot() {
@@ -58,6 +228,10 @@ async function startNextServer() {
       HOSTNAME: '127.0.0.1',
       BKA_DATA_DIR: activeCompanyDir(),
       BKA_MIGRATIONS_DIR: path.join(process.resourcesPath, 'app', 'drizzle'),
+      // Offline desktop build: the server is bound to 127.0.0.1 only, so it is safe to
+      // surface a password-reset token directly in the local HTTP response.
+      BKA_OFFLINE: '1',
+      BKA_INTERNAL_TOKEN: internalToken,
       ELECTRON_RUN_AS_NODE: '1',
     },
     stdio: 'inherit',
@@ -130,9 +304,16 @@ function navigate(route) {
 
 async function createWindow() {
   const url = await startNextServer();
+  serverUrl = url;
+
+  // Restore the last window size/position; ignore positions that are no longer
+  // on any connected display (e.g. an unplugged external monitor).
+  const state = loadWindowState();
+  const usePosition = state && boundsVisible(state);
   mainWindow = new BrowserWindow({
-    width: 1440,
-    height: 900,
+    width: state ? state.width : 1440,
+    height: state ? state.height : 900,
+    ...(usePosition ? { x: state.x, y: state.y } : {}),
     minWidth: 1024,
     minHeight: 700,
     title: 'BookKeeper AI',
@@ -143,22 +324,42 @@ async function createWindow() {
       nodeIntegration: false,
     },
   });
+  if (state?.maximized) mainWindow.maximize();
+  trackWindowState(mainWindow);
+
   await mainWindow.loadURL(url);
   if (isDev) mainWindow.webContents.openDevTools({ mode: 'detach' });
   buildMenu();
   runDueRecurring(url);
+
+  // Deliver a double-clicked .bka after the renderer has had a moment to mount the
+  // DesktopBridge listener (loadURL resolves at load, React hydrates just after).
+  if (pendingBkaPath) setTimeout(deliverPendingBka, 1200);
 }
 
-// Generate any due recurring/memorized transactions on launch (best-effort).
+// Generate any due recurring/memorized transactions on launch (best-effort, but loudly logged).
+// Authenticates with the per-launch internal token (see app/api/recurring/run/route.ts) since
+// the main process has no session cookie.
 function runDueRecurring(url) {
   try {
     fetch(`${url}/api/recurring/run`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'x-bka-internal': internalToken },
       body: '{}',
-    }).catch(() => {});
-  } catch {
-    // global fetch unavailable / server not ready — ignore.
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const body = await res.text().catch(() => '');
+          console.error(`[recurring] launch-time run failed: HTTP ${res.status} ${body}`);
+        } else {
+          const result = await res.json().catch(() => null);
+          const n = result?.generated?.length ?? 0;
+          if (n > 0) console.log(`[recurring] launch-time run generated ${n} document(s)`);
+        }
+      })
+      .catch((err) => console.error('[recurring] launch-time run failed:', err));
+  } catch (err) {
+    console.error('[recurring] launch-time run unavailable:', err);
   }
 }
 
@@ -179,10 +380,17 @@ ipcMain.handle('dialog:saveFile', async (_e, { defaultName, content }) => {
 
 ipcMain.handle('app:dataDir', () => activeCompanyDir());
 
-app.on('second-instance', () => {
+app.on('second-instance', (_event, argv) => {
   if (mainWindow) {
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();
+  }
+  // A second launch with a .bka argument (e.g. double-clicking a backup while the
+  // app is running) is forwarded here by the single-instance lock.
+  const bka = extractBkaPath(argv || []);
+  if (bka) {
+    pendingBkaPath = bka;
+    deliverPendingBka();
   }
 });
 
@@ -214,6 +422,18 @@ app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
+  // First pass: hold the quit open long enough to snapshot the company file, then
+  // re-enter quit with the flag set. Data safety: a rotating local auto-backup means
+  // a bad restore / disk hiccup never costs more than one session.
+  if (!quittingAfterBackup) {
+    quittingAfterBackup = true;
+    event.preventDefault();
+    runAutoBackup()
+      .catch((err) => console.error('[auto-backup] skipped:', err?.message || err))
+      .finally(() => app.quit());
+    return;
+  }
+  // Second pass: backup done (or skipped) — shut the server down for real.
   if (serverProcess) serverProcess.kill();
 });

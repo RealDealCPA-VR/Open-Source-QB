@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Receipt, Download } from 'lucide-react';
 import {
+  Badge,
   Button,
   Card,
   Label,
@@ -13,10 +14,9 @@ import {
   Tr,
   PageHeader,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { formatCurrency } from '@/lib/money';
+import { formatCurrency, Money, toAmountString } from '@/lib/money';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -105,35 +105,28 @@ export default function Report1099Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const totalAll = rows
-    ? rows.reduce((sum, r) => sum + parseFloat(r.total), 0).toFixed(2)
-    : null;
+  const totalAll = rows ? toAmountString(Money.add(...rows.map((r) => r.total))) : null;
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
-
       <PageHeader
         title="1099 Vendor Report"
         icon={Receipt}
         action={
-          <div className="flex items-center gap-3">
-            {rows && rows.length > 0 && (
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => downloadCsv(rows, parseInt(selectedYear, 10))}
-              >
-                <Download className="h-4 w-4" />
-                Download CSV
-              </Button>
-            )}
-          </div>
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={!rows?.length}
+            onClick={() => rows && downloadCsv(rows, parseInt(selectedYear, 10))}
+          >
+            <Download className="h-4 w-4" />
+            Download CSV
+          </Button>
         }
       />
 
       {/* ---- Year picker ---- */}
-      <Card className="mb-6">
+      <Card className="p-4 mb-6">
         <div className="flex flex-wrap items-end gap-4">
           <div>
             <Label htmlFor="year">Calendar Year</Label>
@@ -204,16 +197,14 @@ export default function Report1099Page() {
                     <Td className="font-semibold text-navy">{row.vendorName}</Td>
                     <Td className="tabular-nums text-navy/70">
                       {row.taxId ?? (
-                        <span className="italic text-amber-600 text-xs">Not on file</span>
+                        <span className="italic text-gold text-xs">Not on file</span>
                       )}
                     </Td>
                     <Td className="text-right tabular-nums font-semibold">
                       {formatCurrency(row.total)}
                     </Td>
                     <Td>
-                      <span className="inline-flex items-center rounded-full bg-emerald/15 px-2.5 py-0.5 text-xs font-semibold text-emerald">
-                        Eligible
-                      </span>
+                      <Badge tone="success">Eligible</Badge>
                     </Td>
                   </Tr>
                 ))

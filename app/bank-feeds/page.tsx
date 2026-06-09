@@ -13,6 +13,8 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import Link from 'next/link';
+import { Rss } from 'lucide-react';
 import {
   Button,
   Card,
@@ -25,10 +27,10 @@ import {
   Tr,
   Badge,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { format, parseISO } from 'date-fns';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -232,9 +234,8 @@ export default function BankFeedsPage() {
   if (configured === null) {
     return (
       <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-        <PageHeader title="Live Bank Feeds" />
-        <Card className="p-8 text-center text-navy/40">Checking Plaid configuration...</Card>
-        <Toaster />
+        <PageHeader title="Live Bank Feeds" icon={Rss} />
+        <Card className="p-8 text-center text-navy/40">Checking Plaid configuration…</Card>
       </main>
     );
   }
@@ -243,7 +244,7 @@ export default function BankFeedsPage() {
   if (!configured) {
     return (
       <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-        <PageHeader title="Live Bank Feeds" />
+        <PageHeader title="Live Bank Feeds" icon={Rss} />
 
         <Card className="p-8 max-w-2xl">
           <div className="flex items-start gap-4">
@@ -299,8 +300,6 @@ export default function BankFeedsPage() {
             </div>
           </div>
         </Card>
-
-        <Toaster />
       </main>
     );
   }
@@ -308,7 +307,7 @@ export default function BankFeedsPage() {
   // ---- Render: configured — show connect UI ------------------------------
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <PageHeader title="Live Bank Feeds" />
+      <PageHeader title="Live Bank Feeds" icon={Rss} />
 
       {/* Connection card */}
       <Card className="p-6 mb-6 max-w-2xl">
@@ -323,9 +322,9 @@ export default function BankFeedsPage() {
             {bankAccounts.length === 0 ? (
               <p className="text-sm text-navy/50 mt-1">
                 No bank accounts found.{' '}
-                <a href="/bank-accounts" className="text-electric underline">
-                  Create one first.
-                </a>
+                <Link href="/banking" className="text-electric underline">
+                  Create one in Banking first.
+                </Link>
               </p>
             ) : (
               <Select
@@ -345,15 +344,16 @@ export default function BankFeedsPage() {
 
           <Button
             onClick={handleConnect}
-            disabled={connecting || bankAccounts.length === 0}
+            loading={connecting}
+            disabled={bankAccounts.length === 0}
             className="flex-shrink-0"
           >
-            {connecting ? 'Connecting...' : 'Connect a bank'}
+            Connect a Bank
           </Button>
         </div>
 
         <p className="mt-4 text-xs text-navy/40">
-          Clicking "Connect a bank" will open the Plaid Link dialog. Select your institution,
+          Clicking "Connect a Bank" will open the Plaid Link dialog. Select your institution,
           authenticate, and your recent transactions will be imported automatically.
         </p>
       </Card>
@@ -369,9 +369,9 @@ export default function BankFeedsPage() {
               <tr>
                 <Th>Bank</Th>
                 <Th>Synced at</Th>
-                <Th className="text-right">From Plaid</Th>
-                <Th className="text-right">Imported</Th>
-                <Th className="text-right">Dupes skipped</Th>
+                <Th numeric>From Plaid</Th>
+                <Th numeric>Imported</Th>
+                <Th numeric>Duplicates Skipped</Th>
               </tr>
             </thead>
             <tbody>
@@ -379,19 +379,17 @@ export default function BankFeedsPage() {
                 <Tr key={i}>
                   <Td className="font-medium">{r.bankName}</Td>
                   <Td className="text-navy/50 text-xs whitespace-nowrap">
-                    {new Date(r.importedAt).toLocaleString()}
+                    {format(parseISO(r.importedAt), 'MMM d, yyyy h:mm a')}
                   </Td>
-                  <Td className="text-right tabular-nums">{r.total}</Td>
-                  <Td className="text-right tabular-nums text-emerald font-semibold">{r.imported}</Td>
-                  <Td className="text-right tabular-nums text-navy/40">{r.total - r.imported}</Td>
+                  <Td numeric>{r.total}</Td>
+                  <Td numeric className="text-emerald font-semibold">{r.imported}</Td>
+                  <Td numeric className="text-navy/40">{r.total - r.imported}</Td>
                 </Tr>
               ))}
             </tbody>
           </Table>
         </Card>
       )}
-
-      <Toaster />
     </main>
   );
 }

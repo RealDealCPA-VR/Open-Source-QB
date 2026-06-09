@@ -1,68 +1,145 @@
+import Link from 'next/link';
+import { BookOpen } from 'lucide-react';
+import { Badge, Button, Card, Input, Label, PageHeader, Table, Td, Th, Tr } from '@/components/ui';
 import { getServerContext } from '@/lib/context';
 import { trialBalance } from '@/lib/services/reports';
 import { formatCurrency } from '@/lib/money';
 
 export const dynamic = 'force-dynamic';
 
-export default async function TrialBalancePage() {
+function toInputDate(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function parseParamDate(v: string | undefined): Date | undefined {
+  if (!v) return undefined;
+  // Parse as local midnight so the rendered date matches what the user picked
+  // regardless of the server's UTC offset.
+  const d = new Date(`${v}T00:00:00`);
+  return isNaN(d.getTime()) ? undefined : d;
+}
+
+export default async function TrialBalancePage({
+  searchParams,
+}: {
+  searchParams: Promise<{ asOf?: string }>;
+}) {
   const ctx = await getServerContext();
-  const tb = await trialBalance(ctx);
+  const params = await searchParams;
+  const asOf = parseParamDate(params.asOf) ?? new Date();
+  const asOfStr = toInputDate(asOf);
+  // Drill into the register up to the as-of date.
+  const asOfQs = `?to=${asOfStr}`;
+
+  const tb = await trialBalance(ctx, asOf);
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <div className="flex items-baseline justify-between mb-6">
-        <h1 className="text-3xl font-extrabold text-navy">Trial Balance</h1>
-        <span
-          className={`px-3 py-1 rounded-full text-xs font-semibold ${
-            tb.balanced ? 'bg-emerald/15 text-emerald' : 'bg-red-100 text-red-600'
-          }`}
-        >
-          {tb.balanced ? 'In balance' : 'OUT OF BALANCE'}
-        </span>
+      <div className="max-w-3xl">
+        <PageHeader
+          title="Trial Balance"
+          icon={BookOpen}
+          action={
+            <div className="flex items-center gap-3">
+              <span className="text-sm text-navy/50">
+                as of {asOf.toLocaleDateString('en-US')}
+              </span>
+              <Badge tone={tb.balanced ? 'success' : 'danger'}>
+                {tb.balanced ? 'In balance' : 'OUT OF BALANCE'}
+              </Badge>
+            </div>
+          }
+        />
       </div>
 
-      <div className="rounded-2xl bg-white p-6 shadow-2xl border border-slate-100 max-w-3xl">
-        <table className="w-full border-collapse">
+      {/* As-of date picker (plain GET form — server-rendered page) */}
+      <Card className="mb-6 max-w-3xl">
+        <form method="get" className="flex items-end gap-3 flex-wrap p-4">
+          <div>
+            <Label htmlFor="tb-asof">As of</Label>
+            <Input id="tb-asof" type="date" name="asOf" defaultValue={asOfStr} />
+          </div>
+          <Button type="submit" variant="secondary" size="sm" className="mb-0.5">
+            Run Report
+          </Button>
+        </form>
+      </Card>
+
+      <Card className="p-6 max-w-3xl">
+        <Table>
           <thead>
-            <tr className="border-b-2 border-navy/10 text-navy/70 text-sm">
-              <th className="py-2 px-3 text-left font-semibold">Code</th>
-              <th className="py-2 px-3 text-left font-semibold">Account</th>
-              <th className="py-2 px-3 text-right font-semibold">Debit</th>
-              <th className="py-2 px-3 text-right font-semibold">Credit</th>
+            <tr>
+              <Th>Code</Th>
+              <Th>Account</Th>
+              <Th numeric>Debit</Th>
+              <Th numeric>Credit</Th>
             </tr>
           </thead>
           <tbody>
             {tb.rows.length === 0 && (
               <tr>
-                <td colSpan={4} className="py-8 text-center text-navy/40">
+                <Td colSpan={4} className="py-8 text-center text-navy/40">
                   No posted transactions yet.
-                </td>
+                </Td>
               </tr>
             )}
             {tb.rows.map((r) => (
-              <tr key={r.accountId} className="border-b border-slate-100 hover:bg-electric/5">
-                <td className="py-2 px-3 text-navy/60 tabular-nums">{r.code}</td>
-                <td className="py-2 px-3 text-navy">{r.name}</td>
-                <td className="py-2 px-3 text-right tabular-nums text-navy">
-                  {Number(r.debit) ? formatCurrency(r.debit) : ''}
-                </td>
-                <td className="py-2 px-3 text-right tabular-nums text-navy">
-                  {Number(r.credit) ? formatCurrency(r.credit) : ''}
-                </td>
-              </tr>
+              <Tr key={r.accountId}>
+                {/* QuickZoom: drill from the trial-balance line into the account register */}
+                <Td className="text-navy/60 tabular-nums">
+                  <Link href={`/registers/${r.accountId}${asOfQs}`} className="hover:text-electric hover:underline">
+                    {r.code}
+                  </Link>
+                </Td>
+                <Td>
+                  <Link
+                    href={`/registers/${r.accountId}${asOfQs}`}
+                    className="text-navy hover:text-electric hover:underline"
+                    title={`Open ${r.name} register`}
+                  >
+                    {r.name}
+                  </Link>
+                </Td>
+                <Td numeric>
+                  {Number(r.debit) ? (
+                    <Link
+                      href={`/registers/${r.accountId}${asOfQs}`}
+                      className="text-navy hover:text-electric hover:underline"
+                      title={`Open ${r.name} register`}
+                    >
+                      {formatCurrency(r.debit)}
+                    </Link>
+                  ) : (
+                    ''
+                  )}
+                </Td>
+                <Td numeric>
+                  {Number(r.credit) ? (
+                    <Link
+                      href={`/registers/${r.accountId}${asOfQs}`}
+                      className="text-navy hover:text-electric hover:underline"
+                      title={`Open ${r.name} register`}
+                    >
+                      {formatCurrency(r.credit)}
+                    </Link>
+                  ) : (
+                    ''
+                  )}
+                </Td>
+              </Tr>
             ))}
           </tbody>
           <tfoot>
             <tr className="border-t-2 border-navy/20 font-bold text-navy">
-              <td className="py-3 px-3" colSpan={2}>
+              <td className="py-3 px-4" colSpan={2}>
                 Total
               </td>
-              <td className="py-3 px-3 text-right tabular-nums">{formatCurrency(tb.totalDebit)}</td>
-              <td className="py-3 px-3 text-right tabular-nums">{formatCurrency(tb.totalCredit)}</td>
+              <td className="py-3 px-4 text-right tabular-nums">{formatCurrency(tb.totalDebit)}</td>
+              <td className="py-3 px-4 text-right tabular-nums">{formatCurrency(tb.totalCredit)}</td>
             </tr>
           </tfoot>
-        </table>
-      </div>
+        </Table>
+      </Card>
     </main>
   );
 }

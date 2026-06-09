@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Briefcase, Plus, TrendingUp, DollarSign, X } from 'lucide-react';
+import { Briefcase, Plus, TrendingUp } from 'lucide-react';
 import {
   Button,
   Card,
@@ -14,11 +14,13 @@ import {
   Tr,
   Modal,
   PageHeader,
+  EmptyState,
+  Spinner,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -38,9 +40,15 @@ interface Job {
 
 interface JobSummaryRow extends Job {
   customerName: string | null;
-  revenue: string;
-  cost: string;
-  profit: string;
+  /** null when the row came from the bare list (inactive jobs have no summary). */
+  revenue: string | null;
+  cost: string | null;
+  profit: string | null;
+}
+
+interface Customer {
+  id: string;
+  displayName: string;
 }
 
 interface ProfitabilityLine {
@@ -86,11 +94,6 @@ function profitTone(profit: string): 'success' | 'danger' | 'neutral' {
   return 'neutral';
 }
 
-function formatDate(d: string | null): string {
-  if (!d) return '-';
-  return new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-}
-
 function sourceLabel(source: ProfitabilityLine['source']): string {
   switch (source) {
     case 'invoice_line': return 'Revenue';
@@ -120,6 +123,7 @@ function JobForm({
         <Label htmlFor="name">Job Name *</Label>
         <Input
           id="name"
+          autoFocus
           placeholder="e.g. Roof Replacement — 42 Oak St"
           value={form.name}
           onChange={(e) => onChange('name', e.target.value)}
@@ -163,7 +167,7 @@ function JobForm({
 }
 
 // ---------------------------------------------------------------------------
-// Profitability drawer (shown when a job row is clicked)
+// Profitability panel — built on the kit Modal (Escape, focus trap, aria-modal)
 // ---------------------------------------------------------------------------
 
 function ProfitabilityPanel({
@@ -197,166 +201,146 @@ function ProfitabilityPanel({
     return () => { cancelled = true; };
   }, [jobId, onClose]);
 
-  if (loading) {
-    return (
-      <div className="fixed inset-0 z-50 flex items-end justify-end p-6 pointer-events-none">
-        <Card className="w-full max-w-xl p-6 pointer-events-auto">
-          <p className="text-navy/40 text-sm text-center py-8">Loading...</p>
-        </Card>
-      </div>
-    );
-  }
-
-  if (!data) return null;
-
-  const { profitability: p } = data;
-  const revLines = p.lines.filter((l) => l.source === 'invoice_line');
-  const costLines = p.lines.filter((l) => l.source !== 'invoice_line');
+  const p = data?.profitability;
+  const revLines = p?.lines.filter((l) => l.source === 'invoice_line') ?? [];
+  const costLines = p?.lines.filter((l) => l.source !== 'invoice_line') ?? [];
 
   return (
-    <div className="fixed inset-0 z-50 flex" onClick={onClose}>
-      <div className="flex-1" />
-      <div
-        className="w-full max-w-xl bg-white shadow-2xl overflow-y-auto h-full border-l border-slate-200"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100">
-          <div>
-            <h2 className="text-xl font-bold text-navy">{p.jobName}</h2>
-            <p className="text-sm text-navy/50 mt-0.5">Job P&amp;L</p>
-          </div>
-          <button
-            onClick={onClose}
-            className="text-navy/40 hover:text-navy transition-colors"
-            aria-label="Close"
-          >
-            <X className="h-5 w-5" />
-          </button>
+    <Modal
+      open
+      onClose={onClose}
+      size="lg"
+      title={p ? `${p.jobName} — Job P&L` : 'Job P&L'}
+    >
+      {loading || !p ? (
+        <div className="flex items-center justify-center gap-2 text-navy/40 text-sm py-8">
+          <Spinner className="h-4 w-4" /> Loading...
         </div>
-
-        {/* Summary cards */}
-        <div className="grid grid-cols-3 gap-3 p-6">
-          <div className="rounded-xl bg-emerald/10 p-4 text-center">
-            <p className="text-xs text-emerald font-semibold uppercase tracking-wide mb-1">Revenue</p>
-            <p className="text-lg font-bold text-emerald">{formatCurrency(p.revenue)}</p>
-          </div>
-          <div className="rounded-xl bg-red-50 p-4 text-center">
-            <p className="text-xs text-red-500 font-semibold uppercase tracking-wide mb-1">Cost</p>
-            <p className="text-lg font-bold text-red-500">{formatCurrency(p.cost)}</p>
-          </div>
-          <div
-            className={`rounded-xl p-4 text-center ${
-              parseFloat(p.profit) >= 0 ? 'bg-electric/10' : 'bg-gold/20'
-            }`}
-          >
-            <p
-              className={`text-xs font-semibold uppercase tracking-wide mb-1 ${
-                parseFloat(p.profit) >= 0 ? 'text-electric' : 'text-gold'
+      ) : (
+        <>
+          {/* Summary cards */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+            <div className="rounded-xl bg-emerald/10 p-4 text-center">
+              <p className="text-xs text-emerald font-semibold uppercase tracking-wide mb-1">Revenue</p>
+              <p className="text-lg font-bold text-emerald">{formatCurrency(p.revenue)}</p>
+            </div>
+            <div className="rounded-xl bg-red-50 p-4 text-center">
+              <p className="text-xs text-red-500 font-semibold uppercase tracking-wide mb-1">Cost</p>
+              <p className="text-lg font-bold text-red-500">{formatCurrency(p.cost)}</p>
+            </div>
+            <div
+              className={`rounded-xl p-4 text-center ${
+                parseFloat(p.profit) >= 0 ? 'bg-electric/10' : 'bg-gold/20'
               }`}
             >
-              Profit
-            </p>
-            <p
-              className={`text-lg font-bold ${
-                parseFloat(p.profit) >= 0 ? 'text-electric' : 'text-gold'
-              }`}
-            >
-              {formatCurrency(p.profit)}
-            </p>
-          </div>
-        </div>
-
-        {/* Budget row */}
-        {p.budget !== null && (
-          <div className="mx-6 mb-4 rounded-xl border border-slate-100 bg-slate-50 px-4 py-3 flex items-center justify-between">
-            <span className="text-sm text-navy/70">Budget</span>
-            <span className="font-semibold text-navy">{formatCurrency(p.budget)}</span>
-            {p.budgetVariance !== null && (
-              <span
-                className={`text-sm font-medium ${
-                  parseFloat(p.budgetVariance) >= 0 ? 'text-emerald' : 'text-red-500'
+              <p
+                className={`text-xs font-semibold uppercase tracking-wide mb-1 ${
+                  parseFloat(p.profit) >= 0 ? 'text-electric' : 'text-gold'
                 }`}
               >
-                {parseFloat(p.budgetVariance) >= 0 ? '+' : ''}
-                {formatCurrency(p.budgetVariance)} vs. budget
-              </span>
-            )}
+                Profit
+              </p>
+              <p
+                className={`text-lg font-bold ${
+                  parseFloat(p.profit) >= 0 ? 'text-electric' : 'text-gold'
+                }`}
+              >
+                {formatCurrency(p.profit)}
+              </p>
+            </div>
           </div>
-        )}
 
-        {/* Line items */}
-        {p.lines.length === 0 ? (
-          <div className="px-6 py-8 text-center text-navy/40 text-sm">
-            No line items tagged to this job yet.
-          </div>
-        ) : (
-          <div className="px-6 pb-8 flex flex-col gap-6">
-            {revLines.length > 0 && (
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-wide text-emerald mb-2">
-                  Revenue Lines
-                </p>
-                <div className="rounded-xl border border-slate-100 overflow-hidden">
-                  <table className="w-full border-collapse text-sm">
-                    <thead>
-                      <tr className="bg-slate-50">
-                        <th className="text-left py-2 px-3 font-semibold text-navy/70">Description</th>
-                        <th className="text-right py-2 px-3 font-semibold text-navy/70">Amount</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {revLines.map((l) => (
-                        <tr key={l.id} className="border-t border-slate-100 hover:bg-slate-50/50">
-                          <td className="py-2 px-3 text-navy/80">{l.description ?? '—'}</td>
-                          <td className="py-2 px-3 text-right font-mono text-emerald font-medium">
-                            {formatCurrency(l.amount)}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
+          {/* Budget row */}
+          {p.budget !== null && (
+            <div className="mb-4 rounded-xl border border-slate-100 bg-slate-50 px-4 py-3 flex items-center justify-between">
+              <span className="text-sm text-navy/70">Budget</span>
+              <span className="font-semibold text-navy">{formatCurrency(p.budget)}</span>
+              {p.budgetVariance !== null && (
+                <span
+                  className={`text-sm font-medium ${
+                    parseFloat(p.budgetVariance) >= 0 ? 'text-emerald' : 'text-red-500'
+                  }`}
+                >
+                  {parseFloat(p.budgetVariance) >= 0 ? '+' : ''}
+                  {formatCurrency(p.budgetVariance)} vs. budget
+                </span>
+              )}
+            </div>
+          )}
 
-            {costLines.length > 0 && (
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-wide text-red-500 mb-2">
-                  Cost Lines
-                </p>
-                <div className="rounded-xl border border-slate-100 overflow-hidden">
-                  <table className="w-full border-collapse text-sm">
-                    <thead>
-                      <tr className="bg-slate-50">
-                        <th className="text-left py-2 px-3 font-semibold text-navy/70">Description</th>
-                        <th className="text-left py-2 px-3 font-semibold text-navy/70">Type</th>
-                        <th className="text-right py-2 px-3 font-semibold text-navy/70">Amount</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {costLines.map((l) => (
-                        <tr key={l.id} className="border-t border-slate-100 hover:bg-slate-50/50">
-                          <td className="py-2 px-3 text-navy/80">{l.description ?? '—'}</td>
-                          <td className="py-2 px-3">
-                            <span className="text-xs bg-slate-100 text-slate-600 rounded-full px-2 py-0.5">
-                              {sourceLabel(l.source)}
-                            </span>
-                          </td>
-                          <td className="py-2 px-3 text-right font-mono text-red-500 font-medium">
-                            {formatCurrency(l.amount)}
-                          </td>
+          {/* Line items */}
+          {p.lines.length === 0 ? (
+            <div className="py-8 text-center text-navy/40 text-sm">
+              No line items tagged to this job yet.
+            </div>
+          ) : (
+            <div className="flex flex-col gap-6">
+              {revLines.length > 0 && (
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-emerald mb-2">
+                    Revenue Lines
+                  </p>
+                  <div className="rounded-xl border border-slate-100 overflow-hidden">
+                    <Table>
+                      <thead>
+                        <tr>
+                          <Th>Description</Th>
+                          <Th numeric>Amount</Th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                      </thead>
+                      <tbody>
+                        {revLines.map((l) => (
+                          <Tr key={l.id}>
+                            <Td className="text-navy/80">{l.description ?? '—'}</Td>
+                            <Td numeric className="text-emerald font-medium">
+                              {formatCurrency(l.amount)}
+                            </Td>
+                          </Tr>
+                        ))}
+                      </tbody>
+                    </Table>
+                  </div>
                 </div>
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    </div>
+              )}
+
+              {costLines.length > 0 && (
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-red-500 mb-2">
+                    Cost Lines
+                  </p>
+                  <div className="rounded-xl border border-slate-100 overflow-hidden">
+                    <Table>
+                      <thead>
+                        <tr>
+                          <Th>Description</Th>
+                          <Th>Type</Th>
+                          <Th numeric>Amount</Th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {costLines.map((l) => (
+                          <Tr key={l.id}>
+                            <Td className="text-navy/80">{l.description ?? '—'}</Td>
+                            <Td>
+                              <span className="text-xs bg-slate-100 text-slate-600 rounded-full px-2 py-0.5">
+                                {sourceLabel(l.source)}
+                              </span>
+                            </Td>
+                            <Td numeric className="text-red-500 font-medium">
+                              {formatCurrency(l.amount)}
+                            </Td>
+                          </Tr>
+                        ))}
+                      </tbody>
+                    </Table>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      )}
+    </Modal>
   );
 }
 
@@ -384,23 +368,32 @@ export default function JobsPage() {
   async function fetchJobs() {
     setLoading(true);
     try {
-      if (includeInactive) {
-        // Use plain list for inactive (summary only covers active)
-        const list = await api.get<Job[]>('/api/jobs?includeInactive=true');
-        // Map to summary shape without revenue/cost/profit for inactive
-        setJobs(
-          list.map((j) => ({
-            ...j,
-            customerName: null,
-            revenue: '0.00',
-            cost: '0.00',
-            profit: '0.00',
-          })),
-        );
-      } else {
-        const data = await api.get<JobSummaryRow[]>('/api/jobs?summary=true');
-        setJobs(data);
+      // Always load the summary so active jobs keep customer + revenue/cost/profit.
+      // When showing inactive jobs, merge in the bare list (inactive jobs carry no
+      // summary figures — those render as "—" instead of fake zeros).
+      const summary = await api.get<JobSummaryRow[]>('/api/jobs?summary=true');
+      if (!includeInactive) {
+        setJobs(summary);
+        return;
       }
+      const [list, customers] = await Promise.all([
+        api.get<Job[]>('/api/jobs?includeInactive=true'),
+        api.get<Customer[]>('/api/customers'),
+      ]);
+      const summaryById = new Map(summary.map((s) => [s.id, s]));
+      const custMap = new Map(customers.map((c) => [c.id, c.displayName]));
+      setJobs(
+        list.map(
+          (j) =>
+            summaryById.get(j.id) ?? {
+              ...j,
+              customerName: j.customerId ? (custMap.get(j.customerId) ?? null) : null,
+              revenue: null,
+              cost: null,
+              profit: null,
+            },
+        ),
+      );
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to load jobs', 'danger');
     } finally {
@@ -479,16 +472,21 @@ export default function JobsPage() {
 
       <Card>
         {loading ? (
-          <div className="p-12 text-center text-navy/40 text-sm">Loading jobs...</div>
-        ) : jobs.length === 0 ? (
-          <div className="p-12 text-center">
-            <Briefcase className="mx-auto h-10 w-10 text-navy/20 mb-3" />
-            <p className="text-navy/50 text-sm">
-              {includeInactive
-                ? 'No jobs found.'
-                : 'No active jobs. Click "New Job" to start tracking project profitability.'}
-            </p>
+          <div className="flex items-center justify-center gap-2 p-12 text-navy/40 text-sm">
+            <Spinner className="h-4 w-4" /> Loading jobs...
           </div>
+        ) : jobs.length === 0 ? (
+          <EmptyState
+            icon={Briefcase}
+            title={includeInactive ? 'No jobs found' : 'No active jobs'}
+            message="Create a job to start tracking project profitability."
+            action={
+              <Button onClick={openAddModal}>
+                <Plus className="h-4 w-4" />
+                New Job
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -498,10 +496,10 @@ export default function JobsPage() {
                 <Th>Status</Th>
                 <Th>Start</Th>
                 <Th>End</Th>
-                <Th className="text-right">Budget</Th>
-                <Th className="text-right">Revenue</Th>
-                <Th className="text-right">Cost</Th>
-                <Th className="text-right">Profit</Th>
+                <Th numeric>Budget</Th>
+                <Th numeric>Revenue</Th>
+                <Th numeric>Cost</Th>
+                <Th numeric>Profit</Th>
               </tr>
             </thead>
             <tbody>
@@ -527,24 +525,24 @@ export default function JobsPage() {
                       <Badge tone="neutral">Inactive</Badge>
                     )}
                   </Td>
-                  <Td className="text-navy/60 text-sm">{formatDate(j.startDate)}</Td>
-                  <Td className="text-navy/60 text-sm">{formatDate(j.endDate)}</Td>
-                  <Td className="text-right font-mono text-navy/70 text-sm">
+                  <Td className="text-navy/60 text-sm">{j.startDate ? formatDate(j.startDate) : '-'}</Td>
+                  <Td className="text-navy/60 text-sm">{j.endDate ? formatDate(j.endDate) : '-'}</Td>
+                  <Td numeric className="text-navy/70 text-sm">
                     {j.budget ? formatCurrency(j.budget) : '-'}
                   </Td>
-                  <Td className="text-right font-mono font-semibold text-emerald">
-                    {includeInactive ? '-' : formatCurrency(j.revenue)}
+                  <Td numeric className="font-semibold text-emerald">
+                    {j.revenue !== null ? formatCurrency(j.revenue) : '—'}
                   </Td>
-                  <Td className="text-right font-mono font-semibold text-red-500">
-                    {includeInactive ? '-' : formatCurrency(j.cost)}
+                  <Td numeric className="font-semibold text-red-500">
+                    {j.cost !== null ? formatCurrency(j.cost) : '—'}
                   </Td>
-                  <Td className="text-right">
-                    {includeInactive ? (
-                      <span className="text-navy/40 text-sm">-</span>
-                    ) : (
+                  <Td numeric>
+                    {j.profit !== null ? (
                       <Badge tone={profitTone(j.profit)}>
                         {formatCurrency(j.profit)}
                       </Badge>
+                    ) : (
+                      <span className="text-navy/40 text-sm">—</span>
                     )}
                   </Td>
                 </Tr>
@@ -564,13 +562,21 @@ export default function JobsPage() {
             <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addSaving}>
               Cancel
             </Button>
-            <Button onClick={handleAdd} disabled={addSaving}>
-              {addSaving ? 'Creating...' : 'Create Job'}
+            <Button type="submit" form="new-job-form" loading={addSaving}>
+              Create Job
             </Button>
           </>
         }
       >
-        <JobForm form={addForm} onChange={updateAddForm} />
+        <form
+          id="new-job-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleAdd();
+          }}
+        >
+          <JobForm form={addForm} onChange={updateAddForm} />
+        </form>
       </Modal>
 
       {/* ---- Profitability panel ---- */}
@@ -580,8 +586,6 @@ export default function JobsPage() {
           onClose={() => setSelectedJobId(null)}
         />
       )}
-
-      <Toaster />
     </main>
   );
 }

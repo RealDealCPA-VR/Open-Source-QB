@@ -1,15 +1,18 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { Suspense, useEffect, useState } from 'react';
 import {
   Package,
   Plus,
   Pencil,
   PowerOff,
+  Download,
 } from 'lucide-react';
 import {
   Button,
   Card,
+  ConfirmDialog,
+  EmptyState,
   Input,
   Select,
   Label,
@@ -20,11 +23,12 @@ import {
   Tr,
   Modal,
   PageHeader,
+  Spinner,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { useFocusParam } from '@/lib/useFocusParam';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -38,6 +42,7 @@ interface Item {
   description: string | null;
   salesPrice: string | null;
   purchaseCost: string | null;
+  reorderPoint: string | null;
   taxable: boolean;
   isActive: boolean;
   incomeAccountId: string | null;
@@ -53,6 +58,7 @@ interface FormState {
   description: string;
   salesPrice: string;
   purchaseCost: string;
+  reorderPoint: string;
   sku: string;
 }
 
@@ -62,6 +68,7 @@ const EMPTY_FORM: FormState = {
   description: '',
   salesPrice: '',
   purchaseCost: '',
+  reorderPoint: '',
   sku: '',
 };
 
@@ -83,7 +90,7 @@ const TYPE_TONES: Record<ItemType, 'info' | 'success' | 'warning' | 'neutral'> =
 
 // ── Page ──────────────────────────────────────────────────────────────────────
 
-export default function ItemsPage() {
+function ItemsPageContent() {
   const [items, setItems] = useState<Item[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -131,10 +138,14 @@ export default function ItemsPage() {
       description: item.description ?? '',
       salesPrice: item.salesPrice ?? '',
       purchaseCost: item.purchaseCost ?? '',
+      reorderPoint: item.reorderPoint ?? '',
       sku: item.sku ?? '',
     });
     setModalOpen(true);
   }
+
+  // Auto-open the edit modal when arriving via global search (?focus=<id>)
+  useFocusParam(items, loading, openEdit);
 
   function closeModal() {
     setModalOpen(false);
@@ -161,6 +172,7 @@ export default function ItemsPage() {
       description: form.description.trim() || null,
       salesPrice: form.salesPrice.trim() || null,
       purchaseCost: form.purchaseCost.trim() || null,
+      reorderPoint: form.type === 'inventory' ? form.reorderPoint.trim() || null : null,
       sku: form.sku.trim() || null,
     };
 
@@ -203,26 +215,41 @@ export default function ItemsPage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
-
       <PageHeader
         title="Products & Services"
         icon={Package}
         action={
-          <Button onClick={openCreate}>
-            <Plus className="h-4 w-4" /> Add Item
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="secondary"
+              onClick={() => window.open('/api/export/items.csv', '_blank')}
+              title="Export the item list to CSV"
+            >
+              <Download className="h-4 w-4" /> Export CSV
+            </Button>
+            <Button onClick={openCreate}>
+              <Plus className="h-4 w-4" /> Add Item
+            </Button>
+          </div>
         }
       />
 
       <Card>
         {loading ? (
-          <div className="py-16 text-center text-navy/40 text-sm">Loading items…</div>
-        ) : items.length === 0 ? (
-          <div className="py-16 text-center">
-            <Package className="mx-auto h-10 w-10 text-navy/20 mb-3" />
-            <p className="text-navy/40 text-sm">No items yet. Add your first product or service.</p>
+          <div className="flex items-center justify-center py-20 text-navy/40">
+            <Spinner className="h-6 w-6" />
           </div>
+        ) : items.length === 0 ? (
+          <EmptyState
+            icon={Package}
+            title="No items yet"
+            message="Add your first product or service to get started."
+            action={
+              <Button onClick={openCreate}>
+                <Plus className="h-4 w-4" /> Add Item
+              </Button>
+            }
+          />
         ) : (
           <Table>
             <thead>
@@ -231,8 +258,8 @@ export default function ItemsPage() {
                 <Th>SKU</Th>
                 <Th>Type</Th>
                 <Th>Description</Th>
-                <Th className="text-right">Sales Price</Th>
-                <Th className="text-right">Purchase Cost</Th>
+                <Th numeric>Sales Price</Th>
+                <Th numeric>Purchase Cost</Th>
                 <Th className="text-center">Taxable</Th>
                 <Th className="text-center">Actions</Th>
               </tr>
@@ -250,10 +277,10 @@ export default function ItemsPage() {
                   <Td className="text-navy/60 text-sm max-w-[200px] truncate">
                     {item.description ?? '—'}
                   </Td>
-                  <Td className="text-right tabular-nums">
+                  <Td numeric>
                     {item.salesPrice ? formatCurrency(item.salesPrice) : '—'}
                   </Td>
-                  <Td className="text-right tabular-nums">
+                  <Td numeric>
                     {item.purchaseCost ? formatCurrency(item.purchaseCost) : '—'}
                   </Td>
                   <Td className="text-center">
@@ -301,8 +328,8 @@ export default function ItemsPage() {
             <Button variant="secondary" onClick={closeModal} disabled={saving}>
               Cancel
             </Button>
-            <Button onClick={handleSubmit} disabled={saving}>
-              {saving ? 'Saving…' : editingItem ? 'Save Changes' : 'Create Item'}
+            <Button onClick={handleSubmit} loading={saving}>
+              {editingItem ? 'Save Changes' : 'Create Item'}
             </Button>
           </>
         }
@@ -380,31 +407,49 @@ export default function ItemsPage() {
               />
             </div>
           </div>
+
+          {form.type === 'inventory' && (
+            <div>
+              <Label htmlFor="item-reorder-point">Reorder Point</Label>
+              <Input
+                id="item-reorder-point"
+                type="number"
+                min="0"
+                step="0.0001"
+                value={form.reorderPoint}
+                onChange={(e) => setField('reorderPoint', e.target.value)}
+                placeholder="e.g. 10 — alerts when stock falls to or below this"
+              />
+            </div>
+          )}
         </form>
       </Modal>
 
       {/* Deactivate Confirmation Modal */}
-      <Modal
+      <ConfirmDialog
         open={!!confirmItem}
-        onClose={() => setConfirmItem(null)}
         title="Deactivate Item"
-        footer={
+        message={
           <>
-            <Button variant="secondary" onClick={() => setConfirmItem(null)} disabled={deactivating}>
-              Cancel
-            </Button>
-            <Button variant="danger" onClick={handleDeactivate} disabled={deactivating}>
-              {deactivating ? 'Deactivating…' : 'Deactivate'}
-            </Button>
+            Are you sure you want to deactivate{' '}
+            <span className="font-semibold text-navy">{confirmItem?.name}</span>? It will be hidden
+            from active lists but preserved on historical documents. You can reactivate it later.
           </>
         }
-      >
-        <p className="text-navy/70 text-sm">
-          Are you sure you want to deactivate{' '}
-          <span className="font-semibold text-navy">{confirmItem?.name}</span>? It will be hidden
-          from active lists but preserved on historical documents. You can reactivate it later.
-        </p>
-      </Modal>
+        confirmLabel="Deactivate"
+        tone="danger"
+        loading={deactivating}
+        onConfirm={handleDeactivate}
+        onClose={() => setConfirmItem(null)}
+      />
     </main>
+  );
+}
+
+export default function ItemsPage() {
+  return (
+    <Suspense fallback={null}>
+      <ItemsPageContent />
+    </Suspense>
   );
 }

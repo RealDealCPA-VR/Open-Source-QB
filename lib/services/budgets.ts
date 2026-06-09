@@ -41,11 +41,25 @@ export interface BudgetVsActualRow {
   accountId: string;
   code: string;
   name: string;
+  /** 'revenue' or 'expense' — balance-sheet accounts are not budgetable. */
+  accountType: 'revenue' | 'expense';
   /** Sum of all 12 monthly budget amounts for this account. */
   budget: string;
   /** Actual activity from the GL for the full fiscal year. */
   actual: string;
-  /** actual - budget (positive = over budget, negative = under budget). */
+  /** Raw signed variance: actual - budget. */
+  variance: string;
+  /**
+   * Favorability orientation: revenue is favorable when actual >= budget;
+   * expense is favorable when actual <= budget.
+   */
+  favorable: boolean;
+}
+
+export interface BudgetSectionTotals {
+  budget: string;
+  actual: string;
+  /** actual - budget. */
   variance: string;
 }
 
@@ -54,6 +68,18 @@ export interface BudgetVsActualReport {
   budgetName: string;
   fiscalYear: number;
   rows: BudgetVsActualRow[];
+  /** Income (revenue) section totals. */
+  income: BudgetSectionTotals;
+  /** Expense section totals. */
+  expense: BudgetSectionTotals;
+  /**
+   * Net bottom line (income - expense). The legacy totalBudget/totalActual/
+   * totalVariance fields carry these net figures — income and expenses are never
+   * summed together as one mixed total.
+   */
+  netBudget: string;
+  netActual: string;
+  netVariance: string;
   totalBudget: string;
   totalActual: string;
   totalVariance: string;
@@ -149,6 +175,12 @@ export async function setBudgetLine(
     .where(and(eq(accounts.id, accountId), eq(accounts.companyId, ctx.companyId)));
   if (!account) throw notFound('Account');
 
+  // Budgets compare against P&L actuals — balance-sheet accounts have no P&L
+  // activity to compare to and would always report actual = 0.
+  if (account.type !== 'revenue' && account.type !== 'expense') {
+    throw validation('Budget lines can only be set for revenue or expense accounts.');
+  }
+
   // Upsert: PGlite supports ON CONFLICT via Drizzle's onConflictDoUpdate.
   // The unique constraint is (budgetId, accountId, month) — enforced at app level since
   // there is no DB unique index defined in schema; we query-then-upsert.
@@ -229,19 +261,7 @@ export async function budgetVsActual(
     budgetByAccount.set(line.accountId, prev.plus(Money.of(line.amount)));
   }
 
-  if (budgetByAccount.size === 0) {
-    return {
-      budgetId,
-      budgetName: budget.name,
-      fiscalYear: budget.fiscalYear,
-      rows: [],
-      totalBudget: '0.00',
-      totalActual: '0.00',
-      totalVariance: '0.00',
-    };
-  }
-
-  // Fetch full-year P&L actuals.
+  // Fetch full-year P&L actuals (closing entries are already excluded there).
   const from = new Date(`${budget.fiscalYear}-01-01T00:00:00.000Z`);
   const to = new Date(`${budget.fiscalYear}-12-31T23:59:59.999Z`);
   const pl = await profitAndLoss(ctx, { from, to });
@@ -255,49 +275,84 @@ export async function budgetVsActual(
   // Fetch account metadata for all budgeted accounts.
   const accountIds = [...budgetByAccount.keys()];
   const accountRows = await ctx.db
-    .select({ id: accounts.id, code: accounts.code, name: accounts.name })
+    .select({ id: accounts.id, code: accounts.code, name: accounts.name, type: accounts.type })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId)));
 
-  const accountMeta = new Map(accountRows.map((a) => [a.id, { code: a.code, name: a.name }]));
+  const accountMeta = new Map(
+    accountRows.map((a) => [a.id, { code: a.code, name: a.name, type: a.type }]),
+  );
 
-  // Build result rows.
+  // Build result rows, sectioned into income vs expense — the two must never be
+  // summed into one mixed total (their natural balances point opposite ways).
   const rows: BudgetVsActualRow[] = [];
-  let totalBudget = Money.zero();
-  let totalActual = Money.zero();
+  let incomeBudget = Money.zero();
+  let incomeActual = Money.zero();
+  let expenseBudget = Money.zero();
+  let expenseActual = Money.zero();
 
   for (const accountId of accountIds) {
     const meta = accountMeta.get(accountId);
     if (!meta) continue; // account deleted — skip
+    // Legacy budget lines saved against balance-sheet accounts have no P&L actuals
+    // to compare to — skip them (setBudgetLine now rejects new ones).
+    if (meta.type !== 'revenue' && meta.type !== 'expense') continue;
 
+    const isRevenue = meta.type === 'revenue';
     const budgetAmt = budgetByAccount.get(accountId) ?? Money.zero();
     const actualAmt = Money.of(actualByAccount.get(accountId) ?? '0');
     const variance = actualAmt.minus(budgetAmt);
 
-    totalBudget = totalBudget.plus(budgetAmt);
-    totalActual = totalActual.plus(actualAmt);
+    if (isRevenue) {
+      incomeBudget = incomeBudget.plus(budgetAmt);
+      incomeActual = incomeActual.plus(actualAmt);
+    } else {
+      expenseBudget = expenseBudget.plus(budgetAmt);
+      expenseActual = expenseActual.plus(actualAmt);
+    }
 
     rows.push({
       accountId,
       code: meta.code,
       name: meta.name,
+      accountType: meta.type,
       budget: toAmountString(budgetAmt),
       actual: toAmountString(actualAmt),
       variance: toAmountString(variance),
+      // Over-target income is favorable; over-budget expense is unfavorable.
+      favorable: isRevenue
+        ? actualAmt.greaterThanOrEqualTo(budgetAmt)
+        : actualAmt.lessThanOrEqualTo(budgetAmt),
     });
   }
 
   rows.sort((a, b) => a.code.localeCompare(b.code));
 
-  const totalVariance = totalActual.minus(totalBudget);
+  const netBudget = incomeBudget.minus(expenseBudget);
+  const netActual = incomeActual.minus(expenseActual);
+  const netVariance = netActual.minus(netBudget);
 
   return {
     budgetId,
     budgetName: budget.name,
     fiscalYear: budget.fiscalYear,
     rows,
-    totalBudget: toAmountString(totalBudget),
-    totalActual: toAmountString(totalActual),
-    totalVariance: toAmountString(totalVariance),
+    income: {
+      budget: toAmountString(incomeBudget),
+      actual: toAmountString(incomeActual),
+      variance: toAmountString(incomeActual.minus(incomeBudget)),
+    },
+    expense: {
+      budget: toAmountString(expenseBudget),
+      actual: toAmountString(expenseActual),
+      variance: toAmountString(expenseActual.minus(expenseBudget)),
+    },
+    netBudget: toAmountString(netBudget),
+    netActual: toAmountString(netActual),
+    netVariance: toAmountString(netVariance),
+    // Legacy fields now carry the net bottom line (income - expense).
+    totalBudget: toAmountString(netBudget),
+    totalActual: toAmountString(netActual),
+    totalVariance: toAmountString(netVariance),
   };
 }

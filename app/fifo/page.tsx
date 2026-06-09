@@ -1,23 +1,26 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import { Layers, Plus, ArrowDownCircle, ArrowUpCircle } from 'lucide-react';
+import { Fragment, useEffect, useState } from 'react';
+import { Layers, Plus, ArrowDownCircle, ArrowUpCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import {
   Button,
   Card,
   Input,
   Label,
+  Select,
   Table,
   Th,
   Td,
   Tr,
   Modal,
   PageHeader,
+  EmptyState,
+  Spinner,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { formatDate } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -129,8 +132,8 @@ export default function FifoPage() {
 
   async function fetchItems() {
     try {
-      const data = await api.get<ItemOption[]>('/api/items?type=inventory');
-      setItems(data);
+      const data = await api.get<{ items: ItemOption[] }>('/api/items?type=inventory');
+      setItems(data.items ?? []);
     } catch {
       // non-critical; items list degrades gracefully
     }
@@ -267,14 +270,21 @@ export default function FifoPage() {
 
       <Card>
         {loading ? (
-          <div className="p-12 text-center text-navy/40 text-sm">Loading FIFO valuation...</div>
-        ) : !valuation || valuation.items.length === 0 ? (
-          <div className="p-12 text-center">
-            <Layers className="mx-auto h-10 w-10 text-navy/20 mb-3" />
-            <p className="text-navy/50 text-sm">
-              No inventory layers found. Use "Receive Stock" to add the first lot.
-            </p>
+          <div className="flex items-center justify-center gap-2 p-12 text-navy/40 text-sm">
+            <Spinner className="h-4 w-4" /> Loading FIFO valuation...
           </div>
+        ) : !valuation || valuation.items.length === 0 ? (
+          <EmptyState
+            icon={Layers}
+            title="No inventory layers yet"
+            message="Receive stock to record your first FIFO cost layer."
+            action={
+              <Button onClick={openReceive}>
+                <Plus className="h-4 w-4" />
+                Receive Stock
+              </Button>
+            }
+          />
         ) : (
           <>
             <Table>
@@ -283,33 +293,37 @@ export default function FifoPage() {
                   <Th></Th>
                   <Th>Item</Th>
                   <Th>SKU</Th>
-                  <Th className="text-right">Total Qty</Th>
-                  <Th className="text-right">FIFO Value</Th>
-                  <Th className="text-right">Actions</Th>
+                  <Th numeric>Total Qty</Th>
+                  <Th numeric>FIFO Value</Th>
+                  <Th numeric>Actions</Th>
                 </tr>
               </thead>
               <tbody>
                 {valuation.items.map((item) => (
-                  <>
-                    <Tr key={item.itemId}>
+                  <Fragment key={item.itemId}>
+                    <Tr>
                       <Td>
                         <button
                           onClick={() => toggleExpanded(item.itemId)}
                           className="text-navy/40 hover:text-navy transition-colors"
                           title={expanded.has(item.itemId) ? 'Collapse layers' : 'Expand layers'}
                         >
-                          {expanded.has(item.itemId) ? '▼' : '▶'}
+                          {expanded.has(item.itemId) ? (
+                            <ChevronDown className="h-4 w-4" />
+                          ) : (
+                            <ChevronRight className="h-4 w-4" />
+                          )}
                         </button>
                       </Td>
                       <Td className="font-semibold text-navy">{item.itemName}</Td>
-                      <Td className="text-navy/60 font-mono text-xs">{item.sku ?? '-'}</Td>
-                      <Td className="text-right font-mono text-navy">
+                      <Td className="text-navy/60 text-xs">{item.sku ?? '-'}</Td>
+                      <Td numeric className="text-navy">
                         {parseFloat(item.totalQuantity).toLocaleString(undefined, { maximumFractionDigits: 4 })}
                       </Td>
-                      <Td className="text-right font-mono font-semibold text-navy">
+                      <Td numeric className="font-semibold text-navy">
                         {formatCurrency(item.totalValue)}
                       </Td>
-                      <Td className="text-right">
+                      <Td numeric>
                         <Button
                           variant="ghost"
                           size="sm"
@@ -332,22 +346,20 @@ export default function FifoPage() {
                           <Td colSpan={1} className="pl-8 text-navy/50">
                             Layer {idx + 1}
                           </Td>
-                          <Td className="text-navy/50">
-                            {new Date(layer.date).toLocaleDateString()}
-                          </Td>
-                          <Td className="text-right font-mono">
+                          <Td className="text-navy/50">{formatDate(layer.date)}</Td>
+                          <Td numeric>
                             {parseFloat(layer.quantityRemaining).toLocaleString(undefined, {
                               maximumFractionDigits: 4,
                             })}{' '}
                             <span className="text-navy/40">@ {formatCurrency(layer.unitCost)}</span>
                           </Td>
-                          <Td className="text-right font-mono">
+                          <Td numeric>
                             {formatCurrency(layer.layerValue)}
                           </Td>
                           <Td></Td>
                         </tr>
                       ))}
-                  </>
+                  </Fragment>
                 ))}
               </tbody>
             </Table>
@@ -357,7 +369,7 @@ export default function FifoPage() {
               <span className="text-sm font-semibold text-navy/60 uppercase tracking-wide">
                 Grand Total
               </span>
-              <span className="font-mono text-lg font-bold text-navy">
+              <span className="tabular-nums text-lg font-bold text-navy">
                 {formatCurrency(valuation.grandTotal)}
               </span>
             </div>
@@ -375,25 +387,32 @@ export default function FifoPage() {
             <Button variant="secondary" onClick={() => setReceiveOpen(false)} disabled={receiveSaving}>
               Cancel
             </Button>
-            <Button onClick={handleReceive} disabled={receiveSaving}>
+            <Button type="submit" form="receive-form" loading={receiveSaving}>
               <ArrowDownCircle className="h-4 w-4" />
-              {receiveSaving ? 'Posting...' : 'Receive & Post GL'}
+              Receive &amp; Post GL
             </Button>
           </>
         }
       >
-        <div className="flex flex-col gap-4">
+        <form
+          id="receive-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleReceive();
+          }}
+          className="flex flex-col gap-4"
+        >
           <div>
             <Label htmlFor="receive-item">Item *</Label>
-            <select
+            <Select
               id="receive-item"
+              autoFocus
               value={receiveForm.itemId}
               onChange={(e) => updateReceive('itemId', e.target.value)}
-              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy bg-white outline-none focus:border-electric focus:ring-2 focus:ring-electric/30"
             >
               <option value="">-- select item --</option>
               {itemSelectOptions}
-            </select>
+            </Select>
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div>
@@ -442,7 +461,7 @@ export default function FifoPage() {
           <p className="text-xs text-navy/50">
             GL: Dr 1300 Inventory / Cr 3000 Owner's Equity for qty &times; unit cost.
           </p>
-        </div>
+        </form>
       </Modal>
 
       {/* ---- Consume stock modal ---- */}
@@ -455,25 +474,32 @@ export default function FifoPage() {
             <Button variant="secondary" onClick={() => setConsumeOpen(false)} disabled={consumeSaving}>
               Cancel
             </Button>
-            <Button onClick={handleConsume} disabled={consumeSaving}>
+            <Button type="submit" form="consume-form" loading={consumeSaving}>
               <ArrowUpCircle className="h-4 w-4" />
-              {consumeSaving ? 'Posting...' : 'Consume & Post COGS'}
+              Consume &amp; Post COGS
             </Button>
           </>
         }
       >
-        <div className="flex flex-col gap-4">
+        <form
+          id="consume-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleConsume();
+          }}
+          className="flex flex-col gap-4"
+        >
           <div>
             <Label htmlFor="consume-item">Item *</Label>
-            <select
+            <Select
               id="consume-item"
+              autoFocus
               value={consumeForm.itemId}
               onChange={(e) => updateConsume('itemId', e.target.value)}
-              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy bg-white outline-none focus:border-electric focus:ring-2 focus:ring-electric/30"
             >
               <option value="">-- select item --</option>
               {itemSelectOptions}
-            </select>
+            </Select>
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div>
@@ -510,10 +536,8 @@ export default function FifoPage() {
           <p className="text-xs text-navy/50">
             Oldest cost layers are depleted first (FIFO). GL: Dr 5000 COGS / Cr 1300 Inventory.
           </p>
-        </div>
+        </form>
       </Modal>
-
-      <Toaster />
     </main>
   );
 }

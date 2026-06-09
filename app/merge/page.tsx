@@ -3,12 +3,14 @@
 /**
  * Merge Duplicates page — /merge
  *
- * Lets the user select a record type (customer or vendor), choose a "From"
- * (duplicate to fold away) and a "To" (master to keep), review a prominent
- * warning, then confirm the irreversible merge.
+ * Lets the user select a record type (customer, vendor, or account), choose a
+ * "From" (duplicate to fold away) and a "To" (master to keep), review a
+ * prominent warning, then confirm the irreversible merge.
  *
- * The merge service handles all document reassignment and deactivation in a
- * single database transaction; no GL entries are touched.
+ * The merge service handles all reassignment and deactivation in a single
+ * database transaction. Customer/vendor merges never touch the GL; account
+ * merges re-point the journal lines themselves and recompute the survivor's
+ * cached balance (same-type accounts only).
  */
 import { useEffect, useState, useCallback } from 'react';
 import { GitMerge, AlertTriangle } from 'lucide-react';
@@ -19,10 +21,11 @@ import {
   Select,
   PageHeader,
   Modal,
+  Spinner,
   toast,
-  Toaster,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { formatCurrency } from '@/lib/money';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -42,11 +45,35 @@ interface Vendor {
   isActive: boolean;
 }
 
-type RecordType = 'customer' | 'vendor';
+interface GLAccount {
+  id: string;
+  code: string;
+  name: string;
+  type: string;
+  isActive: boolean;
+}
+
+type RecordType = 'customer' | 'vendor' | 'account';
+
+const TYPE_LABEL: Record<RecordType, string> = {
+  customer: 'customer',
+  vendor: 'vendor',
+  account: 'account',
+};
 
 interface MergeResult {
   deactivatedId: string;
   reassigned: Record<string, number>;
+  /** Account merges only: the survivor's recomputed balance. */
+  newBalance?: string;
+}
+
+/** Uniform option shape across the three record types. */
+interface RecordOption {
+  id: string;
+  label: string;
+  /** GL account type (asset/liability/...) — undefined for customers/vendors. */
+  accountType?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +97,7 @@ function ConfirmMergeModal({
   toName: string;
   merging: boolean;
 }) {
-  const entity = type === 'customer' ? 'customer' : 'vendor';
+  const entity = TYPE_LABEL[type];
   return (
     <Modal
       open={open}
@@ -81,8 +108,8 @@ function ConfirmMergeModal({
           <Button variant="secondary" onClick={onClose} disabled={merging}>
             Cancel
           </Button>
-          <Button variant="danger" onClick={onConfirm} disabled={merging}>
-            {merging ? 'Merging…' : 'Yes, Merge'}
+          <Button variant="danger" onClick={onConfirm} loading={merging}>
+            Yes, Merge
           </Button>
         </>
       }
@@ -110,8 +137,8 @@ function ConfirmMergeModal({
               </p>
               <p className="font-medium text-navy">{fromName}</p>
             </div>
-            <div className="p-4 bg-emerald-50/50">
-              <p className="text-xs font-semibold text-emerald-600 uppercase tracking-wide mb-1">
+            <div className="p-4 bg-emerald/10">
+              <p className="text-xs font-semibold text-emerald uppercase tracking-wide mb-1">
                 To (master record)
               </p>
               <p className="font-medium text-navy">{toName}</p>
@@ -130,7 +157,7 @@ function ConfirmMergeModal({
 function ResultSummary({ result, type }: { result: MergeResult; type: RecordType }) {
   const entries = Object.entries(result.reassigned).filter(([, count]) => count > 0);
   return (
-    <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800 space-y-1">
+    <div className="rounded-lg border border-emerald/30 bg-emerald/10 px-4 py-3 text-sm text-emerald space-y-1">
       <p className="font-semibold">Merge complete.</p>
       {entries.length > 0 ? (
         <ul className="list-disc list-inside space-y-0.5">
@@ -142,6 +169,11 @@ function ResultSummary({ result, type }: { result: MergeResult; type: RecordType
         </ul>
       ) : (
         <p>No linked documents found — {type} deactivated with nothing to reassign.</p>
+      )}
+      {result.newBalance !== undefined && (
+        <p>
+          Surviving account balance recomputed: <strong>{formatCurrency(result.newBalance)}</strong>
+        </p>
       )}
     </div>
   );
@@ -155,6 +187,7 @@ export default function MergePage() {
   const [recordType, setRecordType] = useState<RecordType>('customer');
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
+  const [glAccounts, setGlAccounts] = useState<GLAccount[]>([]);
   const [loading, setLoading] = useState(false);
 
   const [fromId, setFromId] = useState('');
@@ -192,10 +225,23 @@ export default function MergePage() {
     }
   }, []);
 
+  const fetchGlAccounts = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await api.get<GLAccount[]>('/api/accounts');
+      setGlAccounts(data.filter((a) => a.isActive));
+    } catch {
+      toast('Failed to load accounts.', 'danger');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     fetchCustomers();
     fetchVendors();
-  }, [fetchCustomers, fetchVendors]);
+    fetchGlAccounts();
+  }, [fetchCustomers, fetchVendors, fetchGlAccounts]);
 
   // Reset selections when type changes.
   useEffect(() => {
@@ -208,15 +254,39 @@ export default function MergePage() {
   // Helpers
   // ---------------------------------------------------------------------------
 
-  const records: (Customer | Vendor)[] =
-    recordType === 'customer' ? customers : vendors;
+  const records: RecordOption[] =
+    recordType === 'account'
+      ? glAccounts.map((a) => ({
+          id: a.id,
+          label: `${a.code} · ${a.name} (${a.type})`,
+          accountType: a.type,
+        }))
+      : (recordType === 'customer' ? customers : vendors).map((r) => ({
+          id: r.id,
+          label:
+            r.companyName && r.companyName !== r.displayName
+              ? `${r.displayName} — ${r.companyName}`
+              : r.displayName,
+        }));
 
   function nameFor(id: string) {
-    return records.find((r) => r.id === id)?.displayName ?? id;
+    return records.find((r) => r.id === id)?.label ?? id;
   }
 
+  function accountTypeFor(id: string) {
+    return records.find((r) => r.id === id)?.accountType;
+  }
+
+  /** Account merges require matching GL types (asset↔asset, expense↔expense, …). */
+  const typeMismatch =
+    recordType === 'account' &&
+    !!fromId &&
+    !!toId &&
+    fromId !== toId &&
+    accountTypeFor(fromId) !== accountTypeFor(toId);
+
   function canMerge() {
-    return fromId && toId && fromId !== toId;
+    return fromId && toId && fromId !== toId && !typeMismatch;
   }
 
   // ---------------------------------------------------------------------------
@@ -242,8 +312,10 @@ export default function MergePage() {
       // Refresh lists so the deactivated record disappears.
       if (recordType === 'customer') {
         fetchCustomers();
-      } else {
+      } else if (recordType === 'vendor') {
         fetchVendors();
+      } else {
+        fetchGlAccounts();
       }
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Merge failed.', 'danger');
@@ -258,14 +330,14 @@ export default function MergePage() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-offwhite via-[#e8ecf3] to-slate-100 p-8 font-sans">
-      <Toaster />
       <PageHeader title="Merge Duplicates" icon={GitMerge} />
 
       <Card className="p-6 max-w-xl">
         <p className="text-sm text-navy/60 mb-6">
-          Merge a duplicate customer or vendor into its master record. All linked documents
-          (invoices, bills, payments, etc.) will be reassigned to the master. The duplicate
-          will be deactivated. This operation cannot be undone.
+          Merge a duplicate customer, vendor, or GL account into its master record. All linked
+          documents (invoices, bills, payments, etc.) will be reassigned to the master. Account
+          merges also move the journal history and require both accounts to be the same type.
+          The duplicate will be deactivated. This operation cannot be undone.
         </p>
 
         {/* Record type */}
@@ -278,11 +350,14 @@ export default function MergePage() {
           >
             <option value="customer">Customer</option>
             <option value="vendor">Vendor</option>
+            <option value="account">Account</option>
           </Select>
         </div>
 
         {loading ? (
-          <p className="text-sm text-navy/40 py-6 text-center">Loading…</p>
+          <div className="flex items-center justify-center gap-2 text-sm text-navy/40 py-6">
+            <Spinner className="h-4 w-4" /> Loading…
+          </div>
         ) : (
           <>
             {/* From */}
@@ -304,10 +379,7 @@ export default function MergePage() {
                   .filter((r) => r.id !== toId)
                   .map((r) => (
                     <option key={r.id} value={r.id}>
-                      {r.displayName}
-                      {r.companyName && r.companyName !== r.displayName
-                        ? ` — ${r.companyName}`
-                        : ''}
+                      {r.label}
                     </option>
                   ))}
               </Select>
@@ -317,7 +389,7 @@ export default function MergePage() {
             <div className="mb-6">
               <Label htmlFor="merge-to">
                 To{' '}
-                <span className="text-emerald-600 font-normal">(master — will be kept)</span>
+                <span className="text-emerald font-normal">(master — will be kept)</span>
               </Label>
               <Select
                 id="merge-to"
@@ -332,17 +404,22 @@ export default function MergePage() {
                   .filter((r) => r.id !== fromId)
                   .map((r) => (
                     <option key={r.id} value={r.id}>
-                      {r.displayName}
-                      {r.companyName && r.companyName !== r.displayName
-                        ? ` — ${r.companyName}`
-                        : ''}
+                      {r.label}
                     </option>
                   ))}
               </Select>
             </div>
 
+            {/* Account merges require matching GL types */}
+            {typeMismatch && (
+              <p className="text-sm text-red-500 mb-5">
+                Accounts must be the same type to merge ({accountTypeFor(fromId)} vs{' '}
+                {accountTypeFor(toId)}).
+              </p>
+            )}
+
             {/* Inline warning when selections are made */}
-            {fromId && toId && fromId !== toId && (
+            {fromId && toId && fromId !== toId && !typeMismatch && (
               <div className="flex items-start gap-2 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-sm text-amber-800 mb-5">
                 <AlertTriangle className="h-4 w-4 text-amber-500 mt-0.5 shrink-0" />
                 <span>
@@ -365,7 +442,12 @@ export default function MergePage() {
               onClick={() => setShowConfirm(true)}
             >
               <GitMerge className="h-4 w-4" />
-              Merge {recordType === 'customer' ? 'Customers' : 'Vendors'}
+              Merge{' '}
+              {recordType === 'customer'
+                ? 'Customers'
+                : recordType === 'vendor'
+                  ? 'Vendors'
+                  : 'Accounts'}
             </Button>
 
             {/* Result summary */}

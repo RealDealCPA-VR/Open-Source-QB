@@ -20,6 +20,7 @@
     "typecheck": "tsc --noEmit",
     "electron:dev": "electron .",
     "desktop": "concurrently -k -s first -n NEXT,APP -c blue,green \"next dev\" \"wait-on tcp:127.0.0.1:3000 && electron .\"",
+    "make-dev-shortcut": "powershell -ExecutionPolicy Bypass -File scripts/make-dev-shortcut.ps1",
     "desktop:pack": "npm run build && electron-builder --dir",
     "desktop:dist": "npm run build && electron-builder"
   },
@@ -41,6 +42,7 @@
     "nodemailer": "^8.0.10",
     "papaparse": "^5.5.3",
     "pdf-lib": "^1.17.1",
+    "qrcode.react": "^4.2.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "tailwind-merge": "^2.6.0",
@@ -84,7 +86,9 @@
         "to": "app",
         "filter": [
           "**/*",
-          "!node_modules"
+          "!node_modules",
+          "!.env",
+          "!.env.*"
         ]
       },
       {
@@ -113,6 +117,16 @@
         "portable"
       ],
       "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "BookKeeper AI",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
     },
     "mac": {
       "target": [
