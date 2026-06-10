@@ -24,6 +24,7 @@ interface DesktopBridgeApi {
   onMenu?: (cb: (action: string) => void) => Unsubscribe;
   onNavigate?: (cb: (route: string) => void) => Unsubscribe;
   quitAndInstall?: () => Promise<boolean>;
+  company?: { newFile?: () => Promise<unknown>; open?: () => Promise<unknown> };
 }
 
 function bridge(): DesktopBridgeApi | undefined {
@@ -34,8 +35,6 @@ function bridge(): DesktopBridgeApi | undefined {
 const MENU_ROUTES: Record<string, string> = {
   import: '/banking',
   backup: '/backup',
-  'new-company': '/companies',
-  'open-company': '/companies',
 };
 
 export default function DesktopBridge() {
@@ -51,6 +50,15 @@ export default function DesktopBridge() {
       if (action === 'update-ready') {
         setUpdateReady(true);
         toast('Update downloaded — restart to apply it.', 'info');
+        return;
+      }
+      // New/Open Company open native folder dialogs (the company-file model lives in the shell).
+      if (action === 'new-company') {
+        b.company?.newFile?.();
+        return;
+      }
+      if (action === 'open-company') {
+        b.company?.open?.();
         return;
       }
       const route = MENU_ROUTES[action];

@@ -22,5 +22,14 @@ contextBridge.exposeInMainWorld('bookkeeper', {
   },
   /** Apply a downloaded update now (quit, install, relaunch). Resolves false if none is staged. */
   quitAndInstall: () => ipcRenderer.invoke('app:quitAndInstall'),
+  /** Company-file management (the "file lives wherever you put it" model). */
+  company: {
+    current: () => ipcRenderer.invoke('company:current'),
+    recent: () => ipcRenderer.invoke('company:recent'),
+    newFile: () => ipcRenderer.invoke('company:new'),
+    open: () => ipcRenderer.invoke('company:open'),
+    switch: (dir) => ipcRenderer.invoke('company:switch', dir),
+    setProtected: (val) => ipcRenderer.invoke('company:setProtected', val),
+  },
   isDesktop: true,
 });

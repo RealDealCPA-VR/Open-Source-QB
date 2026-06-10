@@ -17,7 +17,9 @@ import { users } from '@/lib/db/schema';
 
 export const SESSION_COOKIE = 'bka_session';
 export const PORTAL_COOKIE = 'bka_portal'; // employee self-service session
+export const UNLOCK_COOKIE = 'bka_unlock'; // file-open password (QB-style company file lock)
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30; // 30 days
+const UNLOCK_TTL_MS = 1000 * 60 * 60 * 12; // 12h within a single launch
 
 function secret(): string {
   if (process.env.BKA_AUTH_SECRET) return process.env.BKA_AUTH_SECRET;
@@ -71,6 +73,63 @@ export function verifySessionToken(
     return { userId: data.userId };
   } catch {
     return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// File-open lock ("company file password", QuickBooks-Desktop style)
+//
+// A company file is one PGlite data directory. An optional file password gates OPENING
+// the whole file. The unlock token is bound to (a) the active data directory and (b) a
+// per-launch nonce (the desktop shell's internal token), so an unlock never leaks across
+// switching/relaunching into a different file and must be re-entered each time the file
+// is opened — cookies on 127.0.0.1 otherwise persist across launches.
+// ---------------------------------------------------------------------------
+
+/** Per-launch nonce. In the packaged app the Electron shell sets a fresh token per launch. */
+function launchNonce(): string {
+  return process.env.BKA_INTERNAL_TOKEN || '';
+}
+
+export function createUnlockToken(): string {
+  const payload = JSON.stringify({
+    dir: resolveDataDir(),
+    nonce: launchNonce(),
+    exp: Date.now() + UNLOCK_TTL_MS,
+  });
+  const body = Buffer.from(payload).toString('base64url');
+  return `${body}.${sign(body)}`;
+}
+
+export function verifyUnlockToken(token: string | undefined | null): boolean {
+  if (!token) return false;
+  const [body, sig] = token.split('.');
+  if (!body || !sig) return false;
+  const expected = sign(body);
+  if (
+    sig.length !== expected.length ||
+    !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))
+  ) {
+    return false;
+  }
+  try {
+    const data = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    if (typeof data.exp !== 'number' || Date.now() > data.exp) return false;
+    if (data.dir !== resolveDataDir()) return false;
+    if ((data.nonce ?? '') !== launchNonce()) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** True when the current request carries a valid unlock cookie for THIS company file. */
+export async function hasValidUnlockCookie(): Promise<boolean> {
+  try {
+    const store = await cookies();
+    return verifyUnlockToken(store.get(UNLOCK_COOKIE)?.value);
+  } catch {
+    return false;
   }
 }
 

@@ -11,9 +11,10 @@ import { cookies, headers } from 'next/headers';
 import { and, eq } from 'drizzle-orm';
 import { getDb, type DB } from '@/lib/db';
 import { ensureDevCompany, verifyClosingDatePassword } from '@/lib/services/company';
+import { getFileLockStatus } from '@/lib/services/fileLock';
 import { getRole } from '@/lib/services/rbac';
 import { companies, userCompanies, users } from '@/lib/db/schema';
-import { getSessionUserId } from '@/lib/auth';
+import { getSessionUserId, hasValidUnlockCookie } from '@/lib/auth';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 
 export const COMPANY_COOKIE = 'bka_company';
@@ -49,6 +50,16 @@ async function resolveClosingDateOverride(db: DB, companyId: string): Promise<bo
 
 export async function getServerContext(): Promise<ServiceContext> {
   const db = await getDb();
+
+  // File-open password (QB-style company file lock). Enforced here so it covers EVERY API route
+  // and server render — even when the file has no user accounts (the standalone-file-password
+  // model, where getServerContext would otherwise fall open for first-run seeding). Page
+  // navigation is additionally redirected to /unlock by middleware for a friendly prompt.
+  const lock = await getFileLockStatus(db);
+  if (lock.enabled && !(await hasValidUnlockCookie())) {
+    throw new ServiceError('FORBIDDEN', 'This company file is locked. Unlock it to continue.');
+  }
+
   const userId = await getSessionUserId();
 
   if (userId) {

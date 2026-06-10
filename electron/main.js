@@ -13,6 +13,7 @@ const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const net = require('node:net');
+const companyFile = require('./companyFile');
 
 const isDev = !app.isPackaged;
 let mainWindow = null;
@@ -254,7 +255,7 @@ function companiesRoot() {
 /**
  * Active company data directory, in priority order:
  *  1. BKA_DATA_DIR env var (one-shot override, e.g. scripted/portable launches)
- *  2. config.json dataDir (set by File > Open Company Folder / Recent Companies)
+ *  2. config.json dataDir (set by File > Open/New Company / Recent Companies)
  *  3. userData/companies/default (first run)
  */
 function activeCompanyDir() {
@@ -350,15 +351,51 @@ function waitForServer(port, timeoutMs = 20000) {
   });
 }
 
-async function pickCompanyFolder() {
+// New Company: always ask for a name + location (a Save dialog), create the folder, seed a
+// manifest, and relaunch into the fresh (empty) file — onboarding then sets up the chart of
+// accounts. The "file" is a self-contained folder the user can place anywhere (incl. a server
+// or network drive).
+async function createCompanyFlow() {
+  const res = await dialog.showSaveDialog(mainWindow, {
+    title: 'New Company File',
+    message: 'Choose a name and location for the new company file',
+    buttonLabel: 'Create',
+    defaultPath: path.join(app.getPath('documents'), 'My Company.bookkeeper'),
+    filters: [{ name: 'BookKeeper Company', extensions: ['bookkeeper'] }],
+    properties: ['createDirectory', 'showOverwriteConfirmation'],
+  });
+  if (res.canceled || !res.filePath) return;
+  const target = res.filePath;
+  const name = path.basename(target).replace(/\.bookkeeper$/i, '');
+  try {
+    if (fs.existsSync(target) && fs.readdirSync(target).length > 0) {
+      dialog.showErrorBox(
+        'Folder not empty',
+        'That location already contains files. Choose a new name or an empty folder for the company file.',
+      );
+      return;
+    }
+    fs.mkdirSync(target, { recursive: true });
+  } catch (e) {
+    dialog.showErrorBox('Could not create company file', String((e && e.message) || e));
+    return;
+  }
+  companyFile.writeManifest(target, { name, createdAt: new Date().toISOString() });
+  openCompanyDir(target);
+}
+
+// Open Company: browse to an existing company-file folder anywhere and relaunch into it.
+async function openCompanyFlow() {
   const res = await dialog.showOpenDialog(mainWindow, {
-    title: 'Open Company Folder',
-    message: 'Choose the data folder for the company file to open',
+    title: 'Open Company File',
+    message: 'Choose a company file folder to open',
     properties: ['openDirectory', 'createDirectory'],
-    defaultPath: companiesRoot(),
+    defaultPath: app.getPath('documents'),
   });
   if (res.canceled || !res.filePaths[0]) return;
-  openCompanyDir(res.filePaths[0]);
+  const dir = res.filePaths[0];
+  companyFile.ensureManifest(dir);
+  openCompanyDir(dir);
 }
 
 function buildMenu() {
@@ -368,7 +405,7 @@ function buildMenu() {
     (d) => typeof d === 'string',
   );
   const recentItems = recents.map((dir) => ({
-    label: dir === current ? `${path.basename(dir)} (current)` : path.basename(dir),
+    label: dir === current ? `${companyFile.companyName(dir)} (current)` : companyFile.companyName(dir),
     sublabel: dir,
     enabled: dir !== current,
     click: () => openCompanyDir(dir),
@@ -377,9 +414,8 @@ function buildMenu() {
     {
       label: 'File',
       submenu: [
-        { label: 'New Company…', click: () => mainWindow?.webContents.send('menu', 'new-company') },
-        { label: 'Open Company…', click: () => mainWindow?.webContents.send('menu', 'open-company') },
-        { label: 'Open Company Folder…', click: () => { pickCompanyFolder(); } },
+        { label: 'New Company…', accelerator: 'CmdOrCtrl+Shift+N', click: () => { createCompanyFlow(); } },
+        { label: 'Open Company…', accelerator: 'CmdOrCtrl+O', click: () => { openCompanyFlow(); } },
         {
           label: 'Recent Companies',
           submenu: recentItems.length
@@ -447,7 +483,11 @@ async function createWindow() {
 
   await mainWindow.loadURL(url);
   if (isDev) mainWindow.webContents.openDevTools({ mode: 'detach' });
-  rememberRecentCompany(activeCompanyDir());
+  // Ensure the active file is self-describing (manifest) and stamp its last-opened time.
+  const activeDir = activeCompanyDir();
+  companyFile.ensureManifest(activeDir);
+  companyFile.writeManifest(activeDir, { lastOpenedAt: new Date().toISOString() });
+  rememberRecentCompany(activeDir);
   buildMenu();
   runDueRecurring(url);
   scheduleAutoBackups();
@@ -499,6 +539,34 @@ ipcMain.handle('dialog:saveFile', async (_e, { defaultName, content }) => {
 });
 
 ipcMain.handle('app:dataDir', () => activeCompanyDir());
+
+// ---------------------------------------------------------------------------
+// Company-file management (drives the in-app "Company File" screen)
+// ---------------------------------------------------------------------------
+ipcMain.handle('company:current', () => {
+  const dir = activeCompanyDir();
+  const m = companyFile.readManifest(dir) || {};
+  return { dir, name: companyFile.companyName(dir), passwordProtected: Boolean(m.passwordProtected) };
+});
+ipcMain.handle('company:recent', () => {
+  const cfg = loadConfig();
+  const current = activeCompanyDir();
+  return (Array.isArray(cfg.recentCompanies) ? cfg.recentCompanies : [])
+    .filter((d) => typeof d === 'string')
+    .map((dir) => ({ dir, name: companyFile.companyName(dir), current: dir === current }));
+});
+ipcMain.handle('company:new', () => { createCompanyFlow(); return true; });
+ipcMain.handle('company:open', () => { openCompanyFlow(); return true; });
+ipcMain.handle('company:switch', (_e, dir) => {
+  if (typeof dir === 'string' && dir) openCompanyDir(dir);
+  return true;
+});
+// Keep the manifest's display hint in sync after the file password is toggled in the UI, so
+// Open/Recent can show a lock icon without opening the database.
+ipcMain.handle('company:setProtected', (_e, val) => {
+  companyFile.writeManifest(activeCompanyDir(), { passwordProtected: Boolean(val) });
+  return true;
+});
 
 app.on('second-instance', (_event, argv) => {
   if (mainWindow) {

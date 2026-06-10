@@ -12,7 +12,7 @@ import {
   ShoppingCart, PiggyBank, FileSpreadsheet, CalendarClock, Briefcase as BriefcaseIcon,
   Layers, ShieldCheck, Network, Landmark, FileClock, Paperclip, BadgeCheck,
   ListChecks, GitMerge, FileX, Clock, Timer, Boxes, Wallet, Percent, Combine,
-  GitCompareArrows, CalendarRange, PackageSearch, Scale, BadgePercent, Car,
+  GitCompareArrows, CalendarRange, PackageSearch, Scale, BadgePercent, Car, HardDrive,
 } from 'lucide-react';
 
 export interface NavLink {
@@ -135,6 +135,7 @@ export const navGroups: NavGroup[] = [
     heading: 'Setup',
     links: [
       { icon: Building2, label: 'Companies', path: '/companies' },
+      { icon: HardDrive, label: 'Company File', path: '/company-file' },
       { icon: ShieldCheck, label: 'Security (2FA)', path: '/security' },
       { icon: Settings, label: 'Settings', path: '/settings' },
     ],

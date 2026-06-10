@@ -11,7 +11,8 @@ const PUBLIC_PREFIXES = ['/login', '/signup', '/onboarding', '/reset-password'];
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
-  // Employee self-service portal has its own session (bka_portal).
+  // Employee self-service portal has its own session (bka_portal) and is exempt from the
+  // company-file lock (employees authenticate with their own portal login).
   if (pathname === '/portal/login') return NextResponse.next();
   if (pathname === '/portal' || pathname.startsWith('/portal/')) {
     if (!req.cookies.get('bka_portal')) {
@@ -20,6 +21,17 @@ export function middleware(req: NextRequest) {
       return NextResponse.redirect(url);
     }
     return NextResponse.next();
+  }
+
+  // Company-file lock (QB-style "open this file" password). If this launch hasn't been unlocked,
+  // send page navigation to /unlock — which auto-passes instantly when no file password is set,
+  // and otherwise prompts. This runs before the login gate so the file password comes first.
+  // (API routes aren't in the matcher; getServerContext enforces the lock there.)
+  if (pathname !== '/unlock' && !req.cookies.get('bka_unlock')) {
+    const url = req.nextUrl.clone();
+    url.pathname = '/unlock';
+    url.searchParams.set('next', pathname);
+    return NextResponse.redirect(url);
   }
 
   if (

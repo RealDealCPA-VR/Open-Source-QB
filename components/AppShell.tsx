@@ -15,7 +15,7 @@ import { Modal, toast } from '@/components/ui';
 import { Briefcase, Building2, ChevronDown, LogOut } from 'lucide-react';
 
 // Routes that render without the app chrome (full-screen).
-const BARE = ['/login', '/signup', '/onboarding', '/reset-password', '/portal'];
+const BARE = ['/login', '/signup', '/onboarding', '/reset-password', '/portal', '/unlock'];
 
 interface CompanyRow {
   id: string;
