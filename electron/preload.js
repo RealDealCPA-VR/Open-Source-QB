@@ -20,5 +20,7 @@ contextBridge.exposeInMainWorld('bookkeeper', {
     ipcRenderer.on('navigate', handler);
     return () => ipcRenderer.removeListener('navigate', handler);
   },
+  /** Apply a downloaded update now (quit, install, relaunch). Resolves false if none is staged. */
+  quitAndInstall: () => ipcRenderer.invoke('app:quitAndInstall'),
   isDesktop: true,
 });

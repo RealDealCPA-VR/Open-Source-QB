@@ -81,7 +81,8 @@
       {
         "provider": "github",
         "owner": "RealDealCPA-VR",
-        "repo": "Open-Source-QB"
+        "repo": "Open-Source-QB",
+        "releaseType": "release"
       }
     ],
     "fileAssociations": [

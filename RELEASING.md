@@ -2,9 +2,10 @@
 
 BookKeeper AI desktop ships auto-update via [`electron-updater`](https://www.electron.build/auto-update)
 against **GitHub Releases**. Installed apps check the repo's Releases on every launch, download a
-newer version in the background, and prompt the user to restart (a toast: *"Update downloaded —
-restart BookKeeper AI to apply it."*). The downloaded update installs automatically on the next
-quit/relaunch.
+newer version in the background, and then show an in-app **"Update ready"** banner with a
+**Restart & install now** button (`components/DesktopBridge.tsx`). Clicking it quits, installs, and
+relaunches into the new version immediately; choosing **Later** lets the update install automatically
+on the next normal quit/relaunch.
 
 - **Feed:** configured in `package.json` → `build.publish` (`github` / `RealDealCPA-VR` / `Open-Source-QB`).
 - **Renderer wiring:** `electron/main.js` `checkForUpdates()` → `update-downloaded` → `components/DesktopBridge.tsx` toast.
@@ -32,19 +33,25 @@ npm run desktop:publish
 
 `electron-builder --publish always` builds the NSIS installer + portable exe (per the `win.target`
 config), generates the **`latest.yml`** feed file and a **`.blockmap`** (enables delta downloads),
-and uploads all of them to a GitHub Release tagged `v<version>`. By default the release is created
-as a **draft** — open it on GitHub and click **Publish** to make it live to clients. (Set
-`build.publish[0].releaseType` to `"release"` to publish immediately.)
+and uploads all of them to a GitHub Release tagged `v<version>`. The publish config sets
+`"releaseType": "release"`, so the release is published **live immediately** — there is no draft
+step, and clients can pick it up as soon as the upload finishes.
 
-That's the whole loop: **bump version → `npm run desktop:publish` → publish the GitHub release.**
-Existing installs pick it up on their next launch.
+> If you'd rather review release notes before clients see it, change
+> `build.publish[0].releaseType` back to `"draft"` and click **Publish** on the GitHub release
+> when ready.
+
+That's the whole loop: **bump version → `npm run desktop:publish`.** Existing installs pick it up on
+their next launch.
 
 ## What happens on the user's machine
 
 1. App launches → `checkForUpdatesAndNotify()` queries the latest GitHub Release.
 2. If its version > the installed version, the installer downloads in the background.
-3. `update-downloaded` fires → the user sees the restart toast.
-4. On next quit, the NSIS updater applies it; relaunch runs the new version.
+3. `update-downloaded` fires → the **"Update ready"** banner appears. The user can click
+   **Restart & install now** (quits, installs, relaunches immediately via the `app:quitAndInstall`
+   IPC handler) or **Later**.
+4. If they chose Later, the NSIS updater applies it on the next quit; relaunch runs the new version.
 5. **Data is preserved.** The local PGlite database lives in the OS user-data dir, untouched by the
    update. On first launch of the new version, `lib/db/index.ts` runs any **new Drizzle migrations**
    bundled in the release, so schema changes (e.g. new columns/tables) apply automatically without

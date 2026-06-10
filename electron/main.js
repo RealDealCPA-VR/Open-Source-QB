@@ -514,11 +514,14 @@ app.on('second-instance', (_event, argv) => {
   }
 });
 
+// Held so the 'app:quitAndInstall' IPC handler can apply a downloaded update on demand.
+let autoUpdater = null;
+
 function checkForUpdates() {
   if (isDev) return;
   try {
     // electron-updater reads the publish config baked in at build time. No-ops if none is set.
-    const { autoUpdater } = require('electron-updater');
+    ({ autoUpdater } = require('electron-updater'));
     autoUpdater.autoDownload = true;
     autoUpdater.on('update-downloaded', () => {
       mainWindow?.webContents.send('menu', 'update-ready');
@@ -526,8 +529,24 @@ function checkForUpdates() {
     autoUpdater.checkForUpdatesAndNotify().catch(() => {});
   } catch {
     // electron-updater not available / no feed configured — ignore.
+    autoUpdater = null;
   }
 }
+
+// Renderer "Restart & install now" button -> apply the downloaded update immediately.
+// Returns false if no update is staged (the UI then tells the user to restart manually).
+ipcMain.handle('app:quitAndInstall', () => {
+  if (!autoUpdater) return false;
+  // Defer so the IPC reply is sent before the app tears down; relaunch after install.
+  setImmediate(() => {
+    try {
+      autoUpdater.quitAndInstall(false, true);
+    } catch {
+      /* nothing staged / updater unavailable — ignore */
+    }
+  });
+  return true;
+});
 
 app.whenReady().then(async () => {
   await createWindow();
