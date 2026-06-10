@@ -22,7 +22,8 @@
     "desktop": "concurrently -k -s first -n NEXT,APP -c blue,green \"next dev\" \"wait-on tcp:127.0.0.1:3000 && electron .\"",
     "make-dev-shortcut": "powershell -ExecutionPolicy Bypass -File scripts/make-dev-shortcut.ps1",
     "desktop:pack": "npm run build && electron-builder --dir",
-    "desktop:dist": "npm run build && electron-builder"
+    "desktop:dist": "npm run build && electron-builder",
+    "desktop:publish": "npm run build && electron-builder --publish always"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.101.0",
@@ -76,6 +77,13 @@
     "directories": {
       "output": "release"
     },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "RealDealCPA-VR",
+        "repo": "Open-Source-QB"
+      }
+    ],
     "fileAssociations": [
       {
         "ext": "bka",
