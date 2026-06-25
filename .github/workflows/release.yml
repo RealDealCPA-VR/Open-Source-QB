@@ -12,7 +12,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - run: npm ci
+      - run: npm ci --legacy-peer-deps
       - name: Build & publish NSIS installer + latest.yml (electron-updater)
         run: npm run desktop:publish
         env:
